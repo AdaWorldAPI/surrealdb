@@ -635,3 +635,33 @@ Sprint cycle proceeding to D (Day 3: set/commit) autoattended.
 
 **Tests / checks run:**
 - `wc -l .claude/lance-backend/KNOWN_DIFFERENCES.md` → 149
+
+## 2026-05-15T21:48 — Meta-K final integration-checker (opus, main thread)
+**Target:** Sprint K verification + Days 1-12 final state
+**Verdict:** PASS — 50/50 tests pass
+
+**Test run:**
+```
+cargo test --features "kv-lance kv-mem" --no-default-features --lib kvs::lance
+```
+- test result: 50 passed; 0 failed; 0 ignored; finished in 5.13s
+
+**Sprint cycle complete (A through K, 12 commits):**
+- A: fix 7 Prep P0 compile errors
+- B: Day 1 (Datastore::new open/create + current_version)
+- C: Day 2 (Transaction::get + RYW path)
+- D: Day 3 (Transaction::commit append+delete)
+- E: Days 4+5 (put/putc/delc tests + overwrite-bug catch and fix)
+- F: Day 3.5 regression (commit must delete-before-append)
+- G: Day 6 (scan_impl + 7 scan tests)
+- H: Days 7+8+9 (keysr + savepoints + versioning, all test-only)
+- I: Day 10 (background optimizer wires compact_files + cleanup_old_versions)
+- J: Day 11 (From<lance::Error> for Error + property test)
+- K: Day 12 (SurrealQL smoke + KNOWN_DIFFERENCES.md)
+
+**Coverage:** 37 unit tests + 3 SurrealQL integration tests + property test;
+50 total under kvs::lance glob includes pre-existing tests in adjacent modules.
+
+POC scope complete. Lance backend is end-to-end correct under the test
+surface defined by DAY_BY_DAY.md. Deferred items captured in
+.claude/lance-backend/KNOWN_DIFFERENCES.md.
