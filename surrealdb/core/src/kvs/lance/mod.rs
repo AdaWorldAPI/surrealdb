@@ -72,7 +72,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;
 use lance::Dataset as LanceDataset;
-use lance::dataset::WriteParams;
+use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteParams};
 use lance_index::{DatasetIndexExt, IndexType};
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use tokio::sync::RwLock;
@@ -338,13 +338,18 @@ impl Transactable for Transaction {
 	///
 	/// 1. Partition pending entries into writes (`Some(Val)`) and
 	///    tombstones (`None`).
-	/// 2. If there are writes, build an Arrow `RecordBatch` (using lance's
-	///    internal arrow v56 re-exports) and call `Dataset::append`.
-	/// 3. If there are deletes, call `Dataset::delete(predicate)`.
-	///    NOTE: Lance 1.0.4 does not expose a public `with_transaction` API,
-	///    so append and delete are issued sequentially (not atomic). This is
-	///    consistent with Lance's OCC semantics where concurrent-write conflicts
-	///    are rare with BindSpace-aware key prefixes.
+	/// 2. If there are writes, build an Arrow `RecordBatch` and issue a
+	///    single `MergeInsertBuilder::execute_reader` call with
+	///    `when_matched(UpdateAll)` + `when_not_matched(InsertAll)`.
+	///    This is ONE atomic Lance commit — no intermediate state between
+	///    delete-old and append-new (Sprint F's sequential pair).
+	/// 3. If there are deletes (from `Transaction::del` calls), call
+	///    `Dataset::delete(predicate)` — unchanged from Sprint F.
+	///
+	/// NOTE: if BOTH writes and deletes are present the two Lance calls are
+	/// still NOT atomic across each other. Future work could express deletes
+	/// via `when_not_matched_by_source(Delete)` if we materialise the
+	/// retained-key set as a side input to merge_insert.
 	async fn commit(&self) -> Result<()> {
 		if self.closed() {
 			return Err(Error::TransactionFinished);
@@ -361,23 +366,9 @@ impl Transactable for Transaction {
 			let new_version = self.read_version + 1;
 
 			// ── writes ──────────────────────────────────────────────────────────
-			// Build the RecordBatch using lance's internal arrow re-exports (v56)
-			// so the types match what Dataset::append expects. Our Cargo.toml pins
-			// arrow-array = "55" but lance 1.0.4 uses v56 internally; the two
-			// versions have distinct type IDs and cannot be mixed.
 			if !writes.is_empty() {
-				// Delete any existing rows for the keys being written first.
-				// This implements upsert semantics: Lance append-only storage
-				// accumulates multiple rows per key; without this step a second
-				// set/putc on the same key would leave two live rows and `get`
-				// (with `limit 1`) could return the stale value.
-				let write_keys: Vec<Key> = writes.iter().map(|(k, _)| k.clone()).collect();
-				let overwrite_predicate = KvSchema::build_delete_predicate(&write_keys);
-				ds.inner
-					.delete(&overwrite_predicate)
-					.await
-					.map_err(|e| Error::Datastore(format!("lance pre-write delete: {e}")))?;
-
+				// Build RecordBatch from pending writes (uses lance's internal
+				// arrow v56 re-exports to avoid the v55/v56 type-id mismatch).
 				let batch = Self::build_write_batch_lance(&writes, new_version)
 					.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?;
 
@@ -387,10 +378,25 @@ impl Transactable for Transaction {
 					schema_ref,
 				);
 
-				ds.inner
-					.append(reader, None)
+				// Single atomic Lance commit via MergeInsertBuilder:
+				//   - matched rows (same key) → overwrite with new value
+				//   - unmatched source rows   → insert (new keys)
+				// This replaces the Sprint-F sequential delete + append pair,
+				// eliminating the partial-state window between those two calls.
+				let arc_ds = Arc::new(ds.inner.clone());
+				let (new_ds, _stats) = MergeInsertBuilder::try_new(arc_ds, vec!["key".into()])
+					.map_err(|e| Error::Datastore(format!("lance merge builder: {e}")))?
+					.when_matched(WhenMatched::UpdateAll)
+					.when_not_matched(WhenNotMatched::InsertAll)
+					.try_build()
+					.map_err(|e| Error::Datastore(format!("lance merge build: {e}")))?
+					.execute_reader(reader)
 					.await
-					.map_err(|e| Error::Datastore(format!("lance append: {e}")))?;
+					.map_err(|e| Error::Datastore(format!("lance merge_insert: {e}")))?;
+
+				// execute_reader returns Arc<Dataset>; unwrap or clone into ds.inner
+				// so that subsequent deletes and future transactions see the new version.
+				ds.inner = Arc::try_unwrap(new_ds).unwrap_or_else(|arc| (*arc).clone());
 			}
 
 			// ── deletes ─────────────────────────────────────────────────────────

@@ -684,3 +684,24 @@ surface defined by DAY_BY_DAY.md. Deferred items captured in
 
 **Tests / checks run:**
 - `cargo check --features kv-lance --no-default-features --manifest-path surrealdb/core/Cargo.toml` → Finished in 8m 28s, 0 errors, 9 warnings (all pre-existing)
+
+## 2026-05-15T23:25 — N1 atomic-committer (sonnet)
+**Target:** surrealdb/core/src/kvs/lance/mod.rs
+**Verdict:** PASS
+
+**What was done:**
+- Replaced sequential Dataset::delete + Dataset::append in Transaction::commit
+  with a single MergeInsertBuilder::execute_reader call.
+- when_matched(WhenMatched::UpdateAll) + when_not_matched(WhenNotMatched::InsertAll) = atomic upsert on "key".
+- execute_reader returns Arc<Dataset>; Arc::try_unwrap / clone back into ds.inner so future ops see the new version.
+- Explicit deletes (Transaction::del) still go through Dataset::delete.
+- Updated doc-comment on commit() to reflect new atomic-upsert semantics.
+
+**Notes / blockers:**
+- Actual lance 4.0 API observed: MergeInsertBuilder::try_new(Arc<Dataset>, Vec<String>) → Result<MergeInsertBuilder>. No when_matched_update_all convenience method — use .when_matched(WhenMatched::UpdateAll). try_build() → MergeInsertJob; MergeInsertJob::execute_reader(impl StreamingWriteSource) → Result<(Arc<Dataset>, MergeStats)>. RecordBatchIterator<I> implements StreamingWriteSource.
+- MergeInsertBuilder takes Arc<Dataset>, not &mut Dataset. Wrapped ds.inner.clone() in Arc::new.
+- execute_reader returns new Arc<Dataset>; updated ds.inner via Arc::try_unwrap or clone fallback.
+- Mixed writes+deletes commit still not atomic across the two Lance calls.
+
+**Tests / checks run:**
+- `cargo check --features kv-lance --no-default-features` → Finished in 25.51s, 0 errors, 9 warnings (all pre-existing)
