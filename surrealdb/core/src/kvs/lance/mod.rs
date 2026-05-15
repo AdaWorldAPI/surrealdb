@@ -731,11 +731,11 @@ impl Transaction {
 	/// Then applies limit/skip/direction.
 	async fn scan_impl(
 		&self,
-		_rng: Range<Key>,
-		_limit: ScanLimit,
-		_skip: u32,
+		rng: Range<Key>,
+		limit: ScanLimit,
+		skip: u32,
 		version: Option<u64>,
-		_direction: Direction,
+		direction: Direction,
 	) -> Result<Vec<(Key, Val)>> {
 		if !self.versioned && version.is_some() {
 			return Err(Error::UnsupportedVersionedQueries);
@@ -744,20 +744,131 @@ impl Transaction {
 			return Err(Error::TransactionFinished);
 		}
 
-		// TODO(lance-integration):
-		//
-		// 1. Open snapshot at version (or self.read_version).
-		// 2. Build DataFusion expression:
-		//      key >= rng.start AND key < rng.end AND tombstone = false
-		// 3. scan().filter(expr).order_by(key, direction).limit(...).execute()
-		// 4. Materialize into Vec<(Key, Val)>.
-		// 5. Merge with pending-buffer overrides:
-		//      - if pending has a Set for key in range, replace
-		//      - if pending has a Delete for key in range, drop
-		// 6. Apply skip/limit AFTER the merge to be consistent across
-		//    pending+stored state.
+		let scan_version = version.unwrap_or(self.read_version);
 
-		todo!("scan_impl: range-scan Lance dataset with pending-buffer merge")
+		// ── (1) Read Lance rows in range ───────────────────────────────────────
+		let mut lance_rows: Vec<(Key, Val)> = Vec::new();
+		{
+			let ds = self.dataset.read().await;
+
+			// Empty dataset / no commits yet → checkout_version may fail. Treat
+			// as empty result (same idiom as Transaction::get).
+			if let Ok(snapshot) = ds.inner.checkout_version(scan_version).await {
+				let filter = KvSchema::build_range_predicate(&rng.start, &rng.end);
+
+				let mut scanner = snapshot.scan();
+				scanner
+					.filter(&filter)
+					.map_err(|e| Error::Datastore(format!("lance scan_impl filter: {e}")))?
+					.project(&["key", "val"])
+					.map_err(|e| Error::Datastore(format!("lance scan_impl project: {e}")))?;
+
+				// Apply column ordering.
+				// lance 1.0.4: Scanner::order_by(Option<Vec<ColumnOrdering>>) -> Result<&mut Self>
+				// ColumnOrdering::asc_nulls_first(String) / desc_nulls_first(String) — the
+				// ascending flag is baked into the constructor, there is no .with_ascending().
+				let ordering = if matches!(direction, Direction::Forward) {
+					lance::dataset::scanner::ColumnOrdering::asc_nulls_first("key".to_string())
+				} else {
+					lance::dataset::scanner::ColumnOrdering::desc_nulls_first("key".to_string())
+				};
+				scanner
+					.order_by(Some(vec![ordering]))
+					.map_err(|e| Error::Datastore(format!("lance scan_impl order_by: {e}")))?;
+
+				use futures::TryStreamExt;
+				let mut stream = scanner
+					.try_into_stream()
+					.await
+					.map_err(|e| Error::Datastore(format!("lance scan_impl stream: {e}")))?;
+
+				while let Some(batch) = stream
+					.try_next()
+					.await
+					.map_err(|e| Error::Datastore(format!("lance scan_impl next: {e}")))?
+				{
+					let key_col = batch
+						.column_by_name("key")
+						.ok_or_else(|| {
+							Error::Datastore("lance scan_impl: missing key column".into())
+						})?
+						.as_any()
+						.downcast_ref::<lance::deps::arrow_array::BinaryArray>()
+						.ok_or_else(|| {
+							Error::Datastore(
+								"lance scan_impl: key column type mismatch".into(),
+							)
+						})?;
+					let val_col = batch
+						.column_by_name("val")
+						.ok_or_else(|| {
+							Error::Datastore("lance scan_impl: missing val column".into())
+						})?
+						.as_any()
+						.downcast_ref::<lance::deps::arrow_array::BinaryArray>()
+						.ok_or_else(|| {
+							Error::Datastore(
+								"lance scan_impl: val column type mismatch".into(),
+							)
+						})?;
+
+					for i in 0..batch.num_rows() {
+						lance_rows
+							.push((key_col.value(i).to_vec(), val_col.value(i).to_vec()));
+					}
+				}
+			}
+		}
+
+		// ── (2) Merge with pending buffer ──────────────────────────────────────
+		{
+			let pending = self.pending.read().await;
+			// Build a BTreeMap for O(N+P) merge; lance already returned rows in
+			// direction order, but we re-sort here after applying pending overlays.
+			let mut merged: std::collections::BTreeMap<Key, Option<Val>> =
+				std::collections::BTreeMap::new();
+			for (k, v) in lance_rows {
+				merged.insert(k, Some(v));
+			}
+			// Overlay pending writes: Set overrides lance row, Delete removes it.
+			// Filter to keys strictly within [rng.start, rng.end).
+			for (k, entry) in pending.iter() {
+				if k.as_slice() >= rng.start.as_slice()
+					&& k.as_slice() < rng.end.as_slice()
+				{
+					match entry {
+						PendingEntry::Set(v) => {
+							merged.insert(k.clone(), Some(v.clone()));
+						}
+						PendingEntry::Delete => {
+							merged.remove(k);
+						}
+					}
+				}
+			}
+			// Materialise in direction order.  BTreeMap iterates ascending by
+			// default; reverse for Backward.
+			let mut combined: Vec<(Key, Val)> = merged
+				.into_iter()
+				.filter_map(|(k, v)| v.map(|val| (k, val)))
+				.collect();
+			if matches!(direction, Direction::Backward) {
+				combined.reverse();
+			}
+
+			// ── (3) Apply skip + limit ─────────────────────────────────────────
+			// ScanLimit::Bytes: we count entries, not bytes (POC fallback).
+			// Byte-size accounting is deferred to a future sprint.
+			let skip_n = skip as usize;
+			let take_n = match limit {
+				ScanLimit::Count(n) => n as usize,
+				ScanLimit::Bytes(_) => 10_000, // POC: unbounded-bytes → generous cap
+				ScanLimit::BytesOrCount(_, n) => n as usize,
+			};
+			let result: Vec<(Key, Val)> =
+				combined.into_iter().skip(skip_n).take(take_n).collect();
+			Ok(result)
+		}
 	}
 }
 

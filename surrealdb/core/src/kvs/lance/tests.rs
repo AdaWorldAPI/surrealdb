@@ -490,3 +490,188 @@ async fn test_set_then_set_returns_latest_value() {
     tx.cancel().await.expect("cancel");
     ds.shutdown().await.expect("shutdown");
 }
+
+// ============================================================================
+//  Transaction::scan / scanr tests (Day 6)
+// ============================================================================
+
+use crate::kvs::api::ScanLimit;
+
+/// Helper: seed a dataset with keys a-e mapped to values 1-5, committed.
+async fn seed_a_to_e(ds: &Datastore) {
+    let tx = ds.transaction(true, false).await.expect("tx");
+    tx.set(b"a".to_vec(), b"1".to_vec()).await.expect("set a");
+    tx.set(b"b".to_vec(), b"2".to_vec()).await.expect("set b");
+    tx.set(b"c".to_vec(), b"3".to_vec()).await.expect("set c");
+    tx.set(b"d".to_vec(), b"4".to_vec()).await.expect("set d");
+    tx.set(b"e".to_vec(), b"5".to_vec()).await.expect("set e");
+    tx.commit().await.expect("commit");
+}
+
+/// Forward scan returns all 5 keys in ascending order.
+#[tokio::test]
+async fn test_scan_forward_returns_all_in_order() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+    seed_a_to_e(&ds).await;
+
+    let tx = ds.transaction(false, false).await.expect("tx");
+    let result = tx.scan(
+        b"a".to_vec()..b"z".to_vec(),
+        ScanLimit::Count(100),
+        0,
+        None,
+    ).await.expect("scan");
+
+    let keys: Vec<&[u8]> = result.iter().map(|(k, _)| k.as_slice()).collect();
+    assert_eq!(keys, vec![b"a".as_ref(), b"b", b"c", b"d", b"e"],
+        "scan forward should return ascending; got {:?}", keys);
+
+    let vals: Vec<&[u8]> = result.iter().map(|(_, v)| v.as_slice()).collect();
+    assert_eq!(vals, vec![b"1".as_ref(), b"2", b"3", b"4", b"5"]);
+
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// Reverse scan returns the same keys in descending order.
+#[tokio::test]
+async fn test_scanr_reverse_returns_all_in_descending_order() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+    seed_a_to_e(&ds).await;
+
+    let tx = ds.transaction(false, false).await.expect("tx");
+    let result = tx.scanr(
+        b"a".to_vec()..b"z".to_vec(),
+        ScanLimit::Count(100),
+        0,
+        None,
+    ).await.expect("scanr");
+
+    let keys: Vec<&[u8]> = result.iter().map(|(k, _)| k.as_slice()).collect();
+    assert_eq!(keys, vec![b"e".as_ref(), b"d", b"c", b"b", b"a"],
+        "scanr should return descending; got {:?}", keys);
+
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// skip and limit work together (skip 2, take 2 → c, d).
+#[tokio::test]
+async fn test_scan_skip_and_limit() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+    seed_a_to_e(&ds).await;
+
+    let tx = ds.transaction(false, false).await.expect("tx");
+    let result = tx.scan(
+        b"a".to_vec()..b"z".to_vec(),
+        ScanLimit::Count(2),
+        2,
+        None,
+    ).await.expect("scan");
+
+    let keys: Vec<&[u8]> = result.iter().map(|(k, _)| k.as_slice()).collect();
+    assert_eq!(keys, vec![b"c".as_ref(), b"d"],
+        "skip 2 take 2 should yield c,d; got {:?}", keys);
+
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// Half-open range respects exclusive end.
+#[tokio::test]
+async fn test_scan_half_open_range_excludes_end() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+    seed_a_to_e(&ds).await;
+
+    let tx = ds.transaction(false, false).await.expect("tx");
+    // Range [b, d) → b, c (d excluded).
+    let result = tx.scan(
+        b"b".to_vec()..b"d".to_vec(),
+        ScanLimit::Count(100),
+        0,
+        None,
+    ).await.expect("scan");
+
+    let keys: Vec<&[u8]> = result.iter().map(|(k, _)| k.as_slice()).collect();
+    assert_eq!(keys, vec![b"b".as_ref(), b"c"],
+        "range [b, d) should yield b,c only; got {:?}", keys);
+
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// Pending Set adds a new key to the scan result.
+#[tokio::test]
+async fn test_scan_pending_set_appears_in_results() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+    seed_a_to_e(&ds).await;
+
+    let tx = ds.transaction(true, false).await.expect("tx");
+    tx.set(b"bb".to_vec(), b"22".to_vec()).await.expect("set pending");
+
+    let result = tx.scan(
+        b"a".to_vec()..b"z".to_vec(),
+        ScanLimit::Count(100),
+        0,
+        None,
+    ).await.expect("scan");
+
+    let keys: Vec<&[u8]> = result.iter().map(|(k, _)| k.as_slice()).collect();
+    assert_eq!(keys, vec![b"a".as_ref(), b"b", b"bb", b"c", b"d", b"e"],
+        "pending Set 'bb' should appear in order; got {:?}", keys);
+
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// Pending Delete hides a stored row from the scan result.
+#[tokio::test]
+async fn test_scan_pending_delete_hides_stored_row() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+    seed_a_to_e(&ds).await;
+
+    let tx = ds.transaction(true, false).await.expect("tx");
+    tx.del(b"c".to_vec()).await.expect("del pending");
+
+    let result = tx.scan(
+        b"a".to_vec()..b"z".to_vec(),
+        ScanLimit::Count(100),
+        0,
+        None,
+    ).await.expect("scan");
+
+    let keys: Vec<&[u8]> = result.iter().map(|(k, _)| k.as_slice()).collect();
+    assert_eq!(keys, vec![b"a".as_ref(), b"b", b"d", b"e"],
+        "pending Delete of 'c' should hide it; got {:?}", keys);
+
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// keys() returns just the keys (projection of scan).
+#[tokio::test]
+async fn test_keys_returns_keys_only() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+    seed_a_to_e(&ds).await;
+
+    let tx = ds.transaction(false, false).await.expect("tx");
+    let result = tx.keys(
+        b"a".to_vec()..b"z".to_vec(),
+        ScanLimit::Count(100),
+        0,
+        None,
+    ).await.expect("keys");
+
+    let keys: Vec<&[u8]> = result.iter().map(|k| k.as_slice()).collect();
+    assert_eq!(keys, vec![b"a".as_ref(), b"b", b"c", b"d", b"e"]);
+
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
