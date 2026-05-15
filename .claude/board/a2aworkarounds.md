@@ -252,3 +252,24 @@ EOF
 
 **Tests / checks run:**
 - `cargo check --features kv-lance --no-default-features` → Finished in 5m 07s, 0 errors, 14 warnings
+
+## 2026-05-15T19:28 — B2 datastore-tester (sonnet)
+**Target:** surrealdb/core/src/kvs/lance/tests.rs (NEW)
+**Verdict:** PASS
+
+**What was done:**
+- Created surrealdb/core/src/kvs/lance/tests.rs with 3 #[tokio::test] integration tests:
+  - test_open_creates_new_dataset
+  - test_open_existing_dataset_succeeds
+  - test_current_version_is_queryable
+- Used std::env::temp_dir() + uuid::Uuid::new_v4() instead of tempfile::TempDir (tempfile is NOT in kv-lance feature — only in kv-mem, kv-rocksdb, kv-surrealkv, kv-tikv).
+- uuid is unconditionally available (workspace dep with v4 feature).
+
+**Notes / blockers:**
+- current_version() is a plain private fn (no pub/pub(crate)) — accessible from tests.rs as a child module (Rust allows descendants to see parent private items).
+- LanceConfig::default() sets versioned=true and background_optimizer enabled; shutdown() is called in every test to allow optimizer task to exit cleanly.
+- tempfile was NOT available under kv-lance feature — replaced with uuid-based unique path in OS temp dir.
+
+**Tests / checks run:**
+- File exists check: ls -la surrealdb/core/src/kvs/lance/tests.rs → present, 3066 bytes
+- Static review only — cargo test is meta agent's responsibility.
