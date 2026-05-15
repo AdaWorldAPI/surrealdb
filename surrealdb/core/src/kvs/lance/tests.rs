@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use super::Datastore;
+use crate::kvs::api::Transactable;
 use crate::kvs::config::LanceConfig;
 
 /// Return a unique path inside the OS temp directory for use as a
@@ -77,5 +78,74 @@ async fn test_current_version_is_queryable() {
 	let ds = Datastore::new(path_str, config).await.expect("create dataset");
 	let v = ds.current_version().await;
 	assert!(v < u64::MAX, "current_version should be a small u64, got {}", v);
+	ds.shutdown().await.expect("shutdown");
+}
+
+// ============================================================================
+//  Transaction::get tests (Day 2)
+// ============================================================================
+
+/// get on a key that was never written → returns None.
+#[tokio::test]
+async fn test_get_missing_key_returns_none() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("path is valid UTF-8");
+	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+	let tx = ds.transaction(true, false).await.expect("tx");
+	let result = tx.get(b"absent-key".to_vec(), None).await.expect("get");
+	assert!(result.is_none(), "expected None for missing key, got {:?}", result);
+	tx.cancel().await.expect("cancel");
+	ds.shutdown().await.expect("shutdown");
+}
+
+/// set in pending buffer → get returns the buffered value (read-your-writes).
+#[tokio::test]
+async fn test_get_after_set_returns_pending_value() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("path is valid UTF-8");
+	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+	let tx = ds.transaction(true, false).await.expect("tx");
+	tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
+	let result = tx.get(b"k1".to_vec(), None).await.expect("get");
+	assert_eq!(
+		result.as_deref(),
+		Some(b"v1".as_ref()),
+		"RYW failed: expected Some(v1), got {:?}",
+		result
+	);
+	tx.cancel().await.expect("cancel");
+	ds.shutdown().await.expect("shutdown");
+}
+
+/// set then delete in pending → get returns None (tombstone wins over write).
+#[tokio::test]
+async fn test_get_after_set_then_del_in_pending_returns_none() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("path is valid UTF-8");
+	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+	let tx = ds.transaction(true, false).await.expect("tx");
+	tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
+	tx.del(b"k1".to_vec()).await.expect("del");
+	let result = tx.get(b"k1".to_vec(), None).await.expect("get");
+	assert!(
+		result.is_none(),
+		"pending delete should hide pending set, got {:?}",
+		result
+	);
+	tx.cancel().await.expect("cancel");
+	ds.shutdown().await.expect("shutdown");
+}
+
+/// exists() is equivalent to get().is_some() — sanity check.
+#[tokio::test]
+async fn test_exists_mirrors_get() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("path is valid UTF-8");
+	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+	let tx = ds.transaction(true, false).await.expect("tx");
+	assert!(!tx.exists(b"k1".to_vec(), None).await.expect("exists 1"));
+	tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
+	assert!(tx.exists(b"k1".to_vec(), None).await.expect("exists 2"));
+	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
