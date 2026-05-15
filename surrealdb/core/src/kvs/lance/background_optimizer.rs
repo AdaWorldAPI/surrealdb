@@ -130,11 +130,12 @@ impl BackgroundOptimizer {
 			// ------------------------------------------------------------------
 			// Step 1: compact small/deleted fragments.
 			//
-			// lance 1.0.4: `compact_files` is a free function in
-			// `lance::dataset::optimize`.  It takes `&mut Dataset`,
-			// `CompactionOptions`, and an optional index-remapper.  Passing
-			// `None` for the remapper uses the built-in default (handles
-			// existing scalar / vector indexes automatically).
+			// lance 4.0: `compact_files` is a free function in
+			// `lance::dataset::optimize` (unchanged from 1.0.4).  It takes
+			// `&mut Dataset`, `CompactionOptions`, and an optional
+			// index-remapper.  Passing `None` for the remapper uses the
+			// built-in default (handles existing scalar / vector indexes
+			// automatically).
 			// ------------------------------------------------------------------
 			match lance::dataset::optimize::compact_files(
 				&mut ds.inner,
@@ -166,21 +167,30 @@ impl BackgroundOptimizer {
 			// ------------------------------------------------------------------
 			// Step 2: prune old versions.
 			//
-			// lance 1.0.4: `Dataset::cleanup_old_versions` takes a
-			// `chrono::Duration` (older_than), and two `Option<bool>` flags.
-			// `chrono` is already a workspace dep in surrealdb/core/Cargo.toml.
+			// lance 4.0: `cleanup_old_versions` is a free function in
+			// `lance::dataset::cleanup` taking `&Dataset` and a `CleanupPolicy`
+			// struct.  The old Dataset method API (chrono::Duration + two
+			// Option<bool> args) was removed.
 			//
-			// We set `error_if_tagged_old_versions = Some(false)` so that tagged
-			// versions (e.g. user-created snapshots / time-travel checkpoints) are
-			// simply skipped rather than causing the optimizer to bail out.
+			// We build a `CleanupPolicy` with:
+			//   - `before_timestamp`: versions older than `retention_secs` ago
+			//   - `error_if_tagged_old_versions = false`: skip tagged snapshots
+			//     rather than aborting the cleanup cycle
+			//
+			// `chrono` is already a workspace dep in surrealdb/core/Cargo.toml.
 			// ------------------------------------------------------------------
 			let retention_secs = *super::cnf::LANCE_VERSION_RETENTION_SECS;
 			if retention_secs > 0 {
-				let older_than = chrono::Duration::seconds(retention_secs as i64);
-				match ds.inner.cleanup_old_versions(
-					older_than,
-					None,        // delete_unverified: use default (false)
-					Some(false), // error_if_tagged_old_versions: skip tagged, don't error
+				let cutoff = chrono::Utc::now()
+					- chrono::TimeDelta::seconds(retention_secs as i64);
+				let policy = lance::dataset::cleanup::CleanupPolicy {
+					before_timestamp: Some(cutoff),
+					error_if_tagged_old_versions: false, // skip tagged, don't error
+					..Default::default()
+				};
+				match lance::dataset::cleanup::cleanup_old_versions(
+					&ds.inner,
+					policy,
 				)
 				.await
 				{
