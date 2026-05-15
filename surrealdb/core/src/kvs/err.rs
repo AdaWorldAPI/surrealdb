@@ -168,6 +168,34 @@ impl From<tikv::Error> for Error {
 	}
 }
 
+#[cfg(feature = "kv-lance")]
+impl From<lance::Error> for Error {
+	fn from(err: lance::Error) -> Self {
+		match err {
+			// Retryable commit conflict — SurrealDB's higher-level retry loop
+			// will re-run the transaction when it sees TransactionConflict.
+			lance::Error::RetryableCommitConflict { .. } => {
+				Error::TransactionConflict(err.to_string())
+			}
+			// Non-retryable commit conflict — still surfaces as a conflict so
+			// callers can distinguish it from a generic datastore error.
+			lance::Error::CommitConflict { .. } => Error::TransactionConflict(err.to_string()),
+			// Dataset not found — most likely a misconfigured path.
+			lance::Error::DatasetNotFound { .. } => {
+				Error::Datastore(format!("dataset not found: {err}"))
+			}
+			// Schema mismatch — mis-matched Arrow schema on re-open.
+			lance::Error::SchemaMismatch { .. } => {
+				Error::Datastore(format!("schema mismatch: {err}"))
+			}
+			// I/O errors from the underlying object store.
+			lance::Error::IO { .. } => Error::Datastore(format!("IO: {err}")),
+			// Everything else falls through to a generic datastore string.
+			other => Error::Datastore(format!("lance: {other}")),
+		}
+	}
+}
+
 // Conversion from anyhow::Error for compatibility with existing code
 impl From<anyhow::Error> for Error {
 	fn from(e: anyhow::Error) -> Self {

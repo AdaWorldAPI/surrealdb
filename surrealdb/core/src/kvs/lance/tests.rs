@@ -920,3 +920,112 @@ async fn test_optimizer_shutdown_completes_within_timeout() {
         .expect("shutdown did not complete within 2s")
         .expect("shutdown returned an error");
 }
+
+// ============================================================================
+//  Property tests (Day 11)
+// ============================================================================
+
+use std::collections::HashMap;
+
+/// Randomized differential test: drive the Lance datastore and a HashMap
+/// reference with the same sequence of operations. After every commit,
+/// every key the HashMap thinks should exist must be queryable on the
+/// datastore and return the same value; every key the HashMap thinks is
+/// absent must return None.
+///
+/// We use a deterministic LCG (linear congruential generator) so the test
+/// is reproducible without pulling in a separate rand crate. Seed is fixed
+/// so failures are debuggable.
+#[tokio::test]
+async fn test_property_matches_hashmap_reference() {
+    const SEED: u64 = 0xC0FFEE;
+    const OPS_PER_TXN: usize = 8;
+    const NUM_TXNS: usize = 25;
+    const KEY_SPACE: u8 = 16; // keys b"k0" .. b"k15"
+
+    fn lcg(state: &mut u64) -> u64 {
+        // Standard LCG (Numerical Recipes).
+        *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        *state
+    }
+
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+    let mut reference: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    let mut rng_state: u64 = SEED;
+
+    for txn_i in 0..NUM_TXNS {
+        let tx = ds.transaction(true, false).await.expect("tx");
+
+        // Buffer of staged ops applied to the reference only after commit.
+        let mut staged: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+
+        for _ in 0..OPS_PER_TXN {
+            let r = lcg(&mut rng_state);
+            let op_kind = r % 3; // 0=set, 1=del, 2=get
+            let key_n = (r / 3) as u8 % KEY_SPACE;
+            let key = format!("k{}", key_n).into_bytes();
+
+            match op_kind {
+                0 => {
+                    // Set.
+                    let val_n = lcg(&mut rng_state) % 100;
+                    let val = format!("v{}", val_n).into_bytes();
+                    tx.set(key.clone(), val.clone()).await.expect("set");
+                    staged.push((key, Some(val)));
+                }
+                1 => {
+                    // Del.
+                    tx.del(key.clone()).await.expect("del");
+                    staged.push((key, None));
+                }
+                2 => {
+                    // Get — only verifies in-txn read-your-writes against
+                    // a buffered view of the staged ops.
+                    // Compute the expected: scan staged in reverse for this key.
+                    let mut expected: Option<Vec<u8>> = reference.get(&key).cloned();
+                    for (k, v) in staged.iter() {
+                        if k == &key {
+                            expected = v.clone();
+                        }
+                    }
+                    let actual = tx.get(key.clone(), None).await.expect("get");
+                    assert_eq!(actual, expected,
+                        "txn {}: get({:?}) mismatch: expected {:?}, got {:?}",
+                        txn_i, key, expected, actual);
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // Decide commit or cancel based on a coin flip — both paths exercised.
+        if lcg(&mut rng_state) % 4 != 0 {
+            tx.commit().await.expect("commit");
+            // Apply staged ops to reference.
+            for (k, v) in staged.into_iter() {
+                match v {
+                    Some(val) => { reference.insert(k, val); }
+                    None => { reference.remove(&k); }
+                }
+            }
+        } else {
+            tx.cancel().await.expect("cancel");
+            // staged is discarded.
+        }
+
+        // After commit/cancel, the datastore must equal the reference.
+        // Read every potentially-touched key and compare.
+        let verify_tx = ds.transaction(false, false).await.expect("verify_tx");
+        for n in 0..KEY_SPACE {
+            let key = format!("k{}", n).into_bytes();
+            let actual = verify_tx.get(key.clone(), None).await.expect("verify get");
+            let expected = reference.get(&key).cloned();
+            assert_eq!(actual, expected,
+                "txn {} post-commit: key {:?} datastore={:?} reference={:?}",
+                txn_i, key, actual, expected);
+        }
+        verify_tx.cancel().await.expect("verify cancel");
+    }
+
+    ds.shutdown().await.expect("shutdown");
+}
