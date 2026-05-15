@@ -68,6 +68,10 @@ pub enum Error {
 	#[error("There was an internal error: {0}")]
 	Internal(String),
 
+	/// There is no savepoint present to rollback to or release
+	#[error("No savepoint present")]
+	NoSavePointPresent,
+
 	#[error("The storage layer does not support compaction requests.")]
 	CompactionNotSupported,
 }

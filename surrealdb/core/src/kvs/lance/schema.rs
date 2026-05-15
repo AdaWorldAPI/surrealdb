@@ -78,8 +78,7 @@ impl KvSchema {
 			.collect();
 		let version_array: UInt64Array =
 			std::iter::repeat(version).take(writes.len()).collect();
-		let tombstone_array: BooleanArray =
-			std::iter::repeat(false).take(writes.len()).collect();
+		let tombstone_array = BooleanArray::from(vec![false; writes.len()]);
 
 		RecordBatch::try_new(
 			schema,
@@ -112,8 +111,7 @@ impl KvSchema {
 			std::iter::repeat(Some(empty_val)).take(deletes.len()).collect();
 		let version_array: UInt64Array =
 			std::iter::repeat(version).take(deletes.len()).collect();
-		let tombstone_array: BooleanArray =
-			std::iter::repeat(true).take(deletes.len()).collect();
+		let tombstone_array = BooleanArray::from(vec![true; deletes.len()]);
 
 		RecordBatch::try_new(
 			schema,

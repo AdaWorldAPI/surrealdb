@@ -166,3 +166,89 @@ EOF
 
 **Tests / checks run:**
 - `diff .claude/lance-backend/lance/cnf.rs surrealdb/core/src/kvs/lance/cnf.rs` → exit 0 (identical)
+
+## 2026-05-15T19:06 — A2 schema-fixer (sonnet)
+**Target:** surrealdb/core/src/kvs/lance/schema.rs
+**Verdict:** PASS
+
+**What was done:**
+- Line 81-82 tombstone_array (build_write_batch): replaced iter::repeat(false).take(writes.len()).collect() with BooleanArray::from(vec![false; writes.len()])
+- Line 115-116 tombstone_array (build_tombstone_batch): replaced iter::repeat(true).take(deletes.len()).collect() with BooleanArray::from(vec![true; deletes.len()])
+- version_array lines (79-80, 113-114) left unchanged — UInt64Array::from_iter<u64> is valid and was not flagged by cargo
+
+**Notes / blockers:**
+- Only the two BooleanArray sites were broken; UInt64Array FromIterator<u64> is well-supported and was not flagged. No other arrays in the file use the repeat/collect pattern.
+
+**Tests / checks run:**
+- `git diff --stat surrealdb/core/src/kvs/lance/schema.rs` → 1 file changed, 2 insertions(+), 4 deletions(-); exactly the two error sites, no other changes
+
+## 2026-05-15T19:07 — A3 direction-fixer (sonnet)
+**Target:** surrealdb/core/src/kvs/lance/mod.rs (line 556 only)
+**Verdict:** PASS
+
+**What was done:**
+- Read scanner.rs Direction enum → variants are: Forward, Backward
+- Replaced `Direction::Reverse` at line 556 with `Direction::Backward`
+
+**Notes / blockers:**
+- (scoped: did not touch lines 583/598 — left for A4)
+
+**Tests / checks run:**
+- `git diff --stat surrealdb/core/src/kvs/lance/mod.rs` → 1 file changed, 1 insertion(+), 1 deletion(-) (exactly 1 line changed)
+
+## 2026-05-15T19:07 — A4 err-variant-adder (sonnet)
+**Target:** surrealdb/core/src/kvs/err.rs
+**Verdict:** PASS
+
+**What was done:**
+- Read existing Error enum → derive macro used: thiserror (#[derive(Error, Debug)])
+- All existing variants are unit variants (PascalCase, no data) with #[error("...")] attributes
+- Checked for existing savepoint-like variants → found: none (tikv uses Error::Transaction("No savepoint..."), surrealkv delegates to upstream, no NoSavePointPresent anywhere)
+- Decision tree path: (c) — no upstream equivalent, add new unit variant
+- Added NoSavePointPresent variant between Internal and CompactionNotSupported (alphabetical N position):
+  ```rust
+  /// There is no savepoint present to rollback to or release
+  #[error("No savepoint present")]
+  NoSavePointPresent,
+  ```
+
+**Notes / blockers:**
+- tikv backend handles the same case via Error::Transaction("No savepoint to rollback to") — lance is more specific/correct with a dedicated variant.
+- No cfg-gate needed: the variant is generic enough to belong in the shared enum unconditionally (matching the pattern of TransactionFinished, TransactionReadonly, etc.).
+
+**Tests / checks run:**
+- `git diff --stat surrealdb/core/src/kvs/err.rs` → 1 file changed, 4 insertions(+), 0 deletions(-) (exactly the new variant + doc comment, no deletions)
+
+## 2026-05-15T19:20 — A1 ds-fixer (sonnet)
+**Target:** surrealdb/core/src/kvs/ds.rs
+**Verdict:** PASS
+
+**What was done:**
+- Error 1 (threadpool): Chose A — deleted the two-line `super::threadpool::initialise()` call from the lance arm. Root cause: `threadpool.rs` has a file-level `#![cfg(any(feature = "kv-mem", feature = "kv-rocksdb", feature = "kv-surrealkv"))]` gate that excludes `kv-lance`, so the module simply does not exist when compiling with only `kv-lance`. Lance uses async I/O (not a blocking thread pool), so the call is not needed.
+- Error 2 (Box<dyn Transactable>): Wrapped with `Box::new(tx) as Box<dyn Transactable>`. Root cause: `lance::Datastore::transaction()` returns `Result<Transaction>` (concrete type), unlike surrealkv/mem which already return `Result<Box<dyn Transactable>>`. The coercion cast makes the tuple type match the `(Box<dyn Transactable>, bool)` return type.
+
+**Notes / blockers:**
+- threadpool.rs gating was the key: line 1 `#![cfg(any(feature = "kv-mem", feature = "kv-rocksdb", feature = "kv-surrealkv"))]` — kv-lance is not in the list, so under `--features kv-lance --no-default-features` the module is absent.
+- surrealkv and mem both return `Box<dyn Transactable>` from their `transaction()` methods; lance returns a concrete `Transaction` — hence needed explicit `Box::new(...) as Box<dyn Transactable>` cast.
+
+**Tests / checks run:**
+- `git diff --stat surrealdb/core/src/kvs/ds.rs` → 1 file changed, 1 insertion(+), 3 deletions(-); exactly the two error sites, no other changes
+
+## 2026-05-15T18:48 — Meta-A integration-checker (opus, main thread)
+**Target:** verification of Sprint A (A1-A4)
+**Verdict:** PASS
+
+**What was done:**
+- Ran `cargo check --features kv-lance --no-default-features --manifest-path surrealdb/core/Cargo.toml` after A1-A4 completed.
+- A1 (ds.rs): threadpool deletion + Box<dyn Transactable> wrap — clean.
+- A2 (schema.rs): BooleanArray::from(vec![...; N]) — clean.
+- A3 (mod.rs:556): Direction::Reverse → Direction::Backward — clean.
+- A4 (err.rs): NoSavePointPresent variant added — clean.
+- One residual P0 surfaced (E0004 non-exhaustive match in err/to_types.rs:294 caused by A4's new variant). Fixed inline on main thread by adding `| KvsError::NoSavePointPresent` to the existing TransactionFinished | TransactionReadonly | TransactionConditionNotMet arm.
+
+**Notes / blockers:**
+- 14 warnings remain (unused imports + unused-field in DatasetHandle + unused_mut in commit's `let mut ds = ...`). These are NOT errors — they're expected for stub-state scaffold and will resolve as Day 1+ wires real Lance API. Not Sprint A's scope.
+- The threadpool gate finding (A1) is reusable: `kv-lance` must NOT depend on the surrealdb-internal threadpool. Lance owns its own async runtime.
+
+**Tests / checks run:**
+- `cargo check --features kv-lance --no-default-features` → Finished in 5m 07s, 0 errors, 14 warnings

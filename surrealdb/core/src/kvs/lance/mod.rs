@@ -553,7 +553,7 @@ impl Transactable for Transaction {
 		skip: u32,
 		version: Option<u64>,
 	) -> Result<Vec<(Key, Val)>> {
-		self.scan_impl(rng, limit, skip, version, Direction::Reverse).await
+		self.scan_impl(rng, limit, skip, version, Direction::Backward).await
 	}
 
 	// ------------------------------------------------------------------------

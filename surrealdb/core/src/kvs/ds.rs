@@ -433,8 +433,6 @@ impl TransactionBuilderFactory for CommunityComposer {
 			(flavour @ "lance", path) => {
 				#[cfg(feature = "kv-lance")]
 				{
-					// Create a new blocking threadpool
-					super::threadpool::initialise();
 					// Parse Lance-specific configuration from query parameters
 					let config =
 						super::config::LanceConfig::from_params(&params).map_err(Error::Kvs)?;
@@ -544,7 +542,7 @@ impl TransactionBuilder for DatastoreFlavor {
 			#[cfg(feature = "kv-lance")]
 			Self::Lance(v) => {
 				let tx = v.transaction(write, lock).await?;
-				(tx, true)
+				(Box::new(tx) as Box<dyn Transactable>, true)
 			}
 			_ => unreachable!(),
 		})
