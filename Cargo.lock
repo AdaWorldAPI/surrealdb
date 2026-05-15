@@ -10067,6 +10067,7 @@ dependencies = [
  "ipnet",
  "jsonwebtoken 10.3.0",
  "lance",
+ "lance-index",
  "lancedb",
  "lexicmp",
  "md-5",

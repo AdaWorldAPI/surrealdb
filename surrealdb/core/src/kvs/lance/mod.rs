@@ -73,6 +73,8 @@ use anyhow::Result as AnyResult;
 use async_trait::async_trait;
 use lance::Dataset as LanceDataset;
 use lance::dataset::WriteParams;
+use lance_index::{DatasetIndexExt, IndexType};
+use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use tokio::sync::RwLock;
 
 use background_optimizer::BackgroundOptimizer;
@@ -143,7 +145,7 @@ impl Datastore {
 		info!(target: TARGET, "Opening Lance datastore at: {}", path);
 
 		// Open an existing Lance dataset, or create a new one if not found.
-		let lance_ds = match LanceDataset::open(path).await {
+		let mut lance_ds = match LanceDataset::open(path).await {
 			Ok(ds) => {
 				info!(target: TARGET, "Opened existing Lance dataset at: {}", path);
 				ds
@@ -178,21 +180,34 @@ impl Datastore {
 			}
 		};
 
-		// TODO(lance-integration): create BTREE scalar index on `key` column.
-		// This requires `lance-index` as a direct crate dependency (add it to
-		// the kv-lance feature in Cargo.toml). Example call once available:
-		//
-		// use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
-		// lance_ds
-		//     .create_index(
-		//         &["key"],
-		//         IndexType::BTree,
-		//         Some("key_btree_idx".into()),
-		//         &ScalarIndexParams::default(),
-		//         false, // replace=false — idempotent on re-open
-		//     )
-		//     .await
-		//     .map_err(|e| Error::Datastore(format!("lance create_index: {e}")))?;
+		// Create a BTREE scalar index on `key` for O(log n) point lookups.
+		// Gated on LANCE_CREATE_KEY_INDEX_ON_OPEN so bulk-load scenarios can
+		// opt out and build the index once after ingestion (much faster).
+		if *cnf::LANCE_CREATE_KEY_INDEX_ON_OPEN {
+			let index_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+			match lance_ds
+				.create_index(
+					&["key"],
+					IndexType::BTree,
+					Some("key_btree_idx".into()),
+					&index_params,
+					false, // replace=false — idempotent on re-open
+				)
+				.await
+			{
+				Ok(_) => {
+					info!(target: TARGET, "BTREE scalar index on 'key' created/confirmed");
+				}
+				Err(e) if e.to_string().contains("already exists") => {
+					// Index already present — this is the normal case on re-open.
+					// Lance returns Err when replace=false and the named index
+					// already exists; treat it as success.
+				}
+				Err(e) => {
+					return Err(Error::Datastore(format!("create_index: {e}")));
+				}
+			}
+		}
 
 		let dataset_handle = DatasetHandle {
 			path: path.to_string(),
