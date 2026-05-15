@@ -122,26 +122,88 @@ impl BackgroundOptimizer {
 				break;
 			}
 
-			let _ds = dataset.write().await;
+			// Acquire a write lock on the dataset.  We hold it for the duration
+			// of the optimize cycle so that Transaction::commit does not race
+			// with compaction (both mutate the fragment list).
+			let mut ds = dataset.write().await;
 
-			// TODO(lance-integration):
+			// ------------------------------------------------------------------
+			// Step 1: compact small/deleted fragments.
 			//
-			// Run Lance's optimize pipeline. Combines:
-			//   - fragment compaction (merge small fragments)
-			//   - scalar-index update (incorporate writes since last
-			//     optimize into the BTREE)
-			//   - version pruning (delete versions older than retention)
-			//
-			// ds.inner
-			//     .optimize(lance::dataset::optimize::CompactionOptions::default())
-			//     .await
-			//     .expect("optimize failed");
+			// lance 1.0.4: `compact_files` is a free function in
+			// `lance::dataset::optimize`.  It takes `&mut Dataset`,
+			// `CompactionOptions`, and an optional index-remapper.  Passing
+			// `None` for the remapper uses the built-in default (handles
+			// existing scalar / vector indexes automatically).
+			// ------------------------------------------------------------------
+			match lance::dataset::optimize::compact_files(
+				&mut ds.inner,
+				lance::dataset::optimize::CompactionOptions::default(),
+				None, // use built-in IndexRemapper
+			)
+			.await
+			{
+				Ok(metrics) => {
+					tracing::debug!(
+						target = "surrealdb::core::kvs::lance::optimizer",
+						fragments_removed = metrics.fragments_removed,
+						fragments_added = metrics.fragments_added,
+						"compact_files completed"
+					);
+				}
+				Err(e) => {
+					// Log and continue — a compaction hiccup must never crash the
+					// host process.  Pending writes are flushed via
+					// Transaction::commit regardless of optimizer state.
+					tracing::warn!(
+						target = "surrealdb::core::kvs::lance::optimizer",
+						error = %e,
+						"compact_files failed; will retry on next cycle"
+					);
+				}
+			}
 
-			// For the POC scaffold we just log that we'd optimize here.
-			tracing::debug!(
-				target = "surrealdb::core::kvs::lance::optimizer",
-				"would call Dataset::optimize() now"
-			);
+			// ------------------------------------------------------------------
+			// Step 2: prune old versions.
+			//
+			// lance 1.0.4: `Dataset::cleanup_old_versions` takes a
+			// `chrono::Duration` (older_than), and two `Option<bool>` flags.
+			// `chrono` is already a workspace dep in surrealdb/core/Cargo.toml.
+			//
+			// We set `error_if_tagged_old_versions = Some(false)` so that tagged
+			// versions (e.g. user-created snapshots / time-travel checkpoints) are
+			// simply skipped rather than causing the optimizer to bail out.
+			// ------------------------------------------------------------------
+			let retention_secs = *super::cnf::LANCE_VERSION_RETENTION_SECS;
+			if retention_secs > 0 {
+				let older_than = chrono::Duration::seconds(retention_secs as i64);
+				match ds.inner.cleanup_old_versions(
+					older_than,
+					None,        // delete_unverified: use default (false)
+					Some(false), // error_if_tagged_old_versions: skip tagged, don't error
+				)
+				.await
+				{
+					Ok(stats) => {
+						tracing::debug!(
+							target = "surrealdb::core::kvs::lance::optimizer",
+							bytes_removed = stats.bytes_removed,
+							old_versions = stats.old_versions,
+							"cleanup_old_versions completed"
+						);
+					}
+					Err(e) => {
+						tracing::warn!(
+							target = "surrealdb::core::kvs::lance::optimizer",
+							error = %e,
+							"cleanup_old_versions failed; will retry on next cycle"
+						);
+					}
+				}
+			}
+
+			// Release the write lock before sleeping until the next cycle.
+			drop(ds);
 		}
 	}
 }

@@ -497,3 +497,61 @@ Sprint cycle proceeding to D (Day 3: set/commit) autoattended.
 **Tests / checks run:**
 - `cargo test --features "kv-lance kv-mem" --no-default-features --lib kvs::lance::tests` → 34 passed; 0 failed; finished in 0.18s
 - `wc -l surrealdb/core/src/kvs/lance/tests.rs` → 869
+
+## 2026-05-15T21:16 — I2 optimizer-tester (sonnet)
+**Target:** surrealdb/core/src/kvs/lance/tests.rs (Day 10)
+**Verdict:** PASS
+
+**What was done:**
+- Read blackboard: confirmed 34/34 tests passing (H1 entry).
+- Read tests.rs (922 lines): both Day 10 optimizer tests were already present (lines 871–922), pre-populated by a prior worker before I2 ran.
+- Tests present:
+  - test_background_optimizer_does_not_panic_on_concurrent_commits
+  - test_optimizer_shutdown_completes_within_timeout
+- Verified tests against spec: unique_tmp_path(), LanceConfig::default(), Transactable, no internal state assertions, tokio::time::timeout — all match constraints exactly.
+- No file edits needed; code matches the required pattern.
+
+**Tests / checks run:**
+- `cargo test --features "kv-lance kv-mem" --no-default-features --lib kvs::lance::tests --no-run` → Finished 0.64s, 0 errors, 7 warnings, executable emitted
+- `wc -l surrealdb/core/src/kvs/lance/tests.rs` → 922
+
+## 2026-05-15T$(date -u +%H:%M) — I1 optimizer-wirer (sonnet)
+**Target:** surrealdb/core/src/kvs/lance/background_optimizer.rs
+**Verdict:** PASS
+
+**What was done:**
+- compact_files: WIRED — `lance::dataset::optimize::compact_files(&mut ds.inner, CompactionOptions::default(), None).await`; `None` for remap_options uses built-in IndexRemapper (no `lance-index` import needed at call site).
+- cleanup_old_versions: WIRED — `ds.inner.cleanup_old_versions(chrono::Duration::seconds(retention_secs as i64), None, Some(false)).await`; skips tagged versions instead of erroring; skipped when `LANCE_VERSION_RETENTION_SECS == 0`.
+- Resilient: both optimizer errors logged-not-propagated; background task continues to next cycle on any failure.
+- RwLock held for entire optimize cycle to prevent concurrent Transaction::commit racing with fragment-list mutation; `drop(ds)` explicit before sleeping.
+
+**Notes / blockers:**
+- Lance API deviations: `compact_files` is a free fn in `lance::dataset::optimize` (not a Dataset method); `cleanup_old_versions` IS a Dataset method taking `chrono::Duration` (not `std::time::Duration`).
+- `chrono` is already in `surrealdb/core/Cargo.toml` as a workspace dep — no new dependency added.
+- `compact_files` internally uses `lance_index` but its public signature needs no `lance-index` import at the call site; `None` for `remap_options: Option<Arc<dyn IndexRemapperOptions>>` compiles without naming the type.
+- `error_if_tagged_old_versions = Some(false)`: tagged versions (user snapshots) are silently skipped rather than aborting the cleanup cycle.
+
+**Tests / checks run:**
+- `cargo check --features kv-lance --no-default-features --manifest-path surrealdb/core/Cargo.toml` → Finished in 17.01s, 0 errors, 10 warnings (all pre-existing)
+- `git diff --stat surrealdb/core/src/kvs/lance/background_optimizer.rs` → 1 file changed, 79 insertions(+), 17 deletions(-)
+
+## 2026-05-15T21:18 — I1 optimizer-wirer (sonnet)
+**Target:** surrealdb/core/src/kvs/lance/background_optimizer.rs
+**Verdict:** PASS
+
+**What was done:**
+- compact_files: WIRED — lance::dataset::optimize::compact_files(&mut ds.inner, CompactionOptions::default(), None).await; None for remap_options uses built-in IndexRemapper (no lance-index import needed at call site).
+- cleanup_old_versions: WIRED — ds.inner.cleanup_old_versions(chrono::Duration::seconds(retention_secs as i64), None, Some(false)).await; skips tagged versions instead of erroring; skipped when LANCE_VERSION_RETENTION_SECS == 0.
+- Resilient: both optimizer errors logged-not-propagated; background task continues to next cycle on any failure.
+- RwLock write-guard held for entire optimize cycle to prevent Transaction::commit racing with fragment-list mutation; explicit drop(ds) before sleeping.
+
+**Notes / blockers:**
+- Lance API deviations: compact_files is a free fn in lance::dataset::optimize (not a Dataset method); cleanup_old_versions IS a Dataset method taking chrono::Duration (not std::time::Duration).
+- chrono is already in surrealdb/core/Cargo.toml as a workspace dep — no new dependency added.
+- compact_files internally uses lance_index but its public signature needs no lance-index import at the call site; None for Option<Arc<dyn IndexRemapperOptions>> compiles without naming the type.
+- error_if_tagged_old_versions = Some(false): tagged versions (user snapshots) silently skipped rather than aborting the cleanup cycle.
+- Dependencies needed but not present: none — chrono and lance are sufficient.
+
+**Tests / checks run:**
+- cargo check --features kv-lance --no-default-features --manifest-path surrealdb/core/Cargo.toml -> Finished in 17.01s, 0 errors, 10 warnings (all pre-existing)
+- git diff --stat surrealdb/core/src/kvs/lance/background_optimizer.rs -> 1 file changed, 79 insertions(+), 17 deletions(-)
