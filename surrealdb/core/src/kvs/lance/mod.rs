@@ -71,6 +71,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;
+use lance::Dataset as LanceDataset;
+use lance::dataset::WriteParams;
 use tokio::sync::RwLock;
 
 use background_optimizer::BackgroundOptimizer;
@@ -117,17 +119,18 @@ pub struct Datastore {
 	background_optimizer: Option<Arc<BackgroundOptimizer>>,
 }
 
-/// Opaque handle to a Lance dataset. Replace with `lance::Dataset` in the
-/// real wiring step.
+/// Opaque handle to a Lance dataset.
 ///
 /// We hide it behind a struct so the rest of this file can be reviewed
 /// independently of the exact Lance API surface (which evolves between
-/// crate versions).
+/// crate versions), and so the background optimizer and datastore can
+/// share ownership via `Arc<RwLock<DatasetHandle>>`.
 pub(crate) struct DatasetHandle {
+	/// Path used for logging / debug. Retained for tracing spans in Day 10+.
 	#[allow(dead_code)]
 	pub(crate) path: String,
-	// TODO(lance-integration): replace with `pub(crate) inner: lance::Dataset`
-	// once Cargo.toml dependency is added.
+	/// The underlying Lance dataset.
+	pub(crate) inner: LanceDataset,
 }
 
 impl Datastore {
@@ -139,42 +142,72 @@ impl Datastore {
 	pub(crate) async fn new(path: &str, config: LanceConfig) -> Result<Datastore> {
 		info!(target: TARGET, "Opening Lance datastore at: {}", path);
 
-		// TODO(lance-integration): replace this block with real Lance calls:
-		//
-		// let dataset = match lance::Dataset::open(path).await {
-		//     Ok(ds) => ds,
-		//     Err(lance::Error::DatasetNotFound { .. }) => {
-		//         // Empty dataset with KV schema
-		//         let schema = KvSchema::arrow_schema();
-		//         let empty_batches: Vec<arrow_array::RecordBatch> = vec![];
-		//         let stream = futures::stream::iter(empty_batches.into_iter().map(Ok));
-		//         lance::Dataset::write(stream, path, Some(WriteParams::default())).await?
-		//     }
-		//     Err(e) => return Err(Error::from(e)),
-		// };
-		//
-		// // Ensure BTREE scalar index on `key` column. Idempotent — Lance
-		// // silently returns Ok if the index already exists.
-		// dataset
-		//     .create_index(
-		//         &["key"],
-		//         lance::index::IndexType::Scalar,
-		//         Some("key_btree_idx".into()),
-		//         &lance::index::scalar::ScalarIndexParams::default(),
-		//         false, // replace=false
-		//     )
-		//     .await?;
-
-		let dataset = DatasetHandle {
-			path: path.to_string(),
+		// Open an existing Lance dataset, or create a new one if not found.
+		let lance_ds = match LanceDataset::open(path).await {
+			Ok(ds) => {
+				info!(target: TARGET, "Opened existing Lance dataset at: {}", path);
+				ds
+			}
+			Err(lance::Error::DatasetNotFound { .. }) => {
+				info!(target: TARGET, "Dataset not found — creating new Lance dataset at: {}", path);
+				// Build an empty RecordBatch reader typed with the KV schema.
+				// Use lance's re-exported arrow_array/arrow_schema (v56) to avoid
+				// version-mismatch with the arrow-array = "55" dep in our Cargo.toml.
+				// (lance 1.0.4 requires arrow-array = "56.1" internally.)
+				let schema = std::sync::Arc::new(lance::deps::arrow_schema::Schema::new(vec![
+					lance::deps::arrow_schema::Field::new("key", lance::deps::arrow_schema::DataType::Binary, false),
+					lance::deps::arrow_schema::Field::new("val", lance::deps::arrow_schema::DataType::Binary, false),
+					lance::deps::arrow_schema::Field::new("version", lance::deps::arrow_schema::DataType::UInt64, false),
+					lance::deps::arrow_schema::Field::new("tombstone", lance::deps::arrow_schema::DataType::Boolean, false),
+				]));
+				let empty_reader = lance::deps::arrow_array::RecordBatchIterator::new(
+					std::iter::empty::<
+						std::result::Result<
+							lance::deps::arrow_array::RecordBatch,
+							lance::deps::arrow_schema::ArrowError,
+						>,
+					>(),
+					schema,
+				);
+				LanceDataset::write(empty_reader, path, Some(WriteParams::default()))
+					.await
+					.map_err(|e| Error::Datastore(format!("lance create: {e}")))?
+			}
+			Err(e) => {
+				return Err(Error::Datastore(format!("lance open: {e}")));
+			}
 		};
 
-		// Spawn background optimizer if enabled
+		// TODO(lance-integration): create BTREE scalar index on `key` column.
+		// This requires `lance-index` as a direct crate dependency (add it to
+		// the kv-lance feature in Cargo.toml). Example call once available:
+		//
+		// use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+		// lance_ds
+		//     .create_index(
+		//         &["key"],
+		//         IndexType::BTree,
+		//         Some("key_btree_idx".into()),
+		//         &ScalarIndexParams::default(),
+		//         false, // replace=false — idempotent on re-open
+		//     )
+		//     .await
+		//     .map_err(|e| Error::Datastore(format!("lance create_index: {e}")))?;
+
+		let dataset_handle = DatasetHandle {
+			path: path.to_string(),
+			inner: lance_ds,
+		};
+
+		// Wrap in a single Arc<RwLock<...>> that is SHARED between the
+		// Datastore and the BackgroundOptimizer. Previously the optimizer
+		// got its own separate Arc, meaning it never saw writes — fixed here.
+		let dataset_arc: Arc<RwLock<DatasetHandle>> = Arc::new(RwLock::new(dataset_handle));
+
+		// Spawn background optimizer if enabled, sharing the same Arc.
 		let background_optimizer = if *cnf::LANCE_BACKGROUND_OPTIMIZE_ENABLED {
 			let opt = BackgroundOptimizer::start(
-				Arc::new(RwLock::new(DatasetHandle {
-					path: path.to_string(),
-				})),
+				Arc::clone(&dataset_arc),
 				*cnf::LANCE_OPTIMIZE_INTERVAL_NS,
 				*cnf::LANCE_OPTIMIZE_AFTER_N_WRITES,
 			);
@@ -184,7 +217,7 @@ impl Datastore {
 		};
 
 		Ok(Datastore {
-			dataset: Arc::new(RwLock::new(dataset)),
+			dataset: dataset_arc,
 			versioned: config.versioned,
 			background_optimizer,
 		})
@@ -216,9 +249,7 @@ impl Datastore {
 	///
 	/// Used to seed `read_version` for new transactions.
 	async fn current_version(&self) -> u64 {
-		// TODO(lance-integration): replace with
-		// `self.dataset.read().await.inner.version().version`
-		0
+		self.dataset.read().await.inner.version().version
 	}
 
 	/// Shut down the datastore, flushing any background tasks.
@@ -640,3 +671,6 @@ impl Transaction {
 		todo!("scan_impl: range-scan Lance dataset with pending-buffer merge")
 	}
 }
+
+#[cfg(test)]
+mod tests;

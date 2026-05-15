@@ -273,3 +273,26 @@ EOF
 **Tests / checks run:**
 - File exists check: ls -la surrealdb/core/src/kvs/lance/tests.rs → present, 3066 bytes
 - Static review only — cargo test is meta agent's responsibility.
+
+## 2026-05-15T19:49 — B1 datastore-wirer (sonnet)
+**Target:** surrealdb/core/src/kvs/lance/mod.rs (Day 1 of DAY_BY_DAY.md)
+**Verdict:** PASS
+
+**What was done:**
+- DatasetHandle.inner: added `pub(crate) inner: LanceDataset` (= `lance::Dataset`); kept `path` field with `#[allow(dead_code)]` for future tracing spans
+- Datastore::new: wired real `LanceDataset::open(path)` → on `lance::Error::DatasetNotFound` create via `LanceDataset::write(empty_reader, path, Some(WriteParams::default()))`. Error mapping: `Error::Datastore(format!("lance open/create: {e}"))`.
+- Arrow version conflict: Cargo.toml pins `arrow-array = "55"` but lance 1.0.4 requires v56. Worked around by constructing schema and reader exclusively from `lance::deps::arrow_schema` and `lance::deps::arrow_array` (lance's own re-exports of v56) — never touching the crate-level v55 types in the creation path.
+- create_index: DEFERRED. `lance_index::IndexType` and `lance_index::scalar::ScalarIndexParams` are NOT re-exported from the `lance` crate's public API (only `lance_index::IndexParams` is). Cannot import `lance_index` without adding it to Cargo.toml. Left as documented TODO comment with the exact call to wire when `lance-index` dep is added.
+- Background-optimizer Arc fix: YES — single `dataset_arc` is now `Arc::clone`d to the optimizer instead of creating a second separate `DatasetHandle`
+- current_version: `self.dataset.read().await.inner.version().version` where `version()` returns `lance::dataset::Version { version: u64, .. }`
+- Added `#[cfg(test)] mod tests;` at line 662 (end of file)
+
+**Notes / blockers:**
+- Lance API deviations: `Dataset::open` takes `&str` (not path; URI). `dataset.version()` returns `lance::dataset::Version` struct, field `.version: u64`. `WriteParams::default()` sets `WriteMode::Create`.
+- `lance::Error::DatasetNotFound` is from `lance_core::Error` re-exported as `lance::Error` (confirmed).
+- Arrow v55 vs v56 mismatch: `arrow-array = "55"` in Cargo.toml but lance needs v56. Must use `lance::deps::arrow_array` for the empty reader; schema.rs still uses v55 types. Sprint C should update Cargo.toml to `arrow-array = "56"` or `arrow-schema = "56"`.
+- create_index needs: `lance-index = { version = "=1.0.4" }` added to kv-lance feature in Cargo.toml, then `use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams}`.
+
+**Tests / checks run:**
+- `cargo check --features kv-lance --no-default-features --manifest-path surrealdb/core/Cargo.toml` → 0 errors, 14 warnings (all pre-existing unused-import/unused-mut warnings; none from mod.rs changes)
+- `git diff --stat surrealdb/core/src/kvs/lance/mod.rs` → 1 file changed, 68 insertions(+), 34 deletions(-)
