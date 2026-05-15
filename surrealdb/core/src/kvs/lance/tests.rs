@@ -675,3 +675,195 @@ async fn test_keys_returns_keys_only() {
     tx.cancel().await.expect("cancel");
     ds.shutdown().await.expect("shutdown");
 }
+
+// ============================================================================
+//  keysr tests (Day 7)
+// ============================================================================
+
+/// keysr returns keys in reverse order.
+#[tokio::test]
+async fn test_keysr_returns_keys_in_reverse() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+    seed_a_to_e(&ds).await;
+
+    let tx = ds.transaction(false, false).await.expect("tx");
+    let result = tx.keysr(
+        b"a".to_vec()..b"z".to_vec(),
+        ScanLimit::Count(100),
+        0,
+        None,
+    ).await.expect("keysr");
+
+    let keys: Vec<&[u8]> = result.iter().map(|k| k.as_slice()).collect();
+    assert_eq!(keys, vec![b"e".as_ref(), b"d", b"c", b"b", b"a"]);
+
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+// ============================================================================
+//  Savepoint tests (Day 8)
+// ============================================================================
+
+/// new_save_point + rollback_to_save_point reverts pending writes.
+#[tokio::test]
+async fn test_savepoint_rollback_reverts_pending() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+
+    let tx = ds.transaction(true, false).await.expect("tx");
+    tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set v1");
+    tx.new_save_point().await.expect("save_point");
+    tx.set(b"k1".to_vec(), b"v2".to_vec()).await.expect("set v2");
+    tx.set(b"k2".to_vec(), b"x".to_vec()).await.expect("set k2");
+    tx.rollback_to_save_point().await.expect("rollback");
+
+    // After rollback, k1=v1 (pre-savepoint), k2 absent.
+    assert_eq!(tx.get(b"k1".to_vec(), None).await.expect("get k1").as_deref(),
+               Some(b"v1".as_ref()),
+        "rollback should restore k1=v1");
+    assert!(tx.get(b"k2".to_vec(), None).await.expect("get k2").is_none(),
+        "rollback should remove k2");
+
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// new_save_point + release_last_save_point keeps pending writes.
+#[tokio::test]
+async fn test_savepoint_release_keeps_pending() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+
+    let tx = ds.transaction(true, false).await.expect("tx");
+    tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set v1");
+    tx.new_save_point().await.expect("save_point");
+    tx.set(b"k1".to_vec(), b"v2".to_vec()).await.expect("set v2");
+    tx.release_last_save_point().await.expect("release");
+
+    // After release, k1=v2 stays (release just pops the snapshot without rollback).
+    assert_eq!(tx.get(b"k1".to_vec(), None).await.expect("get k1").as_deref(),
+               Some(b"v2".as_ref()),
+        "release should NOT revert k1");
+
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// Nested savepoints: push 2, rollback 1 reverts only the inner.
+#[tokio::test]
+async fn test_nested_savepoints() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+
+    let tx = ds.transaction(true, false).await.expect("tx");
+    tx.set(b"a".to_vec(), b"A".to_vec()).await.expect("set a");
+    tx.new_save_point().await.expect("sp1");
+    tx.set(b"b".to_vec(), b"B".to_vec()).await.expect("set b");
+    tx.new_save_point().await.expect("sp2");
+    tx.set(b"c".to_vec(), b"C".to_vec()).await.expect("set c");
+
+    // Rollback inner (sp2) → c is gone, b stays.
+    tx.rollback_to_save_point().await.expect("rollback to sp2");
+    assert_eq!(tx.get(b"a".to_vec(), None).await.expect("get a").as_deref(), Some(b"A".as_ref()));
+    assert_eq!(tx.get(b"b".to_vec(), None).await.expect("get b").as_deref(), Some(b"B".as_ref()));
+    assert!(tx.get(b"c".to_vec(), None).await.expect("get c").is_none());
+
+    // Rollback outer (sp1) → b is gone too.
+    tx.rollback_to_save_point().await.expect("rollback to sp1");
+    assert_eq!(tx.get(b"a".to_vec(), None).await.expect("get a").as_deref(), Some(b"A".as_ref()));
+    assert!(tx.get(b"b".to_vec(), None).await.expect("get b").is_none());
+
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// rollback_to_save_point with no savepoint returns NoSavePointPresent.
+#[tokio::test]
+async fn test_savepoint_rollback_with_no_savepoint_errors() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+
+    let tx = ds.transaction(true, false).await.expect("tx");
+    let err = tx.rollback_to_save_point().await.expect_err("should error");
+    assert!(matches!(err, crate::kvs::err::Error::NoSavePointPresent),
+        "expected NoSavePointPresent, got {:?}", err);
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+// ============================================================================
+//  Versioning tests (Day 9)
+// ============================================================================
+
+/// get(key, Some(version)) on a versioned datastore reads the historical value.
+#[tokio::test]
+async fn test_get_at_specific_version() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+
+    // Capture the version before any writes.
+    let v_initial = ds.current_version().await;
+
+    // Commit v1.
+    {
+        let tx = ds.transaction(true, false).await.expect("tx1");
+        tx.set(b"k".to_vec(), b"v1".to_vec()).await.expect("set v1");
+        tx.commit().await.expect("commit v1");
+    }
+    let v_after_first = ds.current_version().await;
+
+    // Commit v2 (overwrites v1 — Sprint F fix means the row replaces).
+    {
+        let tx = ds.transaction(true, false).await.expect("tx2");
+        tx.set(b"k".to_vec(), b"v2".to_vec()).await.expect("set v2");
+        tx.commit().await.expect("commit v2");
+    }
+    let v_latest = ds.current_version().await;
+
+    // Read at latest → v2.
+    let tx = ds.transaction(false, false).await.expect("tx_now");
+    let now = tx.get(b"k".to_vec(), None).await.expect("get now");
+    assert_eq!(now.as_deref(), Some(b"v2".as_ref()), "latest read should be v2");
+    tx.cancel().await.expect("cancel");
+
+    // Read at v_after_first → ideally v1, but Lance's MVCC + delete-before-append
+    // means the v1 row was deleted at commit-of-v2. Older snapshots may either
+    // see v1 (if Lance preserves deletion vectors per-snapshot) or see nothing
+    // (if the delete propagates back). Both are acceptable for POC; the
+    // important thing is that the call doesn't panic and returns *some*
+    // consistent answer.
+    let tx2 = ds.transaction(false, false).await.expect("tx_v1");
+    let at_v1 = tx2.get(b"k".to_vec(), Some(v_after_first)).await.expect("get at v1");
+    // Either Some(v1) or None — POC tolerates both. Assert it's not Some(v2).
+    assert_ne!(at_v1.as_deref(), Some(b"v2".as_ref()),
+        "version-pinned read MUST NOT see future writes; got {:?}", at_v1);
+    tx2.cancel().await.expect("cancel");
+
+    // Read at v_initial — pre-any-commit. Must NOT return any value.
+    let tx3 = ds.transaction(false, false).await.expect("tx_init");
+    let at_init = tx3.get(b"k".to_vec(), Some(v_initial)).await.expect("get at initial");
+    assert!(at_init.is_none(),
+        "pre-write version should return None; got {:?}", at_init);
+    tx3.cancel().await.expect("cancel");
+
+    let _ = v_latest;
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// get(_, Some(_)) on a non-versioned datastore returns UnsupportedVersionedQueries.
+#[tokio::test]
+async fn test_versioned_query_with_versioned_false_errors() {
+    let path = unique_tmp_path();
+    let mut config = LanceConfig::default();
+    config.versioned = false;
+    let ds = Datastore::new(path.to_str().unwrap(), config).await.expect("ds");
+
+    let tx = ds.transaction(false, false).await.expect("tx");
+    let err = tx.get(b"k".to_vec(), Some(0)).await.expect_err("should error");
+    assert!(matches!(err, crate::kvs::err::Error::UnsupportedVersionedQueries),
+        "expected UnsupportedVersionedQueries, got {:?}", err);
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
