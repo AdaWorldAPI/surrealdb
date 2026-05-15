@@ -180,6 +180,12 @@ impl From<lance::Error> for Error {
 			// Non-retryable commit conflict — still surfaces as a conflict so
 			// callers can distinguish it from a generic datastore error.
 			lance::Error::CommitConflict { .. } => Error::TransactionConflict(err.to_string()),
+			// Incompatible transaction (new in lance 4.0) — the transaction
+			// references a base version that is no longer compatible with the
+			// current dataset state; retrying from a fresh read will succeed.
+			lance::Error::IncompatibleTransaction { .. } => {
+				Error::TransactionConflict(err.to_string())
+			}
 			// Dataset not found — most likely a misconfigured path.
 			lance::Error::DatasetNotFound { .. } => {
 				Error::Datastore(format!("dataset not found: {err}"))
