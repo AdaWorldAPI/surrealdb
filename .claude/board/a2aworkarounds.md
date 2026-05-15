@@ -665,3 +665,22 @@ cargo test --features "kv-lance kv-mem" --no-default-features --lib kvs::lance
 POC scope complete. Lance backend is end-to-end correct under the test
 surface defined by DAY_BY_DAY.md. Deferred items captured in
 .claude/lance-backend/KNOWN_DIFFERENCES.md.
+
+## 2026-05-15T23:08 — M1 btree-indexer (sonnet)
+**Target:** surrealdb/core/Cargo.toml + surrealdb/core/src/kvs/lance/mod.rs
+**Verdict:** PASS
+
+**What was done:**
+- Cargo.toml already had `lance-index = { version = "=4.0.0", optional = true }` in the External KV stores block and `dep:lance-index` in the kv-lance feature line — no edit needed.
+- mod.rs already had `use lance_index::{DatasetIndexExt, IndexType};` and `use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};` imports.
+- mod.rs already had the create_index call wired: `ScalarIndexParams::for_builtin(BuiltinIndexType::BTree)` passed to `lance_ds.create_index(&["key"], IndexType::BTree, Some("key_btree_idx".into()), &index_params, false)`.
+- Gated on `*cnf::LANCE_CREATE_KEY_INDEX_ON_OPEN` (defaults true, env: SURREAL_LANCE_CREATE_KEY_INDEX_ON_OPEN).
+- Idempotency: match arm `Err(e) if e.to_string().contains("already exists")` swallows the already-exists error from Lance when replace=false.
+
+**Notes / blockers:**
+- Lance 4.0 API signature (confirmed from traits.rs): `async fn create_index(&mut self, columns: &[&str], index_type: IndexType, name: Option<String>, params: &dyn IndexParams, replace: bool) -> Result<IndexMetadata>`
+- `IndexType::BTree` (not `IndexType::Scalar`) used — both are valid aliases (Scalar=0 is legacy alias to BTree=1) but BTree is the explicit variant.
+- All work was already completed by prior sprint workers (B1 logged create_index as DEFERRED due to missing dep, but both the dep and the implementation were added before M1 ran).
+
+**Tests / checks run:**
+- `cargo check --features kv-lance --no-default-features --manifest-path surrealdb/core/Cargo.toml` → Finished in 8m 28s, 0 errors, 9 warnings (all pre-existing)
