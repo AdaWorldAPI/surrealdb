@@ -446,3 +446,47 @@ async fn test_delc_none_chk_on_missing_is_noop() {
     tx.commit().await.expect("commit");
     ds.shutdown().await.expect("shutdown");
 }
+
+// ============================================================================
+//  Commit overwrite regression (Sprint F)
+// ============================================================================
+
+/// REGRESSION (Sprint F): set k=v1 + commit + set k=v2 + commit → get k = v2.
+///
+/// Lance is append-only. If commit() simply appended a row without deleting
+/// pre-existing rows with the same key, the dataset would end up with TWO
+/// rows for key k (one with v1, one with v2) and `get` (scan + limit 1)
+/// would return either one non-deterministically. This test pins the
+/// contract: the latest committed value MUST win.
+#[tokio::test]
+async fn test_set_then_set_returns_latest_value() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().unwrap();
+    let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+    // Insert v1.
+    {
+        let tx = ds.transaction(true, false).await.expect("tx1");
+        tx.set(b"k".to_vec(), b"v1".to_vec()).await.expect("set v1");
+        tx.commit().await.expect("commit v1");
+    }
+
+    // Overwrite with v2.
+    {
+        let tx = ds.transaction(true, false).await.expect("tx2");
+        tx.set(b"k".to_vec(), b"v2".to_vec()).await.expect("set v2");
+        tx.commit().await.expect("commit v2");
+    }
+
+    // Read — must see v2, not v1.
+    let tx = ds.transaction(false, false).await.expect("tx3");
+    let result = tx.get(b"k".to_vec(), None).await.expect("get");
+    assert_eq!(
+        result.as_deref(),
+        Some(b"v2".as_ref()),
+        "set-after-set must return latest value; got {:?}",
+        result
+    );
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}

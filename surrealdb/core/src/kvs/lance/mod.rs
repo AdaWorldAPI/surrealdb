@@ -351,6 +351,18 @@ impl Transactable for Transaction {
 			// arrow-array = "55" but lance 1.0.4 uses v56 internally; the two
 			// versions have distinct type IDs and cannot be mixed.
 			if !writes.is_empty() {
+				// Delete any existing rows for the keys being written first.
+				// This implements upsert semantics: Lance append-only storage
+				// accumulates multiple rows per key; without this step a second
+				// set/putc on the same key would leave two live rows and `get`
+				// (with `limit 1`) could return the stale value.
+				let write_keys: Vec<Key> = writes.iter().map(|(k, _)| k.clone()).collect();
+				let overwrite_predicate = KvSchema::build_delete_predicate(&write_keys);
+				ds.inner
+					.delete(&overwrite_predicate)
+					.await
+					.map_err(|e| Error::Datastore(format!("lance pre-write delete: {e}")))?;
+
 				let batch = Self::build_write_batch_lance(&writes, new_version)
 					.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?;
 
