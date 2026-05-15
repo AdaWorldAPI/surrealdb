@@ -150,3 +150,19 @@ EOF
 **Tests / checks run:**
 - `diff -q src dst` × 5 → all silent (byte-identical)
 - `ls -la surrealdb/core/src/kvs/lance/` → 5 files present, sizes match .claude/lance-backend/lance/.
+
+## 2026-05-15T18:34 — W8 lance-cnf-copy (sonnet)
+**Target:** surrealdb/core/src/kvs/lance/cnf.rs
+**Verdict:** PASS
+
+**What was done:**
+- Read blackboard and source file at .claude/lance-backend/lance/cnf.rs.
+- Confirmed target directory surrealdb/core/src/kvs/lance/ already existed (created by a prior worker).
+- File was already present verbatim — diff src dst exits 0, no differences.
+- Verified lazy_env_parse! macro discoverability (see Notes).
+
+**Notes / blockers:**
+- `lazy_env_parse!` macro discoverability: macro is defined with `#[macro_export]` in `surrealdb/core/src/mac/mod.rs` (confirmed via grep). It appears in `surrealdb/core/src/cnf/mod.rs` and all peer backends (`rocksdb/cnf.rs`, `tikv/cnf.rs`, `surrealkv/cnf.rs`) without an explicit `use` import — available implicitly at crate root. No extra import needed.
+
+**Tests / checks run:**
+- `diff .claude/lance-backend/lance/cnf.rs surrealdb/core/src/kvs/lance/cnf.rs` → exit 0 (identical)
