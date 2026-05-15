@@ -296,3 +296,24 @@ EOF
 **Tests / checks run:**
 - `cargo check --features kv-lance --no-default-features --manifest-path surrealdb/core/Cargo.toml` → 0 errors, 14 warnings (all pre-existing unused-import/unused-mut warnings; none from mod.rs changes)
 - `git diff --stat surrealdb/core/src/kvs/lance/mod.rs` → 1 file changed, 68 insertions(+), 34 deletions(-)
+
+## 2026-05-15T20:33 — C1 get-wirer (sonnet)
+**Target:** surrealdb/core/src/kvs/lance/mod.rs (Transaction::get only)
+**Verdict:** PASS
+
+**What was done:**
+- Replaced todo!() in Transaction::get with real Lance scan.
+- Scanner chain shape used: `let mut scanner = snapshot.scan(); scanner.filter(&filter).map_err(...)?.project(&["val", "version"]).map_err(...)?.limit(Some(1), None).map_err(...)?; let mut stream = scanner.try_into_stream().await.map_err(...)?;`
+- Empty-dataset checkout fallback: yes (any `checkout_version` error returns `Ok(None)`)
+- BinaryArray downcast via: `lance::deps::arrow_array::BinaryArray`
+
+**Notes / blockers:**
+- Lance API deviations from spec: `Dataset::checkout(v)` does NOT exist — actual method is `Dataset::checkout_version(impl Into<refs::Ref>)`. `u64` implements `From<u64> for refs::Ref` so passing `scan_version: u64` directly works.
+- Scanner methods return `Result<&mut Self>` (mutable builder), so they cannot be fluently chained through `?` in a single expression. Solution: assign `let mut scanner = snapshot.scan();` then call builder methods separately, then call `scanner.try_into_stream().await`.
+- `try_into_stream()` returns `BoxFuture<'_, Result<DatasetRecordBatchStream>>` — calling `.await` on the future directly (no extra `.map_err` wrapping needed before `.await`).
+- Error mapping: `Error::Datastore(String)` used throughout — no new variants.
+- `use futures::TryStreamExt;` placed inline inside the function body.
+
+**Tests / checks run:**
+- `cargo check --features kv-lance --no-default-features --manifest-path surrealdb/core/Cargo.toml` → Finished in 8m 55s, 0 errors, 12 warnings (all pre-existing)
+- `git diff --stat surrealdb/core/src/kvs/lance/mod.rs` → 1 file changed, 48 insertions(+), 33 deletions(-) (only Transaction::get changed)

@@ -411,40 +411,55 @@ impl Transactable for Transaction {
 		}
 
 		// (2) Fall through to Lance scan at the appropriate version.
-		let _scan_version = version.unwrap_or(self.read_version);
-		let _ds = self.dataset.read().await;
+		let scan_version = version.unwrap_or(self.read_version);
+		let ds = self.dataset.read().await;
 
-		// TODO(lance-integration):
-		//
-		// let snapshot = if let Some(v) = version {
-		//     ds.inner.checkout(v).await?
-		// } else {
-		//     ds.inner.checkout(self.read_version).await?
-		// };
-		//
-		// let filter = format!(
-		//     "key = X'{}' AND tombstone = false",
-		//     hex::encode(&key)
-		// );
-		//
-		// let mut stream = snapshot
-		//     .scan()
-		//     .filter(&filter)?
-		//     .project(&["val", "version"])?
-		//     .limit(Some(1), None)?
-		//     .try_into_stream()
-		//     .await?;
-		//
-		// while let Some(batch) = stream.try_next().await? {
-		//     if batch.num_rows() > 0 {
-		//         let val_col = batch.column_by_name("val").unwrap();
-		//         let val_array = val_col.as_any().downcast_ref::<BinaryArray>().unwrap();
-		//         return Ok(Some(val_array.value(0).to_vec()));
-		//     }
-		// }
-		// Ok(None)
+		// On a fresh dataset with no commits yet, checkout_version may fail.
+		// Treat any checkout failure here as "not found" — equivalent to
+		// no rows matching the filter.
+		let snapshot = match ds.inner.checkout_version(scan_version).await {
+			Ok(s) => s,
+			Err(_) => return Ok(None),
+		};
 
-		todo!("get: scan Lance dataset at version with key filter")
+		let filter = KvSchema::build_get_predicate(&key);
+
+		let mut scanner = snapshot.scan();
+		scanner
+			.filter(&filter)
+			.map_err(|e| Error::Datastore(format!("lance scan filter: {e}")))?
+			.project(&["val", "version"])
+			.map_err(|e| Error::Datastore(format!("lance scan project: {e}")))?
+			.limit(Some(1), None)
+			.map_err(|e| Error::Datastore(format!("lance scan limit: {e}")))?;
+
+		let mut stream = scanner
+			.try_into_stream()
+			.await
+			.map_err(|e| Error::Datastore(format!("lance scan stream: {e}")))?;
+
+		use futures::TryStreamExt;
+		while let Some(batch) = stream
+			.try_next()
+			.await
+			.map_err(|e| Error::Datastore(format!("lance scan next: {e}")))?
+		{
+			if batch.num_rows() > 0 {
+				// Use lance's re-exports for type compat (lance 1.0.4 ↔ arrow v56).
+				let val_col = batch
+					.column_by_name("val")
+					.ok_or_else(|| Error::Datastore("lance scan: missing val column".into()))?;
+				let val_array = val_col
+					.as_any()
+					.downcast_ref::<lance::deps::arrow_array::BinaryArray>()
+					.ok_or_else(|| {
+						Error::Datastore("lance scan: val column type mismatch".into())
+					})?;
+				return Ok(Some(val_array.value(0).to_vec()));
+			}
+		}
+
+		Ok(None)
 	}
 
 	// ------------------------------------------------------------------------
