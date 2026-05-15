@@ -16,6 +16,23 @@ use surrealdb_core::kvs::Datastore;
 use surrealdb_core::syn;
 use surrealdb_types::{Error as TypesError, Notification, Number, ToSql, Value};
 
+/// Returns the storage backend URL for tests.
+///
+/// Defaults to `"memory"` (in-process, no I/O). Override via the
+/// `SURREAL_TEST_KV` env var; the special value `"lance"` is expanded
+/// to a unique `lance:///tmp/srdb-test-lance-<uuid>` path so tests
+/// don't share dataset state.
+fn test_kv_path() -> String {
+	match std::env::var("SURREAL_TEST_KV").as_deref() {
+		Ok("lance") => format!(
+			"lance:///tmp/srdb-test-lance-{}",
+			uuid::Uuid::new_v4()
+		),
+		Ok(other) => other.to_string(),
+		_ => "memory".to_string(),
+	}
+}
+
 pub async fn new_ds(
 	ns: &str,
 	db: &str,
@@ -27,7 +44,7 @@ pub async fn new_ds(
 		.with_capabilities(Capabilities::all())
 		.with_notify(send)
 		.with_auth(auth)
-		.build_with_path("memory")
+		.build_with_path(&test_kv_path())
 		.await?;
 	new_ns_db(&ds, ns, db).await?;
 	Ok((recv, ds))
@@ -177,7 +194,7 @@ pub async fn iam_check_cases_impl(
 				.with_capabilities(Capabilities::all())
 				.with_notify(send)
 				.with_auth(true)
-				.build_with_path("memory")
+				.build_with_path(&test_kv_path())
 				.await
 				.unwrap();
 			iam_run_case(
@@ -202,7 +219,7 @@ pub async fn iam_check_cases_impl(
 				.with_capabilities(Capabilities::all())
 				.with_notify(send)
 				.with_auth(false)
-				.build_with_path("memory")
+				.build_with_path(&test_kv_path())
 				.await
 				.unwrap();
 			iam_run_case(
@@ -239,7 +256,7 @@ pub async fn iam_check_cases_impl(
 				.with_capabilities(Capabilities::all())
 				.with_notify(send)
 				.with_auth(auth_enabled)
-				.build_with_path("memory")
+				.build_with_path(&test_kv_path())
 				.await
 				.unwrap();
 			let expected_result = if auth_enabled {
