@@ -595,3 +595,43 @@ Sprint cycle proceeding to D (Day 3: set/commit) autoattended.
 **Tests / checks run:**
 - `cargo check --features kv-lance --no-default-features --manifest-path surrealdb/core/Cargo.toml` → Finished in 4m 34s, 0 errors, 10 warnings (all pre-existing)
 - `git diff --stat surrealdb/core/src/kvs/err.rs` → 1 file changed, 28 insertions(+), 0 deletions(-) (the impl block, already committed by prior worker)
+
+## 2026-05-15T21:42 — K1 integration-smoker (sonnet)
+**Target:** surrealdb/core/src/kvs/lance/integration_tests.rs (NEW) + 1 mod line in mod.rs
+**Verdict:** PASS
+
+**What was done:**
+- 3 SurrealQL-level smoke tests: smoke_create_select, smoke_update_overwrite, smoke_delete.
+- Used Datastore::builder().build_with_path("lance:///tmp/uuid").await as the builder path.
+- setup_ns_db() helper issues DEFINE NS + DEFINE DB preamble (same as helpers.rs::new_ns_db) so DML doesn't fail.
+- Added `#[cfg(test)] mod integration_tests;` to mod.rs (already present on arrival — a prior worker pre-populated both the file and the mod line).
+- All tests exercise the full stack: URL routing (ds.rs patch) → parser → planner → execution engine → Transactable trait → Lance storage.
+
+**Test results (per-test):**
+- smoke_create_select: PASS — CREATE person:1 + SELECT * FROM person:1 returns Alice
+- smoke_update_overwrite: PASS — CREATE counter:c n=1 + UPDATE n=2 + SELECT returns 2, not 1
+- smoke_delete: PASS — CREATE thing:t + DELETE + SELECT returns empty array
+
+**Notes / discovered gaps:**
+- No new gaps discovered. The full SurrealQL CREATE/SELECT/UPDATE/DELETE cycle works end-to-end through the lance backend.
+- 6 pre-existing warnings (dead_code in cnf.rs, tx_buffer.rs); none from integration_tests.rs.
+- ns/db DEFINE preamble is required: SurrealDB enforces namespace/database existence before DML — smoke tests call setup_ns_db() to satisfy this.
+
+**Tests / checks run:**
+- `cargo test --features "kv-lance kv-mem" --no-default-features --manifest-path surrealdb/core/Cargo.toml --lib kvs::lance::integration_tests` → 3 passed; 0 failed; finished in 0.73s
+- `wc -l surrealdb/core/src/kvs/lance/integration_tests.rs` → 187
+
+## 2026-05-15T21:40 — K2 differences-documenter (sonnet)
+**Target:** .claude/lance-backend/KNOWN_DIFFERENCES.md (NEW)
+**Verdict:** PASS
+
+**What was done:**
+- Wrote KNOWN_DIFFERENCES.md aggregating findings from Sprints A-J.
+- Unit test count: 37 (from grep -c "^async fn test_" tests.rs).
+- Days completed checklist mirrors actual state (1-12 all done).
+- Open/deferred list captures the lance-index BTREE, arrow unification,
+  byte-accurate ScanLimit::Bytes, concurrent-txn property test, upstream
+  test-harness routing, and benchmarks.
+
+**Tests / checks run:**
+- `wc -l .claude/lance-backend/KNOWN_DIFFERENCES.md` → 149
