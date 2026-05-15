@@ -323,11 +323,13 @@ impl Transactable for Transaction {
 	///
 	/// 1. Partition pending entries into writes (`Some(Val)`) and
 	///    tombstones (`None`).
-	/// 2. Build an Arrow `RecordBatch` from writes.
-	/// 3. `Dataset::append(batch).await` — single atomic Lance commit.
-	/// 4. For each tombstone, issue `Dataset::delete(predicate).await`.
-	///    (Lance combines these into one transaction if they happen
-	///    inside a single `with_transaction` block; see TODO below.)
+	/// 2. If there are writes, build an Arrow `RecordBatch` (using lance's
+	///    internal arrow v56 re-exports) and call `Dataset::append`.
+	/// 3. If there are deletes, call `Dataset::delete(predicate)`.
+	///    NOTE: Lance 1.0.4 does not expose a public `with_transaction` API,
+	///    so append and delete are issued sequentially (not atomic). This is
+	///    consistent with Lance's OCC semantics where concurrent-write conflicts
+	///    are rare with BindSpace-aware key prefixes.
 	async fn commit(&self) -> Result<()> {
 		if self.closed() {
 			return Err(Error::TransactionFinished);
@@ -341,26 +343,42 @@ impl Transactable for Transaction {
 
 		if !writes.is_empty() || !deletes.is_empty() {
 			let mut ds = self.dataset.write().await;
+			let new_version = self.read_version + 1;
 
-			// TODO(lance-integration): batch into a single Lance transaction
-			//
-			// let writes_batch = KvSchema::build_record_batch(&writes, self.read_version + 1)?;
-			// let deletes_predicate = KvSchema::build_delete_predicate(&deletes);
-			//
-			// ds.inner.with_transaction(|tx| async {
-			//     if !writes.is_empty() {
-			//         tx.append(writes_batch).await?;
-			//     }
-			//     if !deletes.is_empty() {
-			//         tx.delete(&deletes_predicate).await?;
-			//     }
-			//     Ok(())
-			// }).await?;
+			// ── writes ──────────────────────────────────────────────────────────
+			// Build the RecordBatch using lance's internal arrow re-exports (v56)
+			// so the types match what Dataset::append expects. Our Cargo.toml pins
+			// arrow-array = "55" but lance 1.0.4 uses v56 internally; the two
+			// versions have distinct type IDs and cannot be mixed.
+			if !writes.is_empty() {
+				let batch = Self::build_write_batch_lance(&writes, new_version)
+					.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?;
 
-			let _ = (writes, deletes, ds);
-			todo!("commit: build Arrow batch and call Dataset::append + Dataset::delete");
+				let schema_ref = batch.schema();
+				let reader = lance::deps::arrow_array::RecordBatchIterator::new(
+					vec![Ok(batch)],
+					schema_ref,
+				);
+
+				ds.inner
+					.append(reader, None)
+					.await
+					.map_err(|e| Error::Datastore(format!("lance append: {e}")))?;
+			}
+
+			// ── deletes ─────────────────────────────────────────────────────────
+			if !deletes.is_empty() {
+				let predicate = KvSchema::build_delete_predicate(&deletes);
+				ds.inner
+					.delete(&predicate)
+					.await
+					.map_err(|e| Error::Datastore(format!("lance delete: {e}")))?;
+			}
+
+			drop(ds);
 		}
 
+		drop(pending);
 		self.done.store(true, Ordering::Release);
 
 		// Notify optimizer; may trigger compaction if write-threshold
@@ -651,6 +669,50 @@ impl Transactable for Transaction {
 // ============================================================================
 
 impl Transaction {
+	/// Build a `RecordBatch` using lance's internal arrow re-exports (v56) so
+	/// that the types are compatible with `Dataset::append` without conversion.
+	///
+	/// Our Cargo.toml pins `arrow-array = "55"` while lance 1.0.4 requires v56
+	/// internally. The two major versions have distinct `TypeId`s, so we cannot
+	/// pass an arrow-v55 `RecordBatch` to a function expecting an arrow-v56
+	/// `RecordBatchReader`. We therefore rebuild the batch here using
+	/// `lance::deps::arrow_array` (the v56 re-export).
+	fn build_write_batch_lance(
+		writes: &[(crate::kvs::Key, crate::kvs::Val)],
+		version: u64,
+	) -> std::result::Result<
+		lance::deps::arrow_array::RecordBatch,
+		lance::deps::arrow_schema::ArrowError,
+	> {
+		use lance::deps::arrow_array::{BinaryArray, BooleanArray, RecordBatch, UInt64Array};
+		use lance::deps::arrow_schema::{DataType, Field, Schema};
+		use std::sync::Arc;
+
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("key", DataType::Binary, false),
+			Field::new("val", DataType::Binary, false),
+			Field::new("version", DataType::UInt64, false),
+			Field::new("tombstone", DataType::Boolean, false),
+		]));
+
+		let key_array: BinaryArray =
+			writes.iter().map(|(k, _)| Some(k.as_slice())).collect();
+		let val_array: BinaryArray =
+			writes.iter().map(|(_, v)| Some(v.as_slice())).collect();
+		let version_array = UInt64Array::from(vec![version; writes.len()]);
+		let tombstone_array = BooleanArray::from(vec![false; writes.len()]);
+
+		RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(key_array),
+				Arc::new(val_array),
+				Arc::new(version_array),
+				Arc::new(tombstone_array),
+			],
+		)
+	}
+
 	/// Unified scan/scanr implementation. Merges:
 	///   - pending writes (in-memory, overrides Lance)
 	///   - Lance dataset state at `read_version`

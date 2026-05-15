@@ -149,3 +149,115 @@ async fn test_exists_mirrors_get() {
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
+
+// ============================================================================
+//  Transaction::commit tests (Day 3)
+// ============================================================================
+
+/// set → commit → get round-trips via the Lance dataset (not just pending).
+#[tokio::test]
+async fn test_set_commit_get_roundtrip() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("path is valid UTF-8");
+	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+	// First transaction: set + commit.
+	{
+		let tx = ds.transaction(true, false).await.expect("tx1");
+		tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
+		tx.commit().await.expect("commit");
+	}
+
+	// Second transaction: get must see the committed value via Lance scan.
+	let tx = ds.transaction(false, false).await.expect("tx2");
+	let result = tx.get(b"k1".to_vec(), None).await.expect("get");
+	assert_eq!(result.as_deref(), Some(b"v1".as_ref()),
+		"set+commit+get failed: expected Some(v1), got {:?}", result);
+	tx.cancel().await.expect("cancel");
+	ds.shutdown().await.expect("shutdown");
+}
+
+/// cancel discards pending writes — they are not visible afterward.
+#[tokio::test]
+async fn test_cancel_discards_pending_writes() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("path is valid UTF-8");
+	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+	{
+		let tx = ds.transaction(true, false).await.expect("tx1");
+		tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
+		tx.cancel().await.expect("cancel");
+	}
+
+	let tx = ds.transaction(false, false).await.expect("tx2");
+	let result = tx.get(b"k1".to_vec(), None).await.expect("get");
+	assert!(result.is_none(),
+		"cancel should discard pending writes; got {:?}", result);
+	tx.cancel().await.expect("cancel");
+	ds.shutdown().await.expect("shutdown");
+}
+
+/// Multiple set calls in one txn become visible atomically after commit.
+#[tokio::test]
+async fn test_multiple_sets_commit_atomically() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("path is valid UTF-8");
+	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+	{
+		let tx = ds.transaction(true, false).await.expect("tx1");
+		tx.set(b"a".to_vec(), b"1".to_vec()).await.expect("set a");
+		tx.set(b"b".to_vec(), b"2".to_vec()).await.expect("set b");
+		tx.set(b"c".to_vec(), b"3".to_vec()).await.expect("set c");
+		tx.commit().await.expect("commit");
+	}
+
+	let tx = ds.transaction(false, false).await.expect("tx2");
+	for (k, v) in [(b"a".as_ref(), b"1".as_ref()), (b"b", b"2"), (b"c", b"3")] {
+		let result = tx.get(k.to_vec(), None).await.expect("get");
+		assert_eq!(result.as_deref(), Some(v),
+			"multi-set commit missing key {:?}: got {:?}", k, result);
+	}
+	tx.cancel().await.expect("cancel");
+	ds.shutdown().await.expect("shutdown");
+}
+
+/// del after commit hides a previously-committed value.
+#[tokio::test]
+async fn test_del_after_commit_hides_value() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("path is valid UTF-8");
+	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+	// Insert.
+	{
+		let tx = ds.transaction(true, false).await.expect("tx1");
+		tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
+		tx.commit().await.expect("commit set");
+	}
+
+	// Sanity: value is there.
+	{
+		let tx = ds.transaction(false, false).await.expect("tx2");
+		let result = tx.get(b"k1".to_vec(), None).await.expect("get pre-del");
+		assert_eq!(result.as_deref(), Some(b"v1".as_ref()),
+			"pre-delete sanity failed; got {:?}", result);
+		tx.cancel().await.expect("cancel");
+	}
+
+	// Delete + commit.
+	{
+		let tx = ds.transaction(true, false).await.expect("tx3");
+		tx.del(b"k1".to_vec()).await.expect("del");
+		tx.commit().await.expect("commit del");
+	}
+
+	// Value should be gone.
+	let tx = ds.transaction(false, false).await.expect("tx4");
+	let result = tx.get(b"k1".to_vec(), None).await.expect("get post-del");
+	assert!(result.is_none(),
+		"del+commit should hide value; got {:?}", result);
+	tx.cancel().await.expect("cancel");
+	ds.shutdown().await.expect("shutdown");
+}
