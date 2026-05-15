@@ -8,6 +8,7 @@
 //!
 //! These operations can be processed by the following storage engines:
 //! - `indxdb`: WASM based database to store data in the browser
+//! - `lance`: [Lance](https://lance.org) versioned columnar format with native MVCC, OCC, and scalar indexes. Optimised for AI/analytical workloads.
 //! - `rocksdb`: [RocksDB](https://github.com/facebook/rocksdb) an embeddable persistent key-value
 //!   store for fast storage
 //! - `tikv`: [TiKV](https://github.com/tikv/tikv) a distributed, and transactional key-value
@@ -32,6 +33,8 @@ mod tx;
 mod util;
 
 mod indxdb;
+#[cfg(feature = "kv-lance")]
+mod lance;
 mod mem;
 mod rocksdb;
 mod surrealkv;

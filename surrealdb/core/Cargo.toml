@@ -24,6 +24,7 @@ kv-mem = [
     "dep:affinitypool",
 ]
 kv-indxdb = ["dep:indxdb"]
+kv-lance = ["dep:lance", "dep:arrow-array", "dep:arrow-schema"]
 kv-rocksdb = [
     "dep:rocksdb",
     "tokio/time",
@@ -94,6 +95,9 @@ surrealdb-types = { workspace = true }
 vart.workspace = true
 
 # External KV stores
+lance = { version = "1.0", optional = true }
+arrow-array = { version = "55", optional = true }
+arrow-schema = { version = "55", optional = true }
 rocksdb = { workspace = true, optional = true }
 tikv = { workspace = true, optional = true }
 

@@ -324,6 +324,8 @@ pub enum DatastoreFlavor {
 	TiKV(super::tikv::Datastore),
 	#[cfg(feature = "kv-surrealkv")]
 	SurrealKV(super::surrealkv::Datastore),
+	#[cfg(feature = "kv-lance")]
+	Lance(super::lance::Datastore),
 }
 
 impl TransactionBuilderFactoryRequirements for CommunityComposer {}
@@ -427,6 +429,25 @@ impl TransactionBuilderFactory for CommunityComposer {
 				#[cfg(not(feature = "kv-surrealkv"))]
 				bail!(Error::Kvs(crate::kvs::Error::Datastore("Cannot connect to the `surrealkv` storage engine as it is not enabled in this build of SurrealDB".to_owned())));
 			}
+			// Initiate a Lance datastore
+			(flavour @ "lance", path) => {
+				#[cfg(feature = "kv-lance")]
+				{
+					// Create a new blocking threadpool
+					super::threadpool::initialise();
+					// Parse Lance-specific configuration from query parameters
+					let config =
+						super::config::LanceConfig::from_params(&params).map_err(Error::Kvs)?;
+					// Initialise the storage engine
+					let v = super::lance::Datastore::new(&path, config)
+						.await
+						.map(DatastoreFlavor::Lance)?;
+					info!(target: TARGET, "Started {flavour} kvs store");
+					Ok(Box::<DatastoreFlavor>::new(v))
+				}
+				#[cfg(not(feature = "kv-lance"))]
+				bail!(Error::Kvs(crate::kvs::Error::Datastore("Cannot connect to the `lance` storage engine as it is not enabled in this build of SurrealDB".to_owned())));
+			}
 			// Initiate an IndxDB database
 			(flavour @ "indxdb", path) => {
 				#[cfg(feature = "kv-indxdb")]
@@ -517,6 +538,11 @@ impl TransactionBuilder for DatastoreFlavor {
 			}
 			#[cfg(feature = "kv-surrealkv")]
 			Self::SurrealKV(v) => {
+				let tx = v.transaction(write, lock).await?;
+				(tx, true)
+			}
+			#[cfg(feature = "kv-lance")]
+			Self::Lance(v) => {
 				let tx = v.transaction(write, lock).await?;
 				(tx, true)
 			}
