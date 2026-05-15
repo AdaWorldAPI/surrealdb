@@ -261,3 +261,188 @@ async fn test_del_after_commit_hides_value() {
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
+
+// ============================================================================
+//  Transaction::put / putc tests (Day 4)
+// ============================================================================
+
+/// put on a missing key succeeds.
+#[tokio::test]
+async fn test_put_succeeds_on_missing() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().unwrap();
+    let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+    let tx = ds.transaction(true, false).await.expect("tx");
+    tx.put(b"k1".to_vec(), b"v1".to_vec()).await.expect("put missing");
+    tx.commit().await.expect("commit");
+
+    let tx2 = ds.transaction(false, false).await.expect("tx2");
+    assert_eq!(tx2.get(b"k1".to_vec(), None).await.expect("get").as_deref(),
+               Some(b"v1".as_ref()));
+    tx2.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// put on an existing key returns TransactionKeyAlreadyExists.
+#[tokio::test]
+async fn test_put_fails_on_existing() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().unwrap();
+    let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+    // Insert.
+    {
+        let tx = ds.transaction(true, false).await.expect("tx1");
+        tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
+        tx.commit().await.expect("commit");
+    }
+
+    // put should now fail.
+    let tx = ds.transaction(true, false).await.expect("tx2");
+    let err = tx.put(b"k1".to_vec(), b"v2".to_vec()).await.expect_err("put should fail");
+    assert!(matches!(err, crate::kvs::err::Error::TransactionKeyAlreadyExists),
+        "expected TransactionKeyAlreadyExists, got {:?}", err);
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// putc with a matching chk replaces the value.
+#[tokio::test]
+async fn test_putc_matching_value_succeeds() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().unwrap();
+    let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+    {
+        let tx = ds.transaction(true, false).await.expect("tx1");
+        tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
+        tx.commit().await.expect("commit");
+    }
+
+    {
+        let tx = ds.transaction(true, false).await.expect("tx2");
+        tx.putc(b"k1".to_vec(), b"v2".to_vec(), Some(b"v1".to_vec()))
+            .await.expect("putc match");
+        tx.commit().await.expect("commit");
+    }
+
+    let tx = ds.transaction(false, false).await.expect("tx3");
+    assert_eq!(tx.get(b"k1".to_vec(), None).await.expect("get").as_deref(),
+               Some(b"v2".as_ref()));
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// putc with a mismatched chk returns TransactionConditionNotMet.
+#[tokio::test]
+async fn test_putc_mismatched_value_fails() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().unwrap();
+    let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+    {
+        let tx = ds.transaction(true, false).await.expect("tx1");
+        tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
+        tx.commit().await.expect("commit");
+    }
+
+    let tx = ds.transaction(true, false).await.expect("tx2");
+    let err = tx.putc(b"k1".to_vec(), b"v2".to_vec(), Some(b"wrong".to_vec()))
+        .await.expect_err("putc should fail");
+    assert!(matches!(err, crate::kvs::err::Error::TransactionConditionNotMet),
+        "expected TransactionConditionNotMet, got {:?}", err);
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// putc with None chk on a missing key succeeds (inserts).
+#[tokio::test]
+async fn test_putc_none_chk_on_missing_succeeds() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().unwrap();
+    let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+    let tx = ds.transaction(true, false).await.expect("tx");
+    tx.putc(b"k1".to_vec(), b"v1".to_vec(), None).await.expect("putc None on missing");
+    tx.commit().await.expect("commit");
+
+    let tx2 = ds.transaction(false, false).await.expect("tx2");
+    assert_eq!(tx2.get(b"k1".to_vec(), None).await.expect("get").as_deref(),
+               Some(b"v1".as_ref()));
+    tx2.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+// ============================================================================
+//  Transaction::delc tests (Day 5)
+// ============================================================================
+
+/// delc with a matching chk deletes the value.
+#[tokio::test]
+async fn test_delc_matching_value_succeeds() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().unwrap();
+    let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+    {
+        let tx = ds.transaction(true, false).await.expect("tx1");
+        tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
+        tx.commit().await.expect("commit");
+    }
+
+    {
+        let tx = ds.transaction(true, false).await.expect("tx2");
+        tx.delc(b"k1".to_vec(), Some(b"v1".to_vec()))
+            .await.expect("delc match");
+        tx.commit().await.expect("commit");
+    }
+
+    let tx = ds.transaction(false, false).await.expect("tx3");
+    assert!(tx.get(b"k1".to_vec(), None).await.expect("get").is_none());
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// delc with mismatched chk returns TransactionConditionNotMet; value persists.
+#[tokio::test]
+async fn test_delc_mismatched_value_fails() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().unwrap();
+    let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+    {
+        let tx = ds.transaction(true, false).await.expect("tx1");
+        tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
+        tx.commit().await.expect("commit");
+    }
+
+    {
+        let tx = ds.transaction(true, false).await.expect("tx2");
+        let err = tx.delc(b"k1".to_vec(), Some(b"wrong".to_vec()))
+            .await.expect_err("delc should fail");
+        assert!(matches!(err, crate::kvs::err::Error::TransactionConditionNotMet),
+            "expected TransactionConditionNotMet, got {:?}", err);
+        tx.cancel().await.expect("cancel");
+    }
+
+    let tx = ds.transaction(false, false).await.expect("tx3");
+    assert_eq!(tx.get(b"k1".to_vec(), None).await.expect("get").as_deref(),
+               Some(b"v1".as_ref()),
+        "delc with wrong chk should NOT delete the value");
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// delc with None chk on a missing key is a trivial success (no-op).
+#[tokio::test]
+async fn test_delc_none_chk_on_missing_is_noop() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().unwrap();
+    let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+    let tx = ds.transaction(true, false).await.expect("tx");
+    tx.delc(b"absent".to_vec(), None).await.expect("delc None on missing is no-op");
+    tx.commit().await.expect("commit");
+    ds.shutdown().await.expect("shutdown");
+}
