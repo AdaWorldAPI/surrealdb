@@ -867,3 +867,56 @@ async fn test_versioned_query_with_versioned_false_errors() {
     tx.cancel().await.expect("cancel");
     ds.shutdown().await.expect("shutdown");
 }
+
+// ============================================================================
+//  Background optimizer tests (Day 10)
+// ============================================================================
+
+/// Optimizer doesn't panic when commits happen during its loop.
+/// We use the default config (optimizer enabled, interval = 5 min — too long
+/// to trigger from time alone in a test). After 10 commits, notify_commit
+/// has been called 10 times; the optimizer may or may not have triggered
+/// depending on LANCE_OPTIMIZE_AFTER_N_WRITES (default 1000), so we just
+/// assert the host process still works after the writes.
+#[tokio::test]
+async fn test_background_optimizer_does_not_panic_on_concurrent_commits() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+
+    for i in 0..10 {
+        let tx = ds.transaction(true, false).await.expect("tx");
+        let key = format!("k{}", i).into_bytes();
+        let val = format!("v{}", i).into_bytes();
+        tx.set(key, val).await.expect("set");
+        tx.commit().await.expect("commit");
+    }
+
+    // Sanity: a get still works after 10 commits.
+    let tx = ds.transaction(false, false).await.expect("tx_read");
+    let v = tx.get(b"k5".to_vec(), None).await.expect("get");
+    assert_eq!(v.as_deref(), Some(b"v5".as_ref()));
+    tx.cancel().await.expect("cancel");
+
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// Shutdown completes within 2 seconds even when the optimizer task is alive.
+#[tokio::test]
+async fn test_optimizer_shutdown_completes_within_timeout() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+
+    // Do one commit so the optimizer has been notified.
+    {
+        let tx = ds.transaction(true, false).await.expect("tx");
+        tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
+        tx.commit().await.expect("commit");
+    }
+
+    // Shutdown must complete within 2 seconds.
+    let shutdown_fut = ds.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(2), shutdown_fut)
+        .await
+        .expect("shutdown did not complete within 2s")
+        .expect("shutdown returned an error");
+}
