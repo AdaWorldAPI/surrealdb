@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used)]
+#![recursion_limit = "1024"]
 
 use surrealdb_core::iam::Level;
 use surrealdb_core::syn;

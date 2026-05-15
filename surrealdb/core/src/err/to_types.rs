@@ -305,7 +305,8 @@ pub fn into_types_error(error: Error) -> TypesError {
 			}
 			KvsError::TransactionFinished
 			| KvsError::TransactionReadonly
-			| KvsError::TransactionConditionNotMet => TypesError::query(message, None),
+			| KvsError::TransactionConditionNotMet
+			| KvsError::NoSavePointPresent => TypesError::query(message, None),
 			KvsError::UnsupportedVersionedQueries => TypesError::configuration(message, None),
 			KvsError::Datastore(_)
 			| KvsError::Transaction(_)

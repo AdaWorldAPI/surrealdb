@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Edit(/home/user/surrealdb/**)",
+      "Write(/home/user/surrealdb/**)",
+      "MultiEdit(/home/user/surrealdb/**)",
+      "NotebookEdit(/home/user/surrealdb/**)",
+      "Read(/home/user/surrealdb/**)",
+      "Read(/home/user/lance-graph/**)",
+      "Read(/home/user/ndarray/**)",
+
+      "Edit(**)",
+      "Write(**)",
+      "MultiEdit(**)",
+
+      "Bash(*)",
+
+      "WebFetch",
+      "WebSearch"
+    ],
+    "deny": [
+      "Edit(/home/user/lance-graph/**)",
+      "Write(/home/user/lance-graph/**)",
+      "MultiEdit(/home/user/lance-graph/**)",
+      "Edit(/home/user/ndarray/**)",
+      "Write(/home/user/ndarray/**)",
+      "MultiEdit(/home/user/ndarray/**)",
+
+      "Bash(rm -rf /:*)",
+      "Bash(rm -rf /home:*)",
+      "Bash(rm -rf /home/user:*)",
+      "Bash(rm -rf ~:*)",
+      "Bash(sudo:*)",
+
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git reset --hard origin:*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/user/surrealdb/.claude/hooks/session-start.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
