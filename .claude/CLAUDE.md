@@ -16,6 +16,15 @@ context.
 .claude/
 ├── CLAUDE.md                       ← you are here (orientation)
 ├── BOOT.md                         ← startup ritual for new sessions
+├── settings.json                   ← workspace permissions + hook wiring
+├── board/                          ← APPEND-ONLY session ledgers
+│   ├── AGENT_LOG.md                ← per-session run log (newest first)
+│   └── EPIPHANIES.md               ← findings / conjectures (newest first)
+├── knowledge/                      ← reference docs (READ BY: …)
+│   ├── lance-api-surface.md        ← Lance Dataset API the TODOs call
+│   └── transactable-contract.md    ← the 19 trait methods + invariants
+├── hooks/
+│   └── session-start.sh            ← injects read order at turn 0
 └── lance-backend/                  ← current active project
     ├── README.md                   ← architecture, design, roadmap
     ├── DAY_BY_DAY.md               ← 12-day implementation plan
@@ -48,16 +57,28 @@ are marked `TODO(lance-integration)` and the integration is the
 ## Working agreement (for agents)
 
 This workspace mirrors the AdaWorldAPI pattern used in WoA, lance-graph,
-and other repos. Three rules:
+and other repos. Four rules:
 
 1. **Read BOOT.md first.** Every session. No exceptions. It's the
    loading ritual — orient yourself before touching anything.
-2. **Append don't overwrite.** When adding new files here, place them
-   in a project subdirectory. Don't modify upstream files (e.g.
-   `surrealdb/core/...`) without an explicit patch file in the
-   relevant project's `patches/` directory.
-3. **Commit small.** Each meaningful work step is one commit with a
-   clear message. Mirror Stefan's pattern from WoA.
+2. **Append don't overwrite.** Two flavours:
+   - **Project files.** When adding new files here, place them in
+     a project subdirectory. Don't modify upstream files (e.g.
+     `surrealdb/core/...`) without an explicit patch file in the
+     relevant project's `patches/` directory.
+   - **Board files.** `board/AGENT_LOG.md` and `board/EPIPHANIES.md`
+     are append-only ledgers — write only via `tee -a`, never via
+     `Edit` / `Write` / `>` redirection. Old entries never mutate;
+     corrections append as dated entries citing the original.
+3. **Knowledge before code.** Before resolving a `TODO(lance-integration)`
+   site, load the matching `knowledge/*.md` doc:
+   - `knowledge/lance-api-surface.md` — for any TODO that calls
+     into `lance::Dataset` / `Transaction`.
+   - `knowledge/transactable-contract.md` — for any change to a
+     `Transactable` trait method.
+4. **Commit small.** Each meaningful work step is one commit with a
+   clear message. Mirror Stefan's pattern from WoA. Append one
+   `AGENT_LOG.md` entry per commit batch.
 
 ## What this directory is NOT
 

@@ -11,11 +11,26 @@ Read this file **first** on every new session. It's a 5-minute orient.
 2. **This directory's `CLAUDE.md`** (next to this file).
    - Explains what `.claude/` is for and what the AdaWorldAPI work
      adds on top of upstream.
-3. **The active project's `README.md`** (e.g.
+3. **`.claude/board/AGENT_LOG.md`**.
+   - APPEND-ONLY (newest first). Tells you what prior sessions did,
+     what was committed, what's still open. Skim the top 3 entries.
+4. **`.claude/board/EPIPHANIES.md`**.
+   - APPEND-ONLY (newest first). Findings and conjectures that
+     affect how to interpret the scaffold. Skim entries marked
+     `**Status:** FINDING` for invariants you must preserve.
+5. **The active project's `README.md`** (e.g.
    `lance-backend/README.md`).
    - Tells you what the project is, what's done, what's pending.
-4. **The active project's `DAY_BY_DAY.md`**.
+6. **The active project's `DAY_BY_DAY.md`**.
    - Tells you what to do next. Find the first unchecked box.
+
+If the unchecked box involves a `TODO(lance-integration)` site,
+also load the relevant knowledge doc:
+
+- `.claude/knowledge/lance-api-surface.md` — when the TODO calls
+  `lance::Dataset` / `lance::Transaction` methods.
+- `.claude/knowledge/transactable-contract.md` — when the TODO is
+  in a `Transactable` trait method body.
 
 ## 2. Understand the working context
 
@@ -62,12 +77,15 @@ If you're a fresh session with no specific instruction:
 1. Look at `lance-backend/DAY_BY_DAY.md`.
 2. Find the first unchecked box.
 3. Read the surrounding context (often a `TODO(lance-integration)`
-   block in the relevant `lance/*.rs` file).
+   block in the relevant `lance/*.rs` file). Load the matching
+   knowledge doc (`knowledge/lance-api-surface.md` or
+   `knowledge/transactable-contract.md`).
 4. Do that one task.
-5. Check the box. Commit. Stop.
+5. Check the box. Commit. Append one entry to
+   `.claude/board/AGENT_LOG.md` via `tee -a`. Stop.
 
 If you have a specific instruction from a human, do that instead —
-but still read the four files in step 1 first.
+but still read the files in step 1 first.
 
 ## 5. When something feels wrong
 

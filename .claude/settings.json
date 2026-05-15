@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Edit(/home/user/surrealdb/**)",
+      "Write(/home/user/surrealdb/**)",
+      "MultiEdit(/home/user/surrealdb/**)",
+      "Edit(**/*.md)",
+      "Edit(**/*.rs)",
+      "Edit(**/*.toml)",
+      "Edit(**/*.json)",
+      "Edit(**/*.sh)",
+      "Write(**/*.md)",
+      "Write(**/*.rs)",
+      "Write(**/*.toml)",
+      "Write(**/*.json)",
+      "Write(**/*.sh)",
+      "MultiEdit(**/*.md)",
+      "MultiEdit(**/*.rs)",
+      "MultiEdit(**/*.toml)",
+
+      "Bash(touch:*)",
+      "Bash(touch /home/user/surrealdb/**:*)",
+      "Bash(mkdir -p:*)",
+      "Bash(mkdir -p /home/user/surrealdb/**:*)",
+
+      "Bash(tee -a:*)",
+      "Bash(tee -a /home/user/surrealdb/**:*)",
+      "Bash(tee -a .claude/board/:*)",
+      "Bash(tee -a .claude/board/**:*)",
+      "Bash(tee -a .claude/board/AGENT_LOG.md:*)",
+      "Bash(tee -a .claude/board/EPIPHANIES.md:*)",
+      "Bash(tee -a .claude/knowledge/:*)",
+      "Bash(tee -a .claude/knowledge/**:*)",
+      "Bash(cat >> /home/user/surrealdb/**:*)",
+      "Bash(cat >> .claude/board/:*)",
+      "Bash(cat >> .claude/board/**:*)",
+      "Bash(cat >> .claude/knowledge/:*)",
+      "Bash(cat >> .claude/knowledge/**:*)",
+
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git branch:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git checkout:*)",
+      "Bash(git checkout -b:*)",
+      "Bash(git fetch origin:*)",
+      "Bash(git pull origin:*)",
+      "Bash(git push -u origin:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git show:*)",
+      "Bash(git stash:*)",
+
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo make fmt:*)",
+      "Bash(cargo make ci-clippy:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo doc:*)",
+      "Bash(cargo fmt:*)",
+
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(rg:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(pwd:*)",
+      "Bash(echo:*)",
+      "Bash(cat /home/user/surrealdb/**:*)",
+      "Bash(diff:*)"
+    ],
+    "deny": [
+      "Edit(/home/user/lance-graph/**)",
+      "Write(/home/user/lance-graph/**)",
+      "MultiEdit(/home/user/lance-graph/**)",
+      "Edit(/home/user/ndarray/**)",
+      "Write(/home/user/ndarray/**)",
+      "MultiEdit(/home/user/ndarray/**)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/user/surrealdb/.claude/hooks/session-start.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
