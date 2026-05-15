@@ -317,3 +317,29 @@ EOF
 **Tests / checks run:**
 - `cargo check --features kv-lance --no-default-features --manifest-path surrealdb/core/Cargo.toml` → Finished in 8m 55s, 0 errors, 12 warnings (all pre-existing)
 - `git diff --stat surrealdb/core/src/kvs/lance/mod.rs` → 1 file changed, 48 insertions(+), 33 deletions(-) (only Transaction::get changed)
+
+## 2026-05-15T19:45 — Meta-B + Meta-C integration-checker (opus, main thread)
+**Target:** verification of Sprint B (Day 1) + Sprint C (Day 2)
+**Verdict:** PASS — 7/7 tests pass
+
+**Test run:**
+```
+cargo test --features "kv-lance kv-mem" --no-default-features --lib kvs::lance::tests
+```
+
+- test_open_creates_new_dataset ........................ ok
+- test_open_existing_dataset_succeeds .................. ok
+- test_current_version_is_queryable .................... ok
+- test_get_missing_key_returns_none .................... ok  ← real Lance scan
+- test_get_after_set_returns_pending_value ............. ok  ← RYW path
+- test_get_after_set_then_del_in_pending_returns_none .. ok  ← tombstone overrides
+- test_exists_mirrors_get .............................. ok
+- test result: 7 passed; 0 failed; finished in 0.03s
+
+**Notes / Lance API findings carried forward:**
+- `Dataset::checkout_version(impl Into<Ref>)` is the actual name in lance 1.0.4 (not `checkout`). u64 has `From<u64>` for Ref.
+- Scanner builder methods (filter/project/limit) return `Result<&mut Self>`, not `Result<Self>`. Cannot be fluently chained; call sequentially on a `let mut scanner = ...` binding.
+- BinaryArray downcast must use `lance::deps::arrow_array::BinaryArray` for type compat (arrow v55 pin vs lance's internal v56).
+- Test harness needs `--features "kv-lance kv-mem"` because upstream `iam/file.rs` uses `tempfile` which is gated to kv-mem/rocksdb/surrealkv only.
+
+Sprint cycle proceeding to D (Day 3: set/commit) autoattended.
