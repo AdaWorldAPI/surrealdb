@@ -107,6 +107,10 @@ pub(super) struct CommitGate {
 	/// Held to signal the coordinator task to drain & exit. `None` after
 	/// `shutdown` has been invoked.
 	shutdown: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
+	/// Join handle for the coordinator task, so [`Self::shutdown`] can
+	/// `.await` it and guarantee that all queued submissions have been
+	/// drained and acknowledged before returning.
+	coordinator: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl CommitGate {
@@ -116,11 +120,12 @@ impl CommitGate {
 		let (submit_tx, submit_rx) = mpsc::channel::<Submission>(CHANNEL_CAPACITY);
 		let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-		tokio::spawn(coordinator_loop(dataset, submit_rx, shutdown_rx));
+		let coordinator = tokio::spawn(coordinator_loop(dataset, submit_rx, shutdown_rx));
 
 		Arc::new(Self {
 			submit: submit_tx,
 			shutdown: tokio::sync::Mutex::new(Some(shutdown_tx)),
+			coordinator: tokio::sync::Mutex::new(Some(coordinator)),
 		})
 	}
 
@@ -153,39 +158,89 @@ impl CommitGate {
 	}
 
 	/// Cooperative shutdown — signal the coordinator to drain pending work
-	/// and exit. Subsequent calls are no-ops.
+	/// and exit, then `.await` the coordinator task so all queued
+	/// submissions have been committed and replied to before this returns.
+	///
+	/// Subsequent calls are no-ops (both the signal channel and the join
+	/// handle are taken on first call).
 	pub(super) async fn shutdown(&self) {
+		// 1. Fire the shutdown signal so the coordinator transitions
+		//    into its drain phase (closes the submit channel, then keeps
+		//    flushing batches until the channel is empty).
 		if let Some(tx) = self.shutdown.lock().await.take() {
 			let _ = tx.send(());
+		}
+		// 2. Wait for the coordinator task to actually exit. Without
+		//    this, callers of `Datastore::shutdown()` race against the
+		//    coordinator and may observe a dropped-reply error on
+		//    commits that were enqueued just before the shutdown signal.
+		if let Some(handle) = self.coordinator.lock().await.take() {
+			let _ = handle.await;
 		}
 	}
 }
 
 /// The coordinator's main loop. Owns the receiver end of the submission
 /// channel and the dataset write-handle.
+///
+/// On shutdown signal, the loop transitions into a drain phase: the
+/// submission channel is closed (no new submitters can enqueue) and any
+/// already-queued submissions are flushed as final batches before the
+/// coordinator returns. Without this, in-flight `commit()` callers
+/// would receive a "coordinator dropped reply" error even though
+/// `Datastore::shutdown` is documented to drain the gate first.
 async fn coordinator_loop(
 	dataset: Arc<RwLock<DatasetHandle>>,
 	mut submit_rx: mpsc::Receiver<Submission>,
 	mut shutdown_rx: oneshot::Receiver<()>,
 ) {
+	let mut shutting_down = false;
 	loop {
-		// Wait for the first submission OR the shutdown signal.
-		let first = tokio::select! {
-			biased;
-			_ = &mut shutdown_rx => {
-				trace!(target: TARGET, "commit gate received shutdown signal");
-				return;
-			},
-			sub = submit_rx.recv() => match sub {
+		// Wait for the first submission. While not shutting down, also
+		// race against the shutdown signal so we can transition into the
+		// drain phase. After shutdown is signalled we only `recv` — the
+		// channel is closed, so `recv` returns `None` once the queue is
+		// empty and we exit cleanly.
+		let first = if shutting_down {
+			match submit_rx.recv().await {
 				Some(s) => s,
 				None => {
-					trace!(target: TARGET, "commit gate submission channel closed");
+					trace!(
+						target: TARGET,
+						"commit gate drained and exiting after shutdown"
+					);
 					return;
+				}
+			}
+		} else {
+			tokio::select! {
+				biased;
+				_ = &mut shutdown_rx => {
+					trace!(
+						target: TARGET,
+						"commit gate received shutdown signal — draining queued submissions"
+					);
+					// Stop accepting new submissions; the channel
+					// stays open for already-queued items to drain.
+					submit_rx.close();
+					shutting_down = true;
+					continue;
 				},
-			},
+				sub = submit_rx.recv() => match sub {
+					Some(s) => s,
+					None => {
+						trace!(target: TARGET, "commit gate submission channel closed");
+						return;
+					},
+				},
+			}
 		};
 
 		// Open the batch window — accumulate until MAX_BATCH_SIZE or BATCH_WINDOW.
+		// During drain (shutting_down), we still respect the window but the
+		// `recv()` calls will return `None` as soon as the queue empties, so
+		// we naturally tail off into a final batch rather than waiting the
+		// full 500 µs for nothing.
 		let mut batch = Vec::with_capacity(MAX_BATCH_SIZE);
 		batch.push(first);
 		let deadline = tokio::time::Instant::now() + BATCH_WINDOW;
@@ -198,7 +253,12 @@ async fn coordinator_loop(
 		}
 
 		let batch_len = batch.len();
-		trace!(target: TARGET, "commit gate flushing batch of {} submissions", batch_len);
+		trace!(
+			target: TARGET,
+			"commit gate flushing batch of {} submissions (shutting_down={})",
+			batch_len,
+			shutting_down
+		);
 
 		// Execute the coalesced commit and broadcast the result.
 		execute_batch(&dataset, batch).await;

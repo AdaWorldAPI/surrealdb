@@ -1262,3 +1262,77 @@ async fn test_concurrent_same_key_yields_one_winner() {
         .await
         .expect("shutdown");
 }
+
+/// Regression test for the codex P2 finding on PR #17 (Sprint Z):
+/// `Datastore::shutdown` must drain queued commits in the CollapseGate
+/// coordinator rather than dropping their reply channels.
+///
+/// Pattern: spawn a small race-prone batch of commits and shut down
+/// immediately afterwards. Every commit that the caller `.await`ed
+/// MUST observe either `Ok(())` (drained) or a clean
+/// "commit gate coordinator shut down" error — never a dangling
+/// "coordinator dropped reply", which was the pre-fix bug.
+#[tokio::test]
+async fn shutdown_drains_pending_commits() {
+    use std::sync::Arc;
+
+    let path = unique_tmp_path();
+    let path_str = path.to_str().expect("path is valid UTF-8");
+    let ds = Arc::new(
+        Datastore::new(path_str, LanceConfig::default())
+            .await
+            .expect("create dataset"),
+    );
+
+    // Spawn enough concurrent commits that some will be queued in the
+    // gate's channel while the coordinator is still draining the first
+    // batch. Each commit writes a unique key so BUNDLE-merge can't
+    // collapse them.
+    let mut handles = Vec::new();
+    for i in 0..16u32 {
+        let ds_clone = Arc::clone(&ds);
+        handles.push(tokio::spawn(async move {
+            let tx = ds_clone
+                .transaction(true, false)
+                .await
+                .expect("open tx");
+            tx.set(
+                format!("shutdown_drain_key_{i}").into_bytes(),
+                b"v".to_vec(),
+            )
+            .await
+            .expect("set");
+            tx.commit().await
+        }));
+    }
+
+    // Give the gate a moment to receive submissions (the coordinator
+    // pulls them off the mpsc channel in its hot loop).
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    // Drain & shutdown — this must `.await` the coordinator task
+    // internally, so when this returns, every queued commit has either
+    // landed or been gracefully rejected.
+    Arc::try_unwrap(ds)
+        .map_err(|_| "ds still has outstanding refs")
+        .unwrap()
+        .shutdown()
+        .await
+        .expect("shutdown");
+
+    // Verify the contract: every commit either succeeded (was drained)
+    // or returned the clean "gate shut down" error. The pre-fix bug
+    // produced "coordinator dropped reply" which is what this test
+    // guards against.
+    for (i, handle) in handles.into_iter().enumerate() {
+        match handle.await.expect("join") {
+            Ok(()) => { /* drained */ }
+            Err(crate::kvs::err::Error::Datastore(msg))
+                if msg.contains("commit gate") =>
+            { /* gracefully rejected post-shutdown */ }
+            Err(e) => panic!(
+                "commit #{i} returned unexpected error after shutdown: {e}"
+            ),
+        }
+    }
+}
