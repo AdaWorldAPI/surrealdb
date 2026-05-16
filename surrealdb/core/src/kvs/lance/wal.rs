@@ -158,7 +158,7 @@ impl Wal {
 		loop {
 			let mut len_buf = [0u8; 4];
 			match reader.read_exact(&mut len_buf).await {
-				Ok(()) => {}
+				Ok(_n) => {}
 				Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
 				Err(e) => return Err(Error::Datastore(format!("wal read len: {e}"))),
 			}
@@ -166,7 +166,7 @@ impl Wal {
 
 			let mut body = vec![0u8; len];
 			match reader.read_exact(&mut body).await {
-				Ok(()) => {}
+				Ok(_n) => {}
 				// Partial body at EOF — the previous `append` did not
 				// finish before a crash. Drop the partial record per
 				// the recovery contract.
