@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 use anyhow::Result;
 use helpers::new_ds;
 use surrealdb_core::dbs::Session;

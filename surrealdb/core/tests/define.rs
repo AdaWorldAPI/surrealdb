@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 #![allow(clippy::unwrap_used)]
 
 mod helpers;

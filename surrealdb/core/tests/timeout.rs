@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 mod helpers;
 use std::time::{Duration, Instant};
 

@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 #![allow(clippy::regex_creation_in_loops)]
 
 mod helpers;
