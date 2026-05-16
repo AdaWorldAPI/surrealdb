@@ -232,6 +232,7 @@ impl Vector {
 		}
 	}
 
+	#[cfg(not(feature = "vector-hpc"))]
 	#[inline]
 	fn cosine_distance_f64(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
 		let dot_product = a.dot(b);
@@ -240,12 +241,72 @@ impl Vector {
 		1.0 - dot_product / (norm_a * norm_b)
 	}
 
+	#[cfg(feature = "vector-hpc")]
+	#[inline]
+	fn cosine_distance_f64(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+		// SIMD dispatch lineage:
+		//   ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd  (thin kernel)
+		//   └── built on ndarray_hpc::simd::F64x8  (8-lane polyfill type)
+		//       └── dispatches via static LazyLock<Tier> at simd.rs:92,
+		//           which runs CPU feature detection ONCE at startup.
+		//           Subsequent calls are hardware-agnostic: the same Rust
+		//           surface compiles for AVX-512, AVX2, NEON, or scalar
+		//           fallback, dispatched through the cached Tier.
+		//
+		// SAFETY: as_slice returns Some when storage is contiguous, which is
+		// the case for vectors constructed via Array1::from_vec (SurrealDB's
+		// standard path). For non-contiguous views (rare in this codebase),
+		// fall back to a one-shot to_vec().
+		match (a.as_slice(), b.as_slice()) {
+			(Some(a_s), Some(b_s)) => {
+				// Fast path — contiguous storage, zero-copy.
+				let similarity =
+					ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd(a_s, b_s);
+				1.0 - similarity
+			}
+			_ => {
+				// Fallback — non-contiguous; clone-to-owned first.
+				let a_v: Vec<f64> = a.iter().copied().collect();
+				let b_v: Vec<f64> = b.iter().copied().collect();
+				let similarity =
+					ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd(&a_v, &b_v);
+				1.0 - similarity
+			}
+		}
+	}
+
+	#[cfg(not(feature = "vector-hpc"))]
 	#[inline]
 	fn cosine_distance_f32(a: &Array1<f32>, b: &Array1<f32>) -> f64 {
 		let dot_product = a.dot(b) as f64;
 		let norm_a = ((a * a).sum() as f64).sqrt();
 		let norm_b = ((b * b).sum() as f64).sqrt();
 		1.0 - dot_product / (norm_a * norm_b)
+	}
+
+	#[cfg(feature = "vector-hpc")]
+	#[inline]
+	fn cosine_distance_f32(a: &Array1<f32>, b: &Array1<f32>) -> f64 {
+		// SAFETY: as_slice returns Some when storage is contiguous, which is
+		// the case for vectors constructed via Array1::from_vec (SurrealDB's
+		// standard path). For non-contiguous views (rare in this codebase),
+		// fall back to a one-shot to_vec().
+		match (a.as_slice(), b.as_slice()) {
+			(Some(a_s), Some(b_s)) => {
+				// Fast path — contiguous storage, zero-copy.
+				let similarity =
+					ndarray_hpc::hpc::heel_f64x8::cosine_f32_to_f64_simd(a_s, b_s);
+				1.0 - similarity
+			}
+			_ => {
+				// Fallback — non-contiguous; clone-to-owned first.
+				let a_v: Vec<f32> = a.iter().copied().collect();
+				let b_v: Vec<f32> = b.iter().copied().collect();
+				let similarity =
+					ndarray_hpc::hpc::heel_f64x8::cosine_f32_to_f64_simd(&a_v, &b_v);
+				1.0 - similarity
+			}
+		}
 	}
 
 	#[inline]
@@ -277,10 +338,69 @@ impl Vector {
 	{
 		Zip::from(a).and(b).map_collect(|x, y| (x.to_float() - y.to_float()).powi(2)).sum().sqrt()
 	}
+
+	/// SIMD L2 distance written directly against the polyfill type
+	/// `ndarray_hpc::simd::F64x8`. CPU detection is cached once in
+	/// `LazyLock<Tier>` (simd.rs:92); subsequent calls dispatch via the
+	/// cached tier (AVX-512 / AVX2 / NEON / scalar fallback). Hardware-
+	/// agnostic — same Rust surface compiles on every target.
+	#[cfg(feature = "vector-hpc")]
+	#[inline]
+	fn euclidean_distance_f64_simd(a: &[f64], b: &[f64]) -> f64 {
+		use ndarray_hpc::simd::F64x8;
+		let n = a.len().min(b.len());
+		let chunks = n / 8;
+		let remainder = n % 8;
+
+		let mut sum_sq = F64x8::splat(0.0);
+		for i in 0..chunks {
+			let va = F64x8::from_slice(&a[i * 8..i * 8 + 8]);
+			let vb = F64x8::from_slice(&b[i * 8..i * 8 + 8]);
+			let diff = va - vb;
+			// sum_sq += diff * diff (fused multiply-add).
+			sum_sq = diff.mul_add(diff, sum_sq);
+		}
+
+		let mut acc = sum_sq.reduce_sum();
+		let offset = chunks * 8;
+		for i in 0..remainder {
+			let d = a[offset + i] - b[offset + i];
+			acc += d * d;
+		}
+		acc.sqrt()
+	}
+
+	#[cfg(not(feature = "vector-hpc"))]
+	#[inline]
 	fn euclidean_distance(&self, other: &Self) -> f64 {
 		match (self, other) {
 			(Self::F64(a), Self::F64(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
 			(Self::F32(a), Self::F32(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
+			(Self::I64(a), Self::I64(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
+			(Self::I32(a), Self::I32(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
+			(Self::I16(a), Self::I16(b)) => Self::euclidean(a, b),
+			_ => f64::INFINITY,
+		}
+	}
+
+	#[cfg(feature = "vector-hpc")]
+	#[inline]
+	fn euclidean_distance(&self, other: &Self) -> f64 {
+		match (self, other) {
+			(Self::F64(a), Self::F64(b)) => match (a.as_slice(), b.as_slice()) {
+				(Some(a_s), Some(b_s)) => Self::euclidean_distance_f64_simd(a_s, b_s),
+				_ => {
+					let a_v: Vec<f64> = a.iter().copied().collect();
+					let b_v: Vec<f64> = b.iter().copied().collect();
+					Self::euclidean_distance_f64_simd(&a_v, &b_v)
+				}
+			},
+			// f32 → widen to f64 for SIMD precision then take sqrt.
+			(Self::F32(a), Self::F32(b)) => {
+				let a_v: Vec<f64> = a.iter().map(|&x| x as f64).collect();
+				let b_v: Vec<f64> = b.iter().map(|&x| x as f64).collect();
+				Self::euclidean_distance_f64_simd(&a_v, &b_v)
+			}
 			(Self::I64(a), Self::I64(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
 			(Self::I32(a), Self::I32(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
 			(Self::I16(a), Self::I16(b)) => Self::euclidean(a, b),
@@ -769,5 +889,82 @@ mod tests {
 	fn test_distance_pearson() {
 		test_distance_collection(Distance::Pearson, 100, 1536);
 		test_distance(Distance::Pearson, &[1.0, 2.0, 3.0], &[2.0, 3.0, 4.0], 1.0);
+	}
+}
+
+#[cfg(all(test, feature = "vector-hpc"))]
+mod hpc_tests {
+	use ndarray::Array1;
+	use super::*;
+
+	/// SIMD cosine must agree with the scalar fallback to within fp tolerance,
+	/// across the dim sizes that matter (1, 128, 384, 768, 1024).
+	#[test]
+	fn test_cosine_hpc_matches_scalar() {
+		// We can't easily call the scalar version from inside the feature-gated
+		// module, so we compute scalar inline.
+		fn scalar_cosine(a: &[f64], b: &[f64]) -> f64 {
+			let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+			let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+			let nb: f64 = b.iter().map(|y| y * y).sum::<f64>().sqrt();
+			1.0 - dot / (na * nb)
+		}
+
+		let mut state: u64 = 0xC0FFEE;
+		fn lcg(s: &mut u64) -> f64 {
+			*s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+			((*s >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
+		}
+
+		for &dim in &[1usize, 128, 384, 768, 1024] {
+			let a_v: Vec<f64> = (0..dim).map(|_| lcg(&mut state)).collect();
+			let b_v: Vec<f64> = (0..dim).map(|_| lcg(&mut state)).collect();
+			let a = Array1::from_vec(a_v.clone());
+			let b = Array1::from_vec(b_v.clone());
+
+			let simd = Vector::cosine_distance_f64(&a, &b);
+			let scalar = scalar_cosine(&a_v, &b_v);
+
+			assert!(
+				(simd - scalar).abs() < 1e-9,
+				"dim {}: simd={}, scalar={}, diff={}",
+				dim,
+				simd,
+				scalar,
+				(simd - scalar).abs(),
+			);
+		}
+	}
+
+	/// SIMD Euclidean must agree with the scalar fallback to within fp
+	/// tolerance, across the same dim sizes.
+	#[test]
+	fn test_euclidean_hpc_matches_scalar() {
+		fn scalar_l2(a: &[f64], b: &[f64]) -> f64 {
+			a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f64>().sqrt()
+		}
+
+		let mut state: u64 = 0xBADC0FFEE;
+		fn lcg(s: &mut u64) -> f64 {
+			*s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+			((*s >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
+		}
+
+		for &dim in &[1usize, 128, 384, 768, 1024] {
+			let a_v: Vec<f64> = (0..dim).map(|_| lcg(&mut state)).collect();
+			let b_v: Vec<f64> = (0..dim).map(|_| lcg(&mut state)).collect();
+
+			let simd = Vector::euclidean_distance_f64_simd(&a_v, &b_v);
+			let scalar = scalar_l2(&a_v, &b_v);
+
+			assert!(
+				(simd - scalar).abs() < 1e-9,
+				"dim {}: simd={}, scalar={}, diff={}",
+				dim,
+				simd,
+				scalar,
+				(simd - scalar).abs(),
+			);
+		}
 	}
 }
