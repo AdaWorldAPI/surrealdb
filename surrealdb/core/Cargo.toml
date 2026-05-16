@@ -57,7 +57,12 @@ arbitrary = [
 ]
 allocation-tracking = []
 trace-doc-ops = []
-vector-hpc = ["dep:ndarray-hpc"]
+# SIMD distance kernels using the AdaWorldAPI ndarray fork's hpc/simd
+# modules (F64x8 polyfill, heel_f64x8::cosine_f64_simd). The workspace
+# `ndarray` dep is already the fork (see top-level Cargo.toml), so this
+# feature only flips on the cfg-gated dispatch in idx/trees/vector.rs —
+# no extra crate pulled in.
+vector-hpc = []
 
 # GraphQL support
 graphql = ["dep:async-graphql"]
@@ -136,8 +141,6 @@ humantime.workspace = true
 ipnet.workspace = true
 md-5.workspace = true
 ndarray.workspace = true
-ndarray-hpc = { package = "ndarray", path = "../../../ndarray", optional = true, default-features = false, features = ["std", "hpc-extras"] }
-ndarray-stats.workspace = true
 num_cpus.workspace = true
 num-traits.workspace = true
 object_store.workspace = true

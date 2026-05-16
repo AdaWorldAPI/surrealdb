@@ -141,8 +141,12 @@ logos = "0.16.1" # TODO: pin version
 md-5 = "0.10.6"
 mimalloc = "0.1.48"
 native-tls = "0.2.14"
-ndarray = "0.17.2"
-ndarray-stats = "0.7.0"
+# Always the AdaWorldAPI fork — never crates.io. Direct git dep at the
+# workspace level. We do NOT need [patch.crates-io] because surrealdb-core
+# no longer uses ndarray-stats (the only transitive consumer that would
+# have created a diamond dep against crates.io's ndarray). Distance
+# helpers (l1/l2/linf) are inlined in surrealdb/core/src/idx/trees/vector.rs.
+ndarray = { git = "https://github.com/AdaWorldAPI/ndarray.git", default-features = false, features = ["std", "hpc-extras"] }
 nix = { version = "0.30.1", default-features = false }
 num-traits = "0.2.19"
 num_cpus = "1.17.0"

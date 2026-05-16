@@ -8,7 +8,6 @@ use ahash::{AHasher, HashSet};
 use anyhow::{Result, ensure};
 use blake3::Hasher as Blake3Hasher;
 use ndarray::{Array1, LinalgScalar, Zip};
-use ndarray_stats::DeviationExt;
 use num_traits::Zero;
 use revision::{DeserializeRevisioned, SerializeRevisioned, revisioned};
 use rust_decimal::prelude::FromPrimitive;
@@ -218,16 +217,10 @@ impl Vector {
 	#[cfg(not(feature = "vector-hpc"))]
 	fn chebyshev_distance(&self, other: &Self) -> f64 {
 		match (self, other) {
-			(Self::F64(a), Self::F64(b)) => a.linf_dist(b).unwrap_or(f64::INFINITY),
-			(Self::F32(a), Self::F32(b)) => {
-				a.linf_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY)
-			}
-			(Self::I64(a), Self::I64(b)) => {
-				a.linf_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY)
-			}
-			(Self::I32(a), Self::I32(b)) => {
-				a.linf_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY)
-			}
+			(Self::F64(a), Self::F64(b)) => Self::inline_linf_dist(a, b),
+			(Self::F32(a), Self::F32(b)) => Self::inline_linf_dist(a, b),
+			(Self::I64(a), Self::I64(b)) => Self::inline_linf_dist(a, b),
+			(Self::I32(a), Self::I32(b)) => Self::inline_linf_dist(a, b),
 			(Self::I16(a), Self::I16(b)) => Self::chebyshev(a, b),
 			_ => f64::NAN,
 		}
@@ -250,12 +243,8 @@ impl Vector {
 				let b_v: Vec<f64> = b.iter().map(|&x| x as f64).collect();
 				Self::chebyshev_distance_f64_simd(&a_v, &b_v)
 			}
-			(Self::I64(a), Self::I64(b)) => {
-				a.linf_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY)
-			}
-			(Self::I32(a), Self::I32(b)) => {
-				a.linf_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY)
-			}
+			(Self::I64(a), Self::I64(b)) => Self::inline_linf_dist(a, b),
+			(Self::I32(a), Self::I32(b)) => Self::inline_linf_dist(a, b),
 			(Self::I16(a), Self::I16(b)) => Self::chebyshev(a, b),
 			_ => f64::NAN,
 		}
@@ -274,8 +263,8 @@ impl Vector {
 	#[inline]
 	fn cosine_distance_f64(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
 		// SIMD dispatch lineage:
-		//   ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd  (thin kernel)
-		//   └── built on ndarray_hpc::simd::F64x8  (8-lane polyfill type)
+		//   ndarray::hpc::heel_f64x8::cosine_f64_simd  (thin kernel)
+		//   └── built on ndarray::simd::F64x8  (8-lane polyfill type)
 		//       └── dispatches via static LazyLock<Tier> at simd.rs:92,
 		//           which runs CPU feature detection ONCE at startup.
 		//           Subsequent calls are hardware-agnostic: the same Rust
@@ -290,7 +279,7 @@ impl Vector {
 			(Some(a_s), Some(b_s)) => {
 				// Fast path — contiguous storage, zero-copy.
 				let similarity =
-					ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd(a_s, b_s);
+					ndarray::hpc::heel_f64x8::cosine_f64_simd(a_s, b_s);
 				1.0 - similarity
 			}
 			_ => {
@@ -298,7 +287,7 @@ impl Vector {
 				let a_v: Vec<f64> = a.iter().copied().collect();
 				let b_v: Vec<f64> = b.iter().copied().collect();
 				let similarity =
-					ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd(&a_v, &b_v);
+					ndarray::hpc::heel_f64x8::cosine_f64_simd(&a_v, &b_v);
 				1.0 - similarity
 			}
 		}
@@ -324,7 +313,7 @@ impl Vector {
 			(Some(a_s), Some(b_s)) => {
 				// Fast path — contiguous storage, zero-copy.
 				let similarity =
-					ndarray_hpc::hpc::heel_f64x8::cosine_f32_to_f64_simd(a_s, b_s);
+					ndarray::hpc::heel_f64x8::cosine_f32_to_f64_simd(a_s, b_s);
 				1.0 - similarity
 			}
 			_ => {
@@ -332,7 +321,7 @@ impl Vector {
 				let a_v: Vec<f32> = a.iter().copied().collect();
 				let b_v: Vec<f32> = b.iter().copied().collect();
 				let similarity =
-					ndarray_hpc::hpc::heel_f64x8::cosine_f32_to_f64_simd(&a_v, &b_v);
+					ndarray::hpc::heel_f64x8::cosine_f32_to_f64_simd(&a_v, &b_v);
 				1.0 - similarity
 			}
 		}
@@ -347,6 +336,59 @@ impl Vector {
 		let norm_a = a.mapv(|x| x.to_float() * x.to_float()).sum().sqrt();
 		let norm_b = b.mapv(|x| x.to_float() * x.to_float()).sum().sqrt();
 		1.0 - dot_product / (norm_a * norm_b)
+	}
+
+	/// Inline L1 (Manhattan) distance over a typed Array1 pair. Replaces
+	/// the `ndarray_stats::DeviationExt::l1_dist` we used to call so we
+	/// can keep the AdaWorldAPI ndarray fork without dragging
+	/// `ndarray-stats` (which is impl'd against crates.io's ndarray and
+	/// produced a diamond-dep). Both inputs must have matching length;
+	/// returns f64::INFINITY on mismatch (matches the prior
+	/// `.unwrap_or(f64::INFINITY)` pattern).
+	#[inline]
+	fn inline_l1_dist<T>(a: &Array1<T>, b: &Array1<T>) -> f64
+	where
+		T: ToFloat + Copy,
+	{
+		if a.len() != b.len() {
+			return f64::INFINITY;
+		}
+		Zip::from(a).and(b).fold(0.0_f64, |acc, x, y| {
+			acc + (x.to_float() - y.to_float()).abs()
+		})
+	}
+
+	/// Inline L2 (Euclidean) distance. See `inline_l1_dist` for rationale.
+	#[inline]
+	fn inline_l2_dist<T>(a: &Array1<T>, b: &Array1<T>) -> f64
+	where
+		T: ToFloat + Copy,
+	{
+		if a.len() != b.len() {
+			return f64::INFINITY;
+		}
+		Zip::from(a)
+			.and(b)
+			.fold(0.0_f64, |acc, x, y| {
+				let d = x.to_float() - y.to_float();
+				acc + d * d
+			})
+			.sqrt()
+	}
+
+	/// Inline L∞ (Chebyshev) distance.
+	#[inline]
+	fn inline_linf_dist<T>(a: &Array1<T>, b: &Array1<T>) -> f64
+	where
+		T: ToFloat + Copy,
+	{
+		if a.len() != b.len() {
+			return f64::INFINITY;
+		}
+		Zip::from(a).and(b).fold(0.0_f64, |acc, x, y| {
+			let d = (x.to_float() - y.to_float()).abs();
+			if d > acc { d } else { acc }
+		})
 	}
 
 	fn cosine_distance(&self, other: &Self) -> f64 {
@@ -369,14 +411,14 @@ impl Vector {
 	}
 
 	/// SIMD L2 distance written directly against the polyfill type
-	/// `ndarray_hpc::simd::F64x8`. CPU detection is cached once in
+	/// `ndarray::simd::F64x8`. CPU detection is cached once in
 	/// `LazyLock<Tier>` (simd.rs:92); subsequent calls dispatch via the
 	/// cached tier (AVX-512 / AVX2 / NEON / scalar fallback). Hardware-
 	/// agnostic — same Rust surface compiles on every target.
 	#[cfg(feature = "vector-hpc")]
 	#[inline]
 	fn euclidean_distance_f64_simd(a: &[f64], b: &[f64]) -> f64 {
-		use ndarray_hpc::simd::F64x8;
+		use ndarray::simd::F64x8;
 		let n = a.len().min(b.len());
 		let chunks = n / 8;
 		let remainder = n % 8;
@@ -399,13 +441,13 @@ impl Vector {
 		acc.sqrt()
 	}
 
-	/// SIMD L1 (Manhattan) distance written directly against `ndarray_hpc::simd::F64x8`.
+	/// SIMD L1 (Manhattan) distance written directly against `ndarray::simd::F64x8`.
 	/// CPU detection is cached once in `LazyLock<Tier>` (simd.rs:92); subsequent
 	/// calls dispatch via the cached tier (AVX-512 / AVX2 / NEON / scalar fallback).
 	#[cfg(feature = "vector-hpc")]
 	#[inline]
 	fn manhattan_distance_f64_simd(a: &[f64], b: &[f64]) -> f64 {
-		use ndarray_hpc::simd::F64x8;
+		use ndarray::simd::F64x8;
 		let n = a.len().min(b.len());
 		let chunks = n / 8;
 		let remainder = n % 8;
@@ -424,13 +466,13 @@ impl Vector {
 		sum
 	}
 
-	/// SIMD L∞ (Chebyshev) distance written directly against `ndarray_hpc::simd::F64x8`.
+	/// SIMD L∞ (Chebyshev) distance written directly against `ndarray::simd::F64x8`.
 	/// CPU detection is cached once in `LazyLock<Tier>` (simd.rs:92); subsequent
 	/// calls dispatch via the cached tier (AVX-512 / AVX2 / NEON / scalar fallback).
 	#[cfg(feature = "vector-hpc")]
 	#[inline]
 	fn chebyshev_distance_f64_simd(a: &[f64], b: &[f64]) -> f64 {
-		use ndarray_hpc::simd::F64x8;
+		use ndarray::simd::F64x8;
 		let n = a.len().min(b.len());
 		let chunks = n / 8;
 		let remainder = n % 8;
@@ -451,7 +493,7 @@ impl Vector {
 	}
 
 	/// SIMD Pearson correlation (centered cosine similarity) written against
-	/// `ndarray_hpc::simd::F64x8`. Returns the correlation coefficient r
+	/// `ndarray::simd::F64x8`. Returns the correlation coefficient r
 	/// (not the distance 1-r), matching the scalar `pearson` method contract.
 	/// CPU detection is cached once in `LazyLock<Tier>` (simd.rs:92); subsequent
 	/// calls dispatch via the cached tier (AVX-512 / AVX2 / NEON / scalar fallback).
@@ -473,7 +515,7 @@ impl Vector {
 		// Reuse the SIMD cosine kernel on centered vectors.
 		// cosine_f64_simd returns dot/(|ca|*|cb|) which equals Pearson r.
 		// When both norms are ~0 the kernel returns NaN; map to 0 to match scalar.
-		let r = ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd(&ca, &cb);
+		let r = ndarray::hpc::heel_f64x8::cosine_f64_simd(&ca, &cb);
 		if r.is_finite() { r } else { 0.0 }
 	}
 
@@ -481,10 +523,10 @@ impl Vector {
 	#[inline]
 	fn euclidean_distance(&self, other: &Self) -> f64 {
 		match (self, other) {
-			(Self::F64(a), Self::F64(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
-			(Self::F32(a), Self::F32(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
-			(Self::I64(a), Self::I64(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
-			(Self::I32(a), Self::I32(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
+			(Self::F64(a), Self::F64(b)) => Self::inline_l2_dist(a, b),
+			(Self::F32(a), Self::F32(b)) => Self::inline_l2_dist(a, b),
+			(Self::I64(a), Self::I64(b)) => Self::inline_l2_dist(a, b),
+			(Self::I32(a), Self::I32(b)) => Self::inline_l2_dist(a, b),
 			(Self::I16(a), Self::I16(b)) => Self::euclidean(a, b),
 			_ => f64::INFINITY,
 		}
@@ -508,8 +550,8 @@ impl Vector {
 				let b_v: Vec<f64> = b.iter().map(|&x| x as f64).collect();
 				Self::euclidean_distance_f64_simd(&a_v, &b_v)
 			}
-			(Self::I64(a), Self::I64(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
-			(Self::I32(a), Self::I32(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
+			(Self::I64(a), Self::I64(b)) => Self::inline_l2_dist(a, b),
+			(Self::I32(a), Self::I32(b)) => Self::inline_l2_dist(a, b),
 			(Self::I16(a), Self::I16(b)) => Self::euclidean(a, b),
 			_ => f64::INFINITY,
 		}
@@ -604,10 +646,10 @@ impl Vector {
 	#[cfg(not(feature = "vector-hpc"))]
 	pub(super) fn manhattan_distance(&self, other: &Self) -> f64 {
 		match (self, other) {
-			(Self::F64(a), Self::F64(b)) => a.l1_dist(b).unwrap_or(f64::INFINITY),
-			(Self::F32(a), Self::F32(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
-			(Self::I64(a), Self::I64(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
-			(Self::I32(a), Self::I32(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
+			(Self::F64(a), Self::F64(b)) => Self::inline_l1_dist(a, b),
+			(Self::F32(a), Self::F32(b)) => Self::inline_l1_dist(a, b),
+			(Self::I64(a), Self::I64(b)) => Self::inline_l1_dist(a, b),
+			(Self::I32(a), Self::I32(b)) => Self::inline_l1_dist(a, b),
 			(Self::I16(a), Self::I16(b)) => Self::manhattan(a, b),
 			_ => f64::NAN,
 		}
@@ -630,8 +672,8 @@ impl Vector {
 				let b_v: Vec<f64> = b.iter().map(|&x| x as f64).collect();
 				Self::manhattan_distance_f64_simd(&a_v, &b_v)
 			}
-			(Self::I64(a), Self::I64(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
-			(Self::I32(a), Self::I32(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
+			(Self::I64(a), Self::I64(b)) => Self::inline_l1_dist(a, b),
+			(Self::I32(a), Self::I32(b)) => Self::inline_l1_dist(a, b),
 			(Self::I16(a), Self::I16(b)) => Self::manhattan(a, b),
 			_ => f64::NAN,
 		}
