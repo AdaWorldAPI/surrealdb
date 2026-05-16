@@ -84,7 +84,7 @@ fn bench_cosine(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("simd_hpc", dim), &dim, |bencher, _| {
             bencher.iter(|| {
-                let sim = ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd(
+                let sim = ndarray::hpc::heel_f64x8::cosine_f64_simd(
                     black_box(&a),
                     black_box(&b),
                 );
@@ -96,7 +96,7 @@ fn bench_cosine(c: &mut Criterion) {
 }
 
 fn bench_euclidean(c: &mut Criterion) {
-    use ndarray_hpc::simd::F64x8;
+    use ndarray::simd::F64x8;
 
     /// Reproduces the Sprint P.2 kernel inline so the bench doesn't depend
     /// on `surrealdb-core` re-exporting an internal helper.
@@ -136,7 +136,7 @@ fn bench_euclidean(c: &mut Criterion) {
 }
 
 fn bench_manhattan(c: &mut Criterion) {
-    use ndarray_hpc::simd::F64x8;
+    use ndarray::simd::F64x8;
 
     /// Same shape as Sprint Q's `manhattan_distance_f64_simd`.
     fn simd_manhattan(a: &[f64], b: &[f64]) -> f64 {

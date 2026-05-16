@@ -274,8 +274,8 @@ impl Vector {
 	#[inline]
 	fn cosine_distance_f64(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
 		// SIMD dispatch lineage:
-		//   ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd  (thin kernel)
-		//   └── built on ndarray_hpc::simd::F64x8  (8-lane polyfill type)
+		//   ndarray::hpc::heel_f64x8::cosine_f64_simd  (thin kernel)
+		//   └── built on ndarray::simd::F64x8  (8-lane polyfill type)
 		//       └── dispatches via static LazyLock<Tier> at simd.rs:92,
 		//           which runs CPU feature detection ONCE at startup.
 		//           Subsequent calls are hardware-agnostic: the same Rust
@@ -290,7 +290,7 @@ impl Vector {
 			(Some(a_s), Some(b_s)) => {
 				// Fast path — contiguous storage, zero-copy.
 				let similarity =
-					ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd(a_s, b_s);
+					ndarray::hpc::heel_f64x8::cosine_f64_simd(a_s, b_s);
 				1.0 - similarity
 			}
 			_ => {
@@ -298,7 +298,7 @@ impl Vector {
 				let a_v: Vec<f64> = a.iter().copied().collect();
 				let b_v: Vec<f64> = b.iter().copied().collect();
 				let similarity =
-					ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd(&a_v, &b_v);
+					ndarray::hpc::heel_f64x8::cosine_f64_simd(&a_v, &b_v);
 				1.0 - similarity
 			}
 		}
@@ -324,7 +324,7 @@ impl Vector {
 			(Some(a_s), Some(b_s)) => {
 				// Fast path — contiguous storage, zero-copy.
 				let similarity =
-					ndarray_hpc::hpc::heel_f64x8::cosine_f32_to_f64_simd(a_s, b_s);
+					ndarray::hpc::heel_f64x8::cosine_f32_to_f64_simd(a_s, b_s);
 				1.0 - similarity
 			}
 			_ => {
@@ -332,7 +332,7 @@ impl Vector {
 				let a_v: Vec<f32> = a.iter().copied().collect();
 				let b_v: Vec<f32> = b.iter().copied().collect();
 				let similarity =
-					ndarray_hpc::hpc::heel_f64x8::cosine_f32_to_f64_simd(&a_v, &b_v);
+					ndarray::hpc::heel_f64x8::cosine_f32_to_f64_simd(&a_v, &b_v);
 				1.0 - similarity
 			}
 		}
@@ -369,14 +369,14 @@ impl Vector {
 	}
 
 	/// SIMD L2 distance written directly against the polyfill type
-	/// `ndarray_hpc::simd::F64x8`. CPU detection is cached once in
+	/// `ndarray::simd::F64x8`. CPU detection is cached once in
 	/// `LazyLock<Tier>` (simd.rs:92); subsequent calls dispatch via the
 	/// cached tier (AVX-512 / AVX2 / NEON / scalar fallback). Hardware-
 	/// agnostic — same Rust surface compiles on every target.
 	#[cfg(feature = "vector-hpc")]
 	#[inline]
 	fn euclidean_distance_f64_simd(a: &[f64], b: &[f64]) -> f64 {
-		use ndarray_hpc::simd::F64x8;
+		use ndarray::simd::F64x8;
 		let n = a.len().min(b.len());
 		let chunks = n / 8;
 		let remainder = n % 8;
@@ -399,13 +399,13 @@ impl Vector {
 		acc.sqrt()
 	}
 
-	/// SIMD L1 (Manhattan) distance written directly against `ndarray_hpc::simd::F64x8`.
+	/// SIMD L1 (Manhattan) distance written directly against `ndarray::simd::F64x8`.
 	/// CPU detection is cached once in `LazyLock<Tier>` (simd.rs:92); subsequent
 	/// calls dispatch via the cached tier (AVX-512 / AVX2 / NEON / scalar fallback).
 	#[cfg(feature = "vector-hpc")]
 	#[inline]
 	fn manhattan_distance_f64_simd(a: &[f64], b: &[f64]) -> f64 {
-		use ndarray_hpc::simd::F64x8;
+		use ndarray::simd::F64x8;
 		let n = a.len().min(b.len());
 		let chunks = n / 8;
 		let remainder = n % 8;
@@ -424,13 +424,13 @@ impl Vector {
 		sum
 	}
 
-	/// SIMD L∞ (Chebyshev) distance written directly against `ndarray_hpc::simd::F64x8`.
+	/// SIMD L∞ (Chebyshev) distance written directly against `ndarray::simd::F64x8`.
 	/// CPU detection is cached once in `LazyLock<Tier>` (simd.rs:92); subsequent
 	/// calls dispatch via the cached tier (AVX-512 / AVX2 / NEON / scalar fallback).
 	#[cfg(feature = "vector-hpc")]
 	#[inline]
 	fn chebyshev_distance_f64_simd(a: &[f64], b: &[f64]) -> f64 {
-		use ndarray_hpc::simd::F64x8;
+		use ndarray::simd::F64x8;
 		let n = a.len().min(b.len());
 		let chunks = n / 8;
 		let remainder = n % 8;
@@ -451,7 +451,7 @@ impl Vector {
 	}
 
 	/// SIMD Pearson correlation (centered cosine similarity) written against
-	/// `ndarray_hpc::simd::F64x8`. Returns the correlation coefficient r
+	/// `ndarray::simd::F64x8`. Returns the correlation coefficient r
 	/// (not the distance 1-r), matching the scalar `pearson` method contract.
 	/// CPU detection is cached once in `LazyLock<Tier>` (simd.rs:92); subsequent
 	/// calls dispatch via the cached tier (AVX-512 / AVX2 / NEON / scalar fallback).
@@ -473,7 +473,7 @@ impl Vector {
 		// Reuse the SIMD cosine kernel on centered vectors.
 		// cosine_f64_simd returns dot/(|ca|*|cb|) which equals Pearson r.
 		// When both norms are ~0 the kernel returns NaN; map to 0 to match scalar.
-		let r = ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd(&ca, &cb);
+		let r = ndarray::hpc::heel_f64x8::cosine_f64_simd(&ca, &cb);
 		if r.is_finite() { r } else { 0.0 }
 	}
 

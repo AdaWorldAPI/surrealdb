@@ -4003,6 +4003,7 @@ dependencies = [
 [[package]]
 name = "fractal"
 version = "0.1.0"
+source = "git+https://github.com/AdaWorldAPI/ndarray.git#2a3885d2630873cf20005faae029740599f53743"
 dependencies = [
  "libm",
 ]
@@ -6658,14 +6659,13 @@ dependencies = [
 [[package]]
 name = "ndarray"
 version = "0.17.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "520080814a7a6b4a6e9070823bb24b4531daac8c4627e08ba5de8c5ef2f2752d"
 dependencies = [
- "blake3",
- "fractal",
  "matrixmultiply",
  "num-complex",
  "num-integer",
  "num-traits",
- "p64",
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
@@ -6674,13 +6674,15 @@ dependencies = [
 [[package]]
 name = "ndarray"
 version = "0.17.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "520080814a7a6b4a6e9070823bb24b4531daac8c4627e08ba5de8c5ef2f2752d"
+source = "git+https://github.com/AdaWorldAPI/ndarray.git#2a3885d2630873cf20005faae029740599f53743"
 dependencies = [
+ "blake3",
+ "fractal",
  "matrixmultiply",
  "num-complex",
  "num-integer",
  "num-traits",
+ "p64",
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
@@ -7300,6 +7302,7 @@ dependencies = [
 [[package]]
 name = "p64"
 version = "0.1.0"
+source = "git+https://github.com/AdaWorldAPI/ndarray.git#2a3885d2630873cf20005faae029740599f53743"
 dependencies = [
  "fractal",
 ]
@@ -10103,8 +10106,7 @@ dependencies = [
  "md-5",
  "mimalloc",
  "mime",
- "ndarray 0.17.2",
- "ndarray 0.17.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "ndarray 0.17.2 (git+https://github.com/AdaWorldAPI/ndarray.git)",
  "ndarray-stats",
  "num-traits",
  "num_cpus",
@@ -10496,7 +10498,7 @@ dependencies = [
  "bytes",
  "futures",
  "hyper 1.8.1",
- "ndarray 0.17.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "ndarray 0.17.2 (git+https://github.com/AdaWorldAPI/ndarray.git)",
  "ort",
  "regex",
  "serde",

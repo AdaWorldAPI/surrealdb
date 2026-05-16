@@ -141,7 +141,10 @@ logos = "0.16.1" # TODO: pin version
 md-5 = "0.10.6"
 mimalloc = "0.1.48"
 native-tls = "0.2.14"
-ndarray = "0.17.2"
+# Always the AdaWorldAPI fork — never crates.io. Same version
+# number, but our fork carries the hpc/simd modules used by the
+# kv-lance backend's SIMD distance kernels (vector-hpc feature).
+ndarray = { git = "https://github.com/AdaWorldAPI/ndarray.git", default-features = false, features = ["std", "hpc-extras"] }
 ndarray-stats = "0.7.0"
 nix = { version = "0.30.1", default-features = false }
 num-traits = "0.2.19"
