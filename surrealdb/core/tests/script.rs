@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 #![cfg(feature = "scripting")]
 
 use std::time::{Duration, Instant};

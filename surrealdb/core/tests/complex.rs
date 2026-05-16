@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 #![cfg(not(target_family = "wasm"))]
 
 mod helpers;

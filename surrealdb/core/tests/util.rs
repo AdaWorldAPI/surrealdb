@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 #[expect(unused_macros)]
 macro_rules! assert_empty_val {
 	($tx:expr, $key:expr) => {{
