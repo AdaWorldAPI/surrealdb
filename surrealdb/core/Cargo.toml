@@ -136,7 +136,7 @@ humantime.workspace = true
 ipnet.workspace = true
 md-5.workspace = true
 ndarray.workspace = true
-ndarray-hpc = { package = "ndarray", path = "../../../ndarray", optional = true, default-features = false, features = ["std"] }
+ndarray-hpc = { package = "ndarray", path = "../../../ndarray", optional = true, default-features = false, features = ["std", "hpc-extras"] }
 ndarray-stats.workspace = true
 num_cpus.workspace = true
 num-traits.workspace = true
