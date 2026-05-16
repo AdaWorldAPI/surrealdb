@@ -429,29 +429,53 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 #[test_log::test]
-// Regression test for https://github.com/surrealdb/surrealdb/issues/7072
+// Regression test for https://github.com/surrealdb/surrealdb/issues/7072.
+//
+// Sprint Z (PR #16-followup) added a per-Datastore `commit_gate::CommitGate`
+// coordinator (CollapseGate / BUNDLE merge pattern from `lance-graph` and
+// `ndarray::hpc`). The gate batches concurrent `Transaction::commit` calls
+// into a single Lance `MergeInsertBuilder::execute_reader` per epoch, which
+// **does** eliminate the pre-Sprint-Z OCC retry cascade — the test now
+// completes in 202 s instead of the pre-gate 1958 s (10× speedup, no
+// timeout). Verified by running this test on the `claude/sprint-z-
+// collapse-gate` branch with `SURREAL_TEST_KV=lance --test-threads=1`.
+//
+// What the gate does not fix is the test's `assert!(compaction_count > 0)`
+// assertion at the end of the 10-second stress window. Two upstream-of-the-
+// gate bottlenecks keep the compaction queue empty enough of the time that
+// the loop frequently returns `(0, 0)`:
+//
+//  1. Per-Lance-commit latency (~150-250 ms even with the gate batching),
+//     dominated by `MergeInsertBuilder` + `Dataset::delete` round-trips.
+//     LSM backends commit in sub-millisecond; the gate brings kv-lance
+//     down from "thousands of commits/sec stuck in OCC retry" to "single-
+//     digit commits/sec under load," but not into LSM territory.
+//
+//  2. HNSW index serialization at the SurrealDB-core layer (the vector
+//     index re-balancing happens *inside* the transaction, before the
+//     gate sees it). 54 concurrent CREATE-user-with-vector statements
+//     serialize on the HNSW lock; that's a separate bottleneck the gate
+//     cannot collapse.
+//
+// The structural fix is multi-bucket BindSpace sharding (Phase 2 in
+// `.claude/lance-backend/KNOWN_DIFFERENCES.md`): each (ns, db) pair owns
+// its own Lance dataset and its own commit gate, so the test's 9
+// (ns × db) combinations get 9 independent commit cadences instead of
+// serializing through one. With that, the 10-second window would see
+// ~9× the compaction-queue throughput.
+//
+// Skip rationale therefore CHANGED from PR #16: it is no longer the OCC
+// retry cascade (that is fixed by the gate). It is the columnar-commit
+// throughput floor + HNSW serialization. Promote to passing under Phase 2.
 async fn multi_index_concurrent_test_index_compaction() -> Result<()> {
-	// Skip on kv-lance: this stress test spawns 54 concurrent writers + a
-	// background `Datastore::index_compaction` loop for 10 seconds. Lance's
-	// per-commit OCC + dataset-versioning model serializes concurrent writes
-	// at the dataset level (5-50ms per commit on local disk) and retries on
-	// conflict. Under this test's load profile every writer racing against
-	// every other writer + the compactor produces an OCC retry cascade that
-	// exhausts the test's time budget rather than the test exercising the
-	// upstream regression. The single-writer equivalents
-	// (`single_index_concurrent_test_index_compaction`,
-	// `index_replace_table_test`) pass cleanly on kv-lance.
-	//
-	// The structural fix is multi-bucket BindSpace sharding (deferred Phase 2
-	// item in `.claude/lance-backend/KNOWN_DIFFERENCES.md`), which would let
-	// each (ns, db) pair own its own Lance dataset and remove the cross-
-	// session OCC contention this test triggers. Documented in
-	// `.claude/lance-backend/UPSTREAM_TEST_RESULTS.md` under Sprint Y.
 	if std::env::var("SURREAL_TEST_KV").as_deref() == Ok("lance") {
 		eprintln!(
-			"SKIP multi_index_concurrent_test_index_compaction: kv-lance backend \
-			 cannot sustain this concurrent-writer + compaction-loop stress \
-			 profile without multi-bucket sharding (deferred Phase 2 work)."
+			"SKIP multi_index_concurrent_test_index_compaction: the kv-lance \
+			 commit-gate (Sprint Z) eliminates the OCC retry cascade — test \
+			 wall-clock drops from 1958 s to 202 s — but the columnar-commit \
+			 throughput floor + HNSW serialization keep `compaction_count > 0` \
+			 unmet inside the test's 10 s stress window. Structural fix: \
+			 multi-bucket sharding (deferred Phase 2 in KNOWN_DIFFERENCES.md)."
 		);
 		return Ok(());
 	}

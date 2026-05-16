@@ -62,6 +62,7 @@
 
 mod background_optimizer;
 mod cnf;
+mod commit_gate;
 mod schema;
 mod tx_buffer;
 
@@ -71,12 +72,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use lance::Dataset as LanceDataset;
-use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteParams};
+use lance::dataset::WriteParams;
 use lance_index::{DatasetIndexExt, IndexType};
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use tokio::sync::RwLock;
 
 use background_optimizer::BackgroundOptimizer;
+use commit_gate::CommitGate;
 use schema::KvSchema;
 use tx_buffer::{PendingBuffer, PendingEntry};
 
@@ -117,6 +119,13 @@ pub struct Datastore {
 	/// to compact small fragments and refresh the scalar index.
 	/// Set to `None` when running in test mode or when the user opts out.
 	background_optimizer: Option<Arc<BackgroundOptimizer>>,
+
+	/// Commit coordinator implementing the CollapseGate / BUNDLE merge
+	/// pattern. All in-flight `Transaction::commit` calls flow through
+	/// this single coordinator, which batches concurrent submissions into
+	/// one Lance `MergeInsertBuilder` call per epoch. See
+	/// [`commit_gate`] for the protocol details.
+	commit_gate: Arc<CommitGate>,
 }
 
 /// Opaque handle to a Lance dataset.
@@ -232,10 +241,16 @@ impl Datastore {
 			None
 		};
 
+		// Spawn the commit coordinator. Shares the same `dataset_arc` so
+		// every batched commit lands on the same dataset that every other
+		// path (background optimizer, in-flight reads) sees.
+		let commit_gate = CommitGate::spawn(Arc::clone(&dataset_arc));
+
 		Ok(Datastore {
 			dataset: dataset_arc,
 			versioned: config.versioned,
 			background_optimizer,
+			commit_gate,
 		})
 	}
 
@@ -258,6 +273,7 @@ impl Datastore {
 			read_version,
 			dataset: Arc::clone(&self.dataset),
 			background_optimizer: self.background_optimizer.clone(),
+			commit_gate: Arc::clone(&self.commit_gate),
 		})
 	}
 
@@ -272,6 +288,9 @@ impl Datastore {
 	// Will be called by the kvs::Datastore teardown path in Sprint II+.
 	#[allow(dead_code)]
 	pub(crate) async fn shutdown(&self) -> Result<()> {
+		// Drain the commit gate first so any in-flight batch lands before
+		// the optimizer stops watching the dataset.
+		self.commit_gate.shutdown().await;
 		if let Some(opt) = &self.background_optimizer {
 			opt.shutdown().await;
 		}
@@ -317,6 +336,12 @@ pub struct Transaction {
 	/// Notification hook so commits can wake the optimizer when a
 	/// configured write-count threshold is reached.
 	background_optimizer: Option<Arc<BackgroundOptimizer>>,
+
+	/// Per-datastore commit coordinator. `commit()` submits this
+	/// transaction's pending writes/deletes to the gate, which batches
+	/// concurrent submissions into a single Lance `MergeInsertBuilder`
+	/// commit per epoch.
+	commit_gate: Arc<CommitGate>,
 }
 
 #[async_trait]
@@ -337,22 +362,20 @@ impl Transactable for Transaction {
 	//  Lifecycle: commit / cancel
 	// ------------------------------------------------------------------------
 
-	/// Atomically flush all pending writes/deletes to the Lance dataset.
+	/// Atomically flush all pending writes/deletes to the Lance dataset
+	/// through the per-Datastore commit coordinator ([`commit_gate`]).
 	///
-	/// 1. Partition pending entries into writes (`Some(Val)`) and
-	///    tombstones (`None`).
-	/// 2. If there are writes, build an Arrow `RecordBatch` and issue a
-	///    single `MergeInsertBuilder::execute_reader` call with
-	///    `when_matched(UpdateAll)` + `when_not_matched(InsertAll)`.
-	///    This is ONE atomic Lance commit — no intermediate state between
-	///    delete-old and append-new (Sprint F's sequential pair).
-	/// 3. If there are deletes (from `Transaction::del` calls), call
-	///    `Dataset::delete(predicate)` — unchanged from Sprint F.
+	/// The coordinator batches concurrent submissions into a single Lance
+	/// `MergeInsertBuilder` commit per epoch (BUNDLE merge semantics: last
+	/// submitter wins per key). This collapses N concurrent writers into 1
+	/// Lance commit and eliminates the OCC retry cascade that would
+	/// otherwise hit the dataset under high contention (see the upstream
+	/// `multi_index_concurrent_test_index_compaction` regression test).
 	///
-	/// NOTE: if BOTH writes and deletes are present the two Lance calls are
-	/// still NOT atomic across each other. Future work could express deletes
-	/// via `when_not_matched_by_source(Delete)` if we materialise the
-	/// retained-key set as a side input to merge_insert.
+	/// For a SINGLE-writer workload the coordinator's batch window
+	/// (500 µs) is a no-op — the submitter is alone, the window expires,
+	/// and the gate issues the same `MergeInsertBuilder` + `delete` pair
+	/// that the pre-Sprint-Z inline path issued.
 	async fn commit(&self) -> Result<()> {
 		if self.closed() {
 			return Err(Error::TransactionFinished);
@@ -361,60 +384,17 @@ impl Transactable for Transaction {
 			return Err(Error::TransactionReadonly);
 		}
 
-		let pending = self.pending.read().await;
-		let (writes, deletes) = pending.partition();
+		// Drain the pending buffer into owned microcopies. After this point
+		// the transaction has no more state to flush, so we drop the read
+		// guard before crossing the await boundary on the gate.
+		let (writes, deletes) = {
+			let pending = self.pending.read().await;
+			pending.partition()
+		};
 
-		if !writes.is_empty() || !deletes.is_empty() {
-			let mut ds = self.dataset.write().await;
-			let new_version = self.read_version + 1;
+		let new_version = self.read_version + 1;
+		self.commit_gate.commit(writes, deletes, new_version).await?;
 
-			// ── writes ──────────────────────────────────────────────────────────
-			if !writes.is_empty() {
-				// Build RecordBatch from pending writes. Sprint R unified the
-				// arrow type tree: our pin = lance 4.0's internal = arrow 57.
-				let batch = Self::build_write_batch_lance(&writes, new_version)
-					.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?;
-
-				let schema_ref = batch.schema();
-				let reader = arrow_array::RecordBatchIterator::new(
-					vec![Ok(batch)],
-					schema_ref,
-				);
-
-				// Single atomic Lance commit via MergeInsertBuilder:
-				//   - matched rows (same key) → overwrite with new value
-				//   - unmatched source rows   → insert (new keys)
-				// This replaces the Sprint-F sequential delete + append pair,
-				// eliminating the partial-state window between those two calls.
-				let arc_ds = Arc::new(ds.inner.clone());
-				let (new_ds, _stats) = MergeInsertBuilder::try_new(arc_ds, vec!["key".into()])
-					.map_err(|e| Error::Datastore(format!("lance merge builder: {e}")))?
-					.when_matched(WhenMatched::UpdateAll)
-					.when_not_matched(WhenNotMatched::InsertAll)
-					.try_build()
-					.map_err(|e| Error::Datastore(format!("lance merge build: {e}")))?
-					.execute_reader(reader)
-					.await
-					.map_err(|e| Error::Datastore(format!("lance merge_insert: {e}")))?;
-
-				// execute_reader returns Arc<Dataset>; unwrap or clone into ds.inner
-				// so that subsequent deletes and future transactions see the new version.
-				ds.inner = Arc::try_unwrap(new_ds).unwrap_or_else(|arc| (*arc).clone());
-			}
-
-			// ── deletes ─────────────────────────────────────────────────────────
-			if !deletes.is_empty() {
-				let predicate = KvSchema::build_delete_predicate(&deletes);
-				ds.inner
-					.delete(&predicate)
-					.await
-					.map_err(|e| Error::Datastore(format!("lance delete: {e}")))?;
-			}
-
-			drop(ds);
-		}
-
-		drop(pending);
 		self.done.store(true, Ordering::Release);
 
 		// Notify optimizer; may trigger compaction if write-threshold
@@ -711,7 +691,7 @@ impl Transaction {
 	/// `arrow-array = "57"`, which is the same version lance 4.0 uses internally,
 	/// so the `lance::deps::arrow_array` indirection from the lance-1.0.4 era
 	/// (when our pin was v55 and lance used v56) is no longer necessary.
-	fn build_write_batch_lance(
+	pub(super) fn build_write_batch_lance(
 		writes: &[(crate::kvs::Key, crate::kvs::Val)],
 		version: u64,
 	) -> std::result::Result<
