@@ -1,6 +1,27 @@
 [build]
 rustflags = ["--cfg", "tokio_unstable"]
 
+# AVX2 baseline on x86_64 Linux. We target x86-64-v3 (not v4) because
+# the default GitHub Actions runners (ubuntu-*-x86_64) don't expose
+# AVX-512 — building for v4 there would fail or produce binaries that
+# segfault on the runner CPU. v3 is the lowest common denominator that
+# still unlocks AVX2 + FMA, which is what the F64x8 polyfill's AVX2
+# tier uses.
+#
+# Local hosts with AVX-512 can override to v4 to inline the AVX-512
+# code path (the F64x8 polyfill's LazyLock<Tier> still dispatches at
+# runtime, so the override just affects which intrinsics the compiler
+# is allowed to emit directly):
+#
+#   RUSTFLAGS="-C target-cpu=x86-64-v4" cargo build --features vector-hpc
+#
+# Or, for benches:
+#
+#   RUSTFLAGS="-C target-cpu=x86-64-v4" cargo bench \
+#       -p surrealdb-core --features vector-hpc --bench vector_distance
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
 

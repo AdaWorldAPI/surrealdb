@@ -276,3 +276,8 @@ harness = false
 [[bench]]
 name = "import_load"
 harness = false
+
+[[bench]]
+name = "vector_distance"
+harness = false
+required-features = ["vector-hpc"]
