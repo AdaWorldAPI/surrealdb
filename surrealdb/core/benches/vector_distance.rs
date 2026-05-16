@@ -3,11 +3,11 @@
 
 //! SIMD vs scalar distance kernel microbenchmarks.
 //!
-//! Compares the ndarray-hpc F64x8-backed kernels against straightforward
-//! scalar reference implementations on representative embedding sizes
-//! (128, 384, 768, 1024). The absolute timings depend on the host CPU
-//! (AVX-512 vs AVX2 vs scalar fallback dispatched via the polyfill's
-//! `LazyLock<Tier>` cache); the ratio is the meaningful number.
+//! Compares the AdaWorldAPI ndarray fork's F64x8-backed kernels against
+//! straightforward scalar reference implementations on representative
+//! embedding sizes (128, 384, 768, 1024). The absolute timings depend on
+//! the host CPU (AVX-512 vs AVX2 vs scalar fallback dispatched via the
+//! polyfill's `LazyLock<Tier>` cache); the ratio is the meaningful number.
 //!
 //! Run with:
 //!
