@@ -69,6 +69,12 @@ These come from Stefan's WoA project but apply equally here:
 8. **Stop and ask.** If a design decision will affect downstream
    work (e.g. schema change, transaction-semantic difference),
    surface it explicitly before proceeding.
+9. **Preflight `cargo clippy` before every commit.** Always run
+   `cargo clippy -p <crate> --no-default-features --features "<set>" -- -D warnings`
+   against the affected feature set before pushing. A green clippy
+   is the floor, not the goal — fix every warning at the source,
+   don't `#[allow]` it past unless the rationale is documented
+   inline. CI is the second line of defense; preflight is the first.
 
 ## 4. What to do first
 
