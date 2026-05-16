@@ -141,10 +141,7 @@ logos = "0.16.1" # TODO: pin version
 md-5 = "0.10.6"
 mimalloc = "0.1.48"
 native-tls = "0.2.14"
-# Always the AdaWorldAPI fork — never crates.io. Same version
-# number, but our fork carries the hpc/simd modules used by the
-# kv-lance backend's SIMD distance kernels (vector-hpc feature).
-ndarray = { git = "https://github.com/AdaWorldAPI/ndarray.git", default-features = false, features = ["std", "hpc-extras"] }
+ndarray = { version = "0.17.2", default-features = false, features = ["std", "hpc-extras"] }
 ndarray-stats = "0.7.0"
 nix = { version = "0.30.1", default-features = false }
 num-traits = "0.2.19"
@@ -474,3 +471,17 @@ debug = true
 inherits = "release"
 strip = false
 panic = 'unwind'
+
+# ============================================================================
+# Always-fork ndarray
+# ============================================================================
+# Per maintainer: ndarray is NEVER crates.io — always the AdaWorldAPI fork.
+# A [patch.crates-io] redirect makes EVERY crate in the dep graph that asks
+# for `ndarray = "0.17.x"` resolve to the fork (including transitive deps
+# like ndarray-stats, which would otherwise see crates.io's ndarray and end
+# up incompatible with our `Array1` type at link time).
+#
+# The fork's hpc/* and simd/* modules are reachable as `ndarray::hpc::*`
+# and `ndarray::simd::*` once this patch is in place.
+[patch.crates-io]
+ndarray = { git = "https://github.com/AdaWorldAPI/ndarray.git" }
