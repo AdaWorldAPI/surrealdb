@@ -153,20 +153,23 @@ impl Datastore {
 			Err(lance::Error::DatasetNotFound { .. }) => {
 				info!(target: TARGET, "Dataset not found — creating new Lance dataset at: {}", path);
 				// Build an empty RecordBatch reader typed with the KV schema.
-				// Use lance's re-exported arrow_array/arrow_schema (v56) to avoid
-				// version-mismatch with the arrow-array = "55" dep in our Cargo.toml.
-				// (lance 1.0.4 requires arrow-array = "56.1" internally.)
-				let schema = std::sync::Arc::new(lance::deps::arrow_schema::Schema::new(vec![
-					lance::deps::arrow_schema::Field::new("key", lance::deps::arrow_schema::DataType::Binary, false),
-					lance::deps::arrow_schema::Field::new("val", lance::deps::arrow_schema::DataType::Binary, false),
-					lance::deps::arrow_schema::Field::new("version", lance::deps::arrow_schema::DataType::UInt64, false),
-					lance::deps::arrow_schema::Field::new("tombstone", lance::deps::arrow_schema::DataType::Boolean, false),
+				// Sprint R unification: lance 4.0 and our Cargo.toml both pin
+				// arrow-array/schema = "57", so the direct top-level imports
+				// are now the same crate-version as `lance::deps::*`. The
+				// `lance::deps::*` indirection used in the lance 1.0.4 era
+				// (when our pin was v55 and lance used v56) is no longer
+				// necessary.
+				let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+					arrow_schema::Field::new("key", arrow_schema::DataType::Binary, false),
+					arrow_schema::Field::new("val", arrow_schema::DataType::Binary, false),
+					arrow_schema::Field::new("version", arrow_schema::DataType::UInt64, false),
+					arrow_schema::Field::new("tombstone", arrow_schema::DataType::Boolean, false),
 				]));
-				let empty_reader = lance::deps::arrow_array::RecordBatchIterator::new(
+				let empty_reader = arrow_array::RecordBatchIterator::new(
 					std::iter::empty::<
 						std::result::Result<
-							lance::deps::arrow_array::RecordBatch,
-							lance::deps::arrow_schema::ArrowError,
+							arrow_array::RecordBatch,
+							arrow_schema::ArrowError,
 						>,
 					>(),
 					schema,
@@ -367,13 +370,13 @@ impl Transactable for Transaction {
 
 			// ── writes ──────────────────────────────────────────────────────────
 			if !writes.is_empty() {
-				// Build RecordBatch from pending writes (uses lance's internal
-				// arrow v56 re-exports to avoid the v55/v56 type-id mismatch).
+				// Build RecordBatch from pending writes. Sprint R unified the
+				// arrow type tree: our pin = lance 4.0's internal = arrow 57.
 				let batch = Self::build_write_batch_lance(&writes, new_version)
 					.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?;
 
 				let schema_ref = batch.schema();
-				let reader = lance::deps::arrow_array::RecordBatchIterator::new(
+				let reader = arrow_array::RecordBatchIterator::new(
 					vec![Ok(batch)],
 					schema_ref,
 				);
@@ -496,13 +499,14 @@ impl Transactable for Transaction {
 			.map_err(|e| Error::Datastore(format!("lance scan next: {e}")))?
 		{
 			if batch.num_rows() > 0 {
-				// Use lance's re-exports for type compat (lance 1.0.4 ↔ arrow v56).
+				// Sprint R unification: direct arrow_array import (same crate
+				// + version as lance internally uses, both 57.x).
 				let val_col = batch
 					.column_by_name("val")
 					.ok_or_else(|| Error::Datastore("lance scan: missing val column".into()))?;
 				let val_array = val_col
 					.as_any()
-					.downcast_ref::<lance::deps::arrow_array::BinaryArray>()
+					.downcast_ref::<arrow_array::BinaryArray>()
 					.ok_or_else(|| {
 						Error::Datastore("lance scan: val column type mismatch".into())
 					})?;
@@ -702,23 +706,20 @@ impl Transactable for Transaction {
 // ============================================================================
 
 impl Transaction {
-	/// Build a `RecordBatch` using lance's internal arrow re-exports (v56) so
-	/// that the types are compatible with `Dataset::append` without conversion.
-	///
-	/// Our Cargo.toml pins `arrow-array = "55"` while lance 1.0.4 requires v56
-	/// internally. The two major versions have distinct `TypeId`s, so we cannot
-	/// pass an arrow-v55 `RecordBatch` to a function expecting an arrow-v56
-	/// `RecordBatchReader`. We therefore rebuild the batch here using
-	/// `lance::deps::arrow_array` (the v56 re-export).
+	/// Build a `RecordBatch` for the Lance `MergeInsertBuilder` / `Dataset::append`
+	/// path. Sprint R unified the arrow type tree: our Cargo.toml pins
+	/// `arrow-array = "57"`, which is the same version lance 4.0 uses internally,
+	/// so the `lance::deps::arrow_array` indirection from the lance-1.0.4 era
+	/// (when our pin was v55 and lance used v56) is no longer necessary.
 	fn build_write_batch_lance(
 		writes: &[(crate::kvs::Key, crate::kvs::Val)],
 		version: u64,
 	) -> std::result::Result<
-		lance::deps::arrow_array::RecordBatch,
-		lance::deps::arrow_schema::ArrowError,
+		arrow_array::RecordBatch,
+		arrow_schema::ArrowError,
 	> {
-		use lance::deps::arrow_array::{BinaryArray, BooleanArray, RecordBatch, UInt64Array};
-		use lance::deps::arrow_schema::{DataType, Field, Schema};
+		use arrow_array::{BinaryArray, BooleanArray, RecordBatch, UInt64Array};
+		use arrow_schema::{DataType, Field, Schema};
 		use std::sync::Arc;
 
 		let schema = Arc::new(Schema::new(vec![
@@ -814,7 +815,7 @@ impl Transaction {
 							Error::Datastore("lance scan_impl: missing key column".into())
 						})?
 						.as_any()
-						.downcast_ref::<lance::deps::arrow_array::BinaryArray>()
+						.downcast_ref::<arrow_array::BinaryArray>()
 						.ok_or_else(|| {
 							Error::Datastore(
 								"lance scan_impl: key column type mismatch".into(),
@@ -826,7 +827,7 @@ impl Transaction {
 							Error::Datastore("lance scan_impl: missing val column".into())
 						})?
 						.as_any()
-						.downcast_ref::<lance::deps::arrow_array::BinaryArray>()
+						.downcast_ref::<arrow_array::BinaryArray>()
 						.ok_or_else(|| {
 							Error::Datastore(
 								"lance scan_impl: val column type mismatch".into(),
