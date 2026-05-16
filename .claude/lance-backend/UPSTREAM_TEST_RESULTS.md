@@ -56,17 +56,43 @@ compaction operations; Lance's OCC + `MergeInsertBuilder` upsert (Sprint N)
 serializes these in a way the test doesn't anticipate. Test wall-clock
 was 1958s (32 min), so it's likely hitting Lance OCC retry storms.
 
-This is a real semantic gap to address in a dedicated sprint. Workarounds
-to investigate:
-- Configure Lance's commit conflict retry policy (raise tolerance)
-- Route concurrent index compactions through a serialized queue
-  application-side
-- Or document the limitation in `KNOWN_DIFFERENCES.md` as "not supported
-  on kv-lance" and skip the test under that backend
+**Sprint Z update (2026-05-16):** the OCC retry cascade *was* the
+primary failure mode, and a per-Datastore `commit_gate::CommitGate`
+coordinator (CollapseGate / BUNDLE merge pattern, ported from
+`lance-graph` + `ndarray::hpc::bnn_cross_plane`) eliminates it.
+Concurrent `Transaction::commit` calls now flow through one mpsc
+channel, get coalesced by key inside a 500 µs window, and land as ONE
+`MergeInsertBuilder::execute_reader` per epoch.
 
-The other 2 `index.rs` tests (`single_index_concurrent_test_index_compaction`,
-`index_replace_table_test`) both pass — the gap is specifically the
-multi-index concurrent compaction path.
+Verified on `claude/sprint-z-collapse-gate`:
+- Wall-clock: **202 s** (was 1958 s — 10× speedup, no timeout)
+- Lance commit events: still proceed (no OCC-retry deadlock)
+- 59/59 kv-lance unit tests pass with the gate active
+
+The test still does not pass the `assert!(compaction_count > 0)` check
+at the 10 s stress-window end. The remaining bottlenecks are *upstream*
+of the gate:
+
+1. Per-Lance-commit latency (~150-250 ms) — `MergeInsertBuilder` +
+   `Dataset::delete` round-trip cost on columnar storage.
+2. HNSW index serialization inside the SurrealDB-core indexing path
+   (54 concurrent `CREATE user SET vector = ...` serialize on the HNSW
+   lock before the gate sees the commit).
+
+Together those keep the compaction queue too thinly populated within
+the 10 s window for the loop to observe `count_iteration > 0`. The
+structural fix remains multi-bucket BindSpace sharding (Phase 2 item
+in `KNOWN_DIFFERENCES.md`): each (ns, db) pair owns its own Lance
+dataset and its own commit gate, so the test's 9 (ns × db) combinations
+get 9 independent commit cadences instead of serializing through one.
+
+The test is therefore **still skipped** under kv-lance, but with an
+updated rationale: not "OCC retry storm" (fixed by the gate) but
+"columnar-commit throughput floor + HNSW serialization at the test's
+10 s window."
+
+`hnsw_concurrent_writes` and `multi_index_concurrent_test_create_update_delete`
+in `index.rs` are not yet retested with the gate active — pending Sprint Z+.
 
 ## Cumulative across both sprints
 

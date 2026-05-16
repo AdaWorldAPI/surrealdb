@@ -1,0 +1,349 @@
+#![cfg(feature = "kv-lance")]
+
+//! # Commit coordinator — CollapseGate / BUNDLE merge for concurrent commits
+//!
+//! Multiple in-flight Transactions calling [`Transaction::commit`] concurrently
+//! would otherwise each issue their own `MergeInsertBuilder::execute_reader`
+//! against the shared Lance dataset, producing N independent dataset versions
+//! and triggering Lance's OCC retry path. Under high contention (e.g. the
+//! upstream `multi_index_concurrent_test_index_compaction` test, which spawns
+//! 54 concurrent writers + a background `index_compaction` loop) the retry
+//! cascade exhausts the wall-clock budget.
+//!
+//! This module implements the lance-graph CollapseGate write protocol from
+//! `ndarray::hpc::data-flow.md`:
+//!
+//! - **BindSpace read-only zero-copy** = each Transaction's `read_version`
+//!   snapshot (immutable view of the dataset).
+//! - **Owned microcopies for write scope** = each Transaction's
+//!   `PendingBuffer` (heap-local writes/deletes; not visible to readers).
+//! - **CollapseGate** (this module) = a single per-Datastore coordinator
+//!   that batches N concurrent submissions inside a small time/size window
+//!   and issues **ONE** `MergeInsertBuilder::execute_reader` per batch,
+//!   collapsing N would-be commits into 1.
+//!
+//! The merge semantics are [`MergeMode::Bundle`] from
+//! `lance_graph_contract::collapse_gate`: when two submissions in the same
+//! batch touch the same key, the later submitter's value wins. This matches
+//! upstream SurrealDB's serial-commit semantics where two transactions
+//! writing the same key see "the last commit wins" — only here we coalesce
+//! the work into a single Lance commit.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::{RwLock, mpsc, oneshot};
+use tracing::{trace, warn};
+
+use super::DatasetHandle;
+use super::schema::KvSchema;
+use crate::kvs::err::{Error, Result};
+use crate::kvs::{Key, Val};
+
+const TARGET: &str = "surrealdb::core::kvs::lance::commit_gate";
+
+/// Batch window — coordinator waits at most this long after the first
+/// submission before flushing the batch.
+///
+/// 500 µs is short enough that single-writer latency stays under 1 ms (the
+/// per-commit Lance round-trip on local disk is already several ms, so the
+/// 500 µs wait is dwarfed by the commit itself), and long enough that bursts
+/// of concurrent commits naturally coalesce.
+const BATCH_WINDOW: Duration = Duration::from_micros(500);
+
+/// Hard cap on submissions per batch. Above this, the gate flushes
+/// regardless of the window timer.
+const MAX_BATCH_SIZE: usize = 64;
+
+/// Bounded channel for backpressure. If the channel fills up, new submitters
+/// `.await` on `send` until the coordinator drains.
+const CHANNEL_CAPACITY: usize = 256;
+
+/// A single in-flight Transaction's commit request.
+struct Submission {
+	writes: Vec<(Key, Val)>,
+	deletes: Vec<Key>,
+	/// Version to stamp on every written row. The gate uses `max(version)`
+	/// across the batch as the canonical stamp for all rows in the merged
+	/// RecordBatch — monotonicity is preserved since each transaction's
+	/// `version = read_version + 1` is at least as large as its base.
+	version: u64,
+	reply: oneshot::Sender<BatchOutcome>,
+}
+
+/// Compact, `Clone` outcome that the coordinator broadcasts to every
+/// submitter in a batch. `Error` itself does not impl `Clone`, so we collapse
+/// to the two categories that callers need to distinguish (`TransactionConflict`
+/// gates SurrealDB's retry loop via `Error::is_retryable`; everything else
+/// surfaces as a generic datastore failure).
+#[derive(Clone, Debug)]
+enum BatchOutcome {
+	Ok,
+	Conflict(String),
+	Datastore(String),
+}
+
+impl BatchOutcome {
+	fn from_err(e: &Error) -> Self {
+		match e {
+			Error::TransactionConflict(s) => Self::Conflict(s.clone()),
+			other => Self::Datastore(other.to_string()),
+		}
+	}
+
+	fn into_result(self) -> Result<()> {
+		match self {
+			Self::Ok => Ok(()),
+			Self::Conflict(s) => Err(Error::TransactionConflict(s)),
+			Self::Datastore(s) => Err(Error::Datastore(s)),
+		}
+	}
+}
+
+/// Per-Datastore commit coordinator. Held inside an `Arc` and shared with
+/// every in-flight Transaction via `Transaction::commit_gate`.
+pub(super) struct CommitGate {
+	submit: mpsc::Sender<Submission>,
+	/// Held to signal the coordinator task to drain & exit. `None` after
+	/// `shutdown` has been invoked.
+	shutdown: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl CommitGate {
+	/// Spawn the coordinator task. The returned `Arc<Self>` is cloned into
+	/// each Transaction.
+	pub(super) fn spawn(dataset: Arc<RwLock<DatasetHandle>>) -> Arc<Self> {
+		let (submit_tx, submit_rx) = mpsc::channel::<Submission>(CHANNEL_CAPACITY);
+		let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+		tokio::spawn(coordinator_loop(dataset, submit_rx, shutdown_rx));
+
+		Arc::new(Self {
+			submit: submit_tx,
+			shutdown: tokio::sync::Mutex::new(Some(shutdown_tx)),
+		})
+	}
+
+	/// Submit a batch of (writes, deletes) and wait for the coordinator's
+	/// gated commit to land.
+	pub(super) async fn commit(
+		&self,
+		writes: Vec<(Key, Val)>,
+		deletes: Vec<Key>,
+		version: u64,
+	) -> Result<()> {
+		// Empty submissions short-circuit without touching the gate.
+		if writes.is_empty() && deletes.is_empty() {
+			return Ok(());
+		}
+		let (reply_tx, reply_rx) = oneshot::channel();
+		self.submit
+			.send(Submission {
+				writes,
+				deletes,
+				version,
+				reply: reply_tx,
+			})
+			.await
+			.map_err(|_| Error::Datastore("commit gate coordinator shut down".into()))?;
+		reply_rx
+			.await
+			.map_err(|_| Error::Datastore("commit gate coordinator dropped reply".into()))?
+			.into_result()
+	}
+
+	/// Cooperative shutdown — signal the coordinator to drain pending work
+	/// and exit. Subsequent calls are no-ops.
+	pub(super) async fn shutdown(&self) {
+		if let Some(tx) = self.shutdown.lock().await.take() {
+			let _ = tx.send(());
+		}
+	}
+}
+
+/// The coordinator's main loop. Owns the receiver end of the submission
+/// channel and the dataset write-handle.
+async fn coordinator_loop(
+	dataset: Arc<RwLock<DatasetHandle>>,
+	mut submit_rx: mpsc::Receiver<Submission>,
+	mut shutdown_rx: oneshot::Receiver<()>,
+) {
+	loop {
+		// Wait for the first submission OR the shutdown signal.
+		let first = tokio::select! {
+			biased;
+			_ = &mut shutdown_rx => {
+				trace!(target: TARGET, "commit gate received shutdown signal");
+				return;
+			},
+			sub = submit_rx.recv() => match sub {
+				Some(s) => s,
+				None => {
+					trace!(target: TARGET, "commit gate submission channel closed");
+					return;
+				},
+			},
+		};
+
+		// Open the batch window — accumulate until MAX_BATCH_SIZE or BATCH_WINDOW.
+		let mut batch = Vec::with_capacity(MAX_BATCH_SIZE);
+		batch.push(first);
+		let deadline = tokio::time::Instant::now() + BATCH_WINDOW;
+		while batch.len() < MAX_BATCH_SIZE {
+			match tokio::time::timeout_at(deadline, submit_rx.recv()).await {
+				Ok(Some(sub)) => batch.push(sub),
+				Ok(None) => break,
+				Err(_) => break, // window expired
+			}
+		}
+
+		let batch_len = batch.len();
+		trace!(target: TARGET, "commit gate flushing batch of {} submissions", batch_len);
+
+		// Execute the coalesced commit and broadcast the result.
+		execute_batch(&dataset, batch).await;
+	}
+}
+
+/// Coalesce all submissions in `batch` by key (BUNDLE semantics: last-submit
+/// wins), issue ONE Lance commit, and broadcast the outcome to every
+/// submitter's reply channel.
+async fn execute_batch(dataset: &Arc<RwLock<DatasetHandle>>, batch: Vec<Submission>) {
+	use std::collections::HashMap;
+
+	// Op = the merged operation for a single key after BUNDLE coalescing.
+	enum Op {
+		Write(Val),
+		Delete,
+	}
+
+	let mut merged: HashMap<Key, Op> = HashMap::new();
+	let mut max_version = 0u64;
+	let mut replies: Vec<oneshot::Sender<BatchOutcome>> = Vec::with_capacity(batch.len());
+
+	for sub in batch {
+		if sub.version > max_version {
+			max_version = sub.version;
+		}
+		for (k, v) in sub.writes {
+			merged.insert(k, Op::Write(v));
+		}
+		for k in sub.deletes {
+			merged.insert(k, Op::Delete);
+		}
+		replies.push(sub.reply);
+	}
+
+	// Partition the merged map back into (writes, deletes) for Lance.
+	let mut writes: Vec<(Key, Val)> = Vec::with_capacity(merged.len());
+	let mut deletes: Vec<Key> = Vec::new();
+	for (k, op) in merged {
+		match op {
+			Op::Write(v) => writes.push((k, v)),
+			Op::Delete => deletes.push(k),
+		}
+	}
+
+	let result = single_lance_commit(dataset, writes, deletes, max_version).await;
+
+	let outcome = match &result {
+		Ok(()) => BatchOutcome::Ok,
+		Err(e) => {
+			warn!(target: TARGET, "batched lance commit failed: {e}");
+			BatchOutcome::from_err(e)
+		}
+	};
+
+	// Broadcast the outcome to every submitter. A dropped receiver is
+	// expected if the caller's await was cancelled — ignore the send error.
+	for reply in replies {
+		let _ = reply.send(outcome.clone());
+	}
+}
+
+/// Issue a single Lance `MergeInsertBuilder::execute_reader` (for writes)
+/// followed by a `Dataset::delete` (for deletes). One dataset version is
+/// produced per call — concurrent submitters in the same batch share it.
+async fn single_lance_commit(
+	dataset: &Arc<RwLock<DatasetHandle>>,
+	writes: Vec<(Key, Val)>,
+	deletes: Vec<Key>,
+	version: u64,
+) -> Result<()> {
+	use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+
+	if writes.is_empty() && deletes.is_empty() {
+		return Ok(());
+	}
+
+	let mut ds = dataset.write().await;
+
+	// ── writes ─────────────────────────────────────────────────────────
+	if !writes.is_empty() {
+		let batch = super::Transaction::build_write_batch_lance(&writes, version)
+			.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?;
+		let schema_ref = batch.schema();
+		let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema_ref);
+
+		let arc_ds = Arc::new(ds.inner.clone());
+		let (new_ds, _stats) = MergeInsertBuilder::try_new(arc_ds, vec!["key".into()])
+			.map_err(|e| Error::Datastore(format!("lance merge builder: {e}")))?
+			.when_matched(WhenMatched::UpdateAll)
+			.when_not_matched(WhenNotMatched::InsertAll)
+			.try_build()
+			.map_err(|e| Error::Datastore(format!("lance merge build: {e}")))?
+			.execute_reader(reader)
+			.await
+			.map_err(|e| Error::Datastore(format!("lance merge_insert: {e}")))?;
+
+		ds.inner = Arc::try_unwrap(new_ds).unwrap_or_else(|arc| (*arc).clone());
+	}
+
+	// ── deletes ────────────────────────────────────────────────────────
+	if !deletes.is_empty() {
+		let predicate = KvSchema::build_delete_predicate(&deletes);
+		ds.inner
+			.delete(&predicate)
+			.await
+			.map_err(|e| Error::Datastore(format!("lance delete: {e}")))?;
+	}
+
+	Ok(())
+}
+
+// ============================================================================
+//  Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn batch_outcome_round_trips() {
+		assert!(matches!(BatchOutcome::Ok.into_result(), Ok(())));
+		assert!(matches!(
+			BatchOutcome::Conflict("x".into()).into_result(),
+			Err(Error::TransactionConflict(_))
+		));
+		assert!(matches!(
+			BatchOutcome::Datastore("y".into()).into_result(),
+			Err(Error::Datastore(_))
+		));
+	}
+
+	#[tokio::test]
+	async fn batch_outcome_from_err_preserves_conflict() {
+		let e = Error::TransactionConflict("oops".into());
+		let outcome = BatchOutcome::from_err(&e);
+		assert!(matches!(outcome, BatchOutcome::Conflict(_)));
+		assert!(outcome.into_result().is_err_and(|e| e.is_retryable()));
+	}
+
+	#[tokio::test]
+	async fn batch_outcome_from_err_collapses_to_datastore() {
+		let e = Error::Internal("anything".into());
+		let outcome = BatchOutcome::from_err(&e);
+		assert!(matches!(outcome, BatchOutcome::Datastore(_)));
+	}
+}
