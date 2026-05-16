@@ -215,11 +215,40 @@ impl Vector {
 			.fold(0.0_f64, f64::max)
 	}
 
+	#[cfg(not(feature = "vector-hpc"))]
 	fn chebyshev_distance(&self, other: &Self) -> f64 {
 		match (self, other) {
 			(Self::F64(a), Self::F64(b)) => a.linf_dist(b).unwrap_or(f64::INFINITY),
 			(Self::F32(a), Self::F32(b)) => {
 				a.linf_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY)
+			}
+			(Self::I64(a), Self::I64(b)) => {
+				a.linf_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY)
+			}
+			(Self::I32(a), Self::I32(b)) => {
+				a.linf_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY)
+			}
+			(Self::I16(a), Self::I16(b)) => Self::chebyshev(a, b),
+			_ => f64::NAN,
+		}
+	}
+
+	#[cfg(feature = "vector-hpc")]
+	fn chebyshev_distance(&self, other: &Self) -> f64 {
+		match (self, other) {
+			(Self::F64(a), Self::F64(b)) => match (a.as_slice(), b.as_slice()) {
+				(Some(a_s), Some(b_s)) => Self::chebyshev_distance_f64_simd(a_s, b_s),
+				_ => {
+					let a_v: Vec<f64> = a.iter().copied().collect();
+					let b_v: Vec<f64> = b.iter().copied().collect();
+					Self::chebyshev_distance_f64_simd(&a_v, &b_v)
+				}
+			},
+			// f32 → widen to f64 for SIMD precision.
+			(Self::F32(a), Self::F32(b)) => {
+				let a_v: Vec<f64> = a.iter().map(|&x| x as f64).collect();
+				let b_v: Vec<f64> = b.iter().map(|&x| x as f64).collect();
+				Self::chebyshev_distance_f64_simd(&a_v, &b_v)
 			}
 			(Self::I64(a), Self::I64(b)) => {
 				a.linf_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY)
@@ -370,6 +399,84 @@ impl Vector {
 		acc.sqrt()
 	}
 
+	/// SIMD L1 (Manhattan) distance written directly against `ndarray_hpc::simd::F64x8`.
+	/// CPU detection is cached once in `LazyLock<Tier>` (simd.rs:92); subsequent
+	/// calls dispatch via the cached tier (AVX-512 / AVX2 / NEON / scalar fallback).
+	#[cfg(feature = "vector-hpc")]
+	#[inline]
+	fn manhattan_distance_f64_simd(a: &[f64], b: &[f64]) -> f64 {
+		use ndarray_hpc::simd::F64x8;
+		let n = a.len().min(b.len());
+		let chunks = n / 8;
+		let remainder = n % 8;
+
+		let mut acc = F64x8::splat(0.0);
+		for i in 0..chunks {
+			let va = F64x8::from_slice(&a[i * 8..i * 8 + 8]);
+			let vb = F64x8::from_slice(&b[i * 8..i * 8 + 8]);
+			acc = acc + (va - vb).abs();
+		}
+		let mut sum = acc.reduce_sum();
+		let offset = chunks * 8;
+		for i in 0..remainder {
+			sum += (a[offset + i] - b[offset + i]).abs();
+		}
+		sum
+	}
+
+	/// SIMD L∞ (Chebyshev) distance written directly against `ndarray_hpc::simd::F64x8`.
+	/// CPU detection is cached once in `LazyLock<Tier>` (simd.rs:92); subsequent
+	/// calls dispatch via the cached tier (AVX-512 / AVX2 / NEON / scalar fallback).
+	#[cfg(feature = "vector-hpc")]
+	#[inline]
+	fn chebyshev_distance_f64_simd(a: &[f64], b: &[f64]) -> f64 {
+		use ndarray_hpc::simd::F64x8;
+		let n = a.len().min(b.len());
+		let chunks = n / 8;
+		let remainder = n % 8;
+
+		let mut acc = F64x8::splat(f64::NEG_INFINITY);
+		for i in 0..chunks {
+			let va = F64x8::from_slice(&a[i * 8..i * 8 + 8]);
+			let vb = F64x8::from_slice(&b[i * 8..i * 8 + 8]);
+			acc = acc.simd_max((va - vb).abs());
+		}
+		let mut m = acc.reduce_max();
+		let offset = chunks * 8;
+		for i in 0..remainder {
+			m = m.max((a[offset + i] - b[offset + i]).abs());
+		}
+		// Empty inputs or all-NEG_INFINITY accumulator: distance is 0.
+		if m.is_finite() { m } else { 0.0 }
+	}
+
+	/// SIMD Pearson correlation (centered cosine similarity) written against
+	/// `ndarray_hpc::simd::F64x8`. Returns the correlation coefficient r
+	/// (not the distance 1-r), matching the scalar `pearson` method contract.
+	/// CPU detection is cached once in `LazyLock<Tier>` (simd.rs:92); subsequent
+	/// calls dispatch via the cached tier (AVX-512 / AVX2 / NEON / scalar fallback).
+	#[cfg(feature = "vector-hpc")]
+	#[inline]
+	fn pearson_similarity_f64_simd(a: &[f64], b: &[f64]) -> f64 {
+		let n = a.len().min(b.len());
+		if n == 0 {
+			return 0.0; // match scalar: denominator==0 returns 0
+		}
+		let nf = n as f64;
+		// Pass 1: compute means (scalar; this is O(n) not O(n/8) — acceptable
+		// because Pass 2 dominates and the SIMD cosine kernel handles the bulk).
+		let mean_a: f64 = a[..n].iter().sum::<f64>() / nf;
+		let mean_b: f64 = b[..n].iter().sum::<f64>() / nf;
+		// Pass 2: center the vectors.
+		let ca: Vec<f64> = a[..n].iter().map(|x| x - mean_a).collect();
+		let cb: Vec<f64> = b[..n].iter().map(|x| x - mean_b).collect();
+		// Reuse the SIMD cosine kernel on centered vectors.
+		// cosine_f64_simd returns dot/(|ca|*|cb|) which equals Pearson r.
+		// When both norms are ~0 the kernel returns NaN; map to 0 to match scalar.
+		let r = ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd(&ca, &cb);
+		if r.is_finite() { r } else { 0.0 }
+	}
+
 	#[cfg(not(feature = "vector-hpc"))]
 	#[inline]
 	fn euclidean_distance(&self, other: &Self) -> f64 {
@@ -494,10 +601,35 @@ impl Vector {
 		a.iter().zip(b.iter()).map(|(&a, &b)| (a - b).to_float().abs()).sum()
 	}
 
+	#[cfg(not(feature = "vector-hpc"))]
 	pub(super) fn manhattan_distance(&self, other: &Self) -> f64 {
 		match (self, other) {
 			(Self::F64(a), Self::F64(b)) => a.l1_dist(b).unwrap_or(f64::INFINITY),
 			(Self::F32(a), Self::F32(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
+			(Self::I64(a), Self::I64(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
+			(Self::I32(a), Self::I32(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
+			(Self::I16(a), Self::I16(b)) => Self::manhattan(a, b),
+			_ => f64::NAN,
+		}
+	}
+
+	#[cfg(feature = "vector-hpc")]
+	pub(super) fn manhattan_distance(&self, other: &Self) -> f64 {
+		match (self, other) {
+			(Self::F64(a), Self::F64(b)) => match (a.as_slice(), b.as_slice()) {
+				(Some(a_s), Some(b_s)) => Self::manhattan_distance_f64_simd(a_s, b_s),
+				_ => {
+					let a_v: Vec<f64> = a.iter().copied().collect();
+					let b_v: Vec<f64> = b.iter().copied().collect();
+					Self::manhattan_distance_f64_simd(&a_v, &b_v)
+				}
+			},
+			// f32 → widen to f64 for SIMD precision.
+			(Self::F32(a), Self::F32(b)) => {
+				let a_v: Vec<f64> = a.iter().map(|&x| x as f64).collect();
+				let b_v: Vec<f64> = b.iter().map(|&x| x as f64).collect();
+				Self::manhattan_distance_f64_simd(&a_v, &b_v)
+			}
 			(Self::I64(a), Self::I64(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
 			(Self::I32(a), Self::I32(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
 			(Self::I16(a), Self::I16(b)) => Self::manhattan(a, b),
@@ -559,10 +691,35 @@ impl Vector {
 		numerator / denominator
 	}
 
+	#[cfg(not(feature = "vector-hpc"))]
 	fn pearson_similarity(&self, other: &Self) -> f64 {
 		match (self, other) {
 			(Self::F64(a), Self::F64(b)) => Self::pearson(a, b),
 			(Self::F32(a), Self::F32(b)) => Self::pearson(a, b),
+			(Self::I64(a), Self::I64(b)) => Self::pearson(a, b),
+			(Self::I32(a), Self::I32(b)) => Self::pearson(a, b),
+			(Self::I16(a), Self::I16(b)) => Self::pearson(a, b),
+			_ => f64::NAN,
+		}
+	}
+
+	#[cfg(feature = "vector-hpc")]
+	fn pearson_similarity(&self, other: &Self) -> f64 {
+		match (self, other) {
+			(Self::F64(a), Self::F64(b)) => match (a.as_slice(), b.as_slice()) {
+				(Some(a_s), Some(b_s)) => Self::pearson_similarity_f64_simd(a_s, b_s),
+				_ => {
+					let a_v: Vec<f64> = a.iter().copied().collect();
+					let b_v: Vec<f64> = b.iter().copied().collect();
+					Self::pearson_similarity_f64_simd(&a_v, &b_v)
+				}
+			},
+			// f32 → widen to f64 for SIMD precision.
+			(Self::F32(a), Self::F32(b)) => {
+				let a_v: Vec<f64> = a.iter().map(|&x| x as f64).collect();
+				let b_v: Vec<f64> = b.iter().map(|&x| x as f64).collect();
+				Self::pearson_similarity_f64_simd(&a_v, &b_v)
+			}
 			(Self::I64(a), Self::I64(b)) => Self::pearson(a, b),
 			(Self::I32(a), Self::I32(b)) => Self::pearson(a, b),
 			(Self::I16(a), Self::I16(b)) => Self::pearson(a, b),
@@ -957,6 +1114,113 @@ mod hpc_tests {
 			let simd = Vector::euclidean_distance_f64_simd(&a_v, &b_v);
 			let scalar = scalar_l2(&a_v, &b_v);
 
+			assert!(
+				(simd - scalar).abs() < 1e-9,
+				"dim {}: simd={}, scalar={}, diff={}",
+				dim,
+				simd,
+				scalar,
+				(simd - scalar).abs(),
+			);
+		}
+	}
+
+	/// SIMD Manhattan must agree with the scalar fallback to within fp tolerance,
+	/// across the same dim sizes.
+	#[test]
+	fn test_manhattan_hpc_matches_scalar() {
+		fn scalar_manhattan(a: &[f64], b: &[f64]) -> f64 {
+			a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum()
+		}
+
+		let mut state: u64 = 0xDEADBEEF;
+		fn lcg(s: &mut u64) -> f64 {
+			*s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+			((*s >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
+		}
+
+		for &dim in &[1usize, 128, 384, 768, 1024] {
+			let a_v: Vec<f64> = (0..dim).map(|_| lcg(&mut state)).collect();
+			let b_v: Vec<f64> = (0..dim).map(|_| lcg(&mut state)).collect();
+
+			let simd = Vector::manhattan_distance_f64_simd(&a_v, &b_v);
+			let scalar = scalar_manhattan(&a_v, &b_v);
+
+			assert!(
+				(simd - scalar).abs() < 1e-9,
+				"dim {}: simd={}, scalar={}, diff={}",
+				dim,
+				simd,
+				scalar,
+				(simd - scalar).abs(),
+			);
+		}
+	}
+
+	/// SIMD Chebyshev must agree with the scalar fallback to within fp tolerance,
+	/// across the same dim sizes.
+	#[test]
+	fn test_chebyshev_hpc_matches_scalar() {
+		fn scalar_chebyshev(a: &[f64], b: &[f64]) -> f64 {
+			a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(f64::NEG_INFINITY, f64::max)
+		}
+
+		let mut state: u64 = 0xFEEDFACE;
+		fn lcg(s: &mut u64) -> f64 {
+			*s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+			((*s >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
+		}
+
+		for &dim in &[1usize, 128, 384, 768, 1024] {
+			let a_v: Vec<f64> = (0..dim).map(|_| lcg(&mut state)).collect();
+			let b_v: Vec<f64> = (0..dim).map(|_| lcg(&mut state)).collect();
+
+			let simd = Vector::chebyshev_distance_f64_simd(&a_v, &b_v);
+			let scalar = scalar_chebyshev(&a_v, &b_v);
+
+			assert!(
+				(simd - scalar).abs() < 1e-9,
+				"dim {}: simd={}, scalar={}, diff={}",
+				dim,
+				simd,
+				scalar,
+				(simd - scalar).abs(),
+			);
+		}
+	}
+
+	/// SIMD Pearson correlation must agree with the scalar fallback to within fp
+	/// tolerance, across the same dim sizes.
+	#[test]
+	fn test_pearson_hpc_matches_scalar() {
+		fn scalar_pearson(a: &[f64], b: &[f64]) -> f64 {
+			let n = a.len() as f64;
+			let mean_a = a.iter().sum::<f64>() / n;
+			let mean_b = b.iter().sum::<f64>() / n;
+			let dot: f64 = a.iter().zip(b).map(|(x, y)| (x - mean_a) * (y - mean_b)).sum();
+			let na: f64 = a.iter().map(|x| (x - mean_a).powi(2)).sum::<f64>().sqrt();
+			let nb: f64 = b.iter().map(|y| (y - mean_b).powi(2)).sum::<f64>().sqrt();
+			if na * nb < 1e-12 {
+				0.0
+			} else {
+				dot / (na * nb)
+			}
+		}
+
+		let mut state: u64 = 0xCAFEBABE;
+		fn lcg(s: &mut u64) -> f64 {
+			*s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+			((*s >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
+		}
+
+		for &dim in &[1usize, 128, 384, 768, 1024] {
+			let a_v: Vec<f64> = (0..dim).map(|_| lcg(&mut state)).collect();
+			let b_v: Vec<f64> = (0..dim).map(|_| lcg(&mut state)).collect();
+
+			let simd = Vector::pearson_similarity_f64_simd(&a_v, &b_v);
+			let scalar = scalar_pearson(&a_v, &b_v);
+
+			// Pearson is two-pass (mean subtraction + cosine), so allow 1e-9.
 			assert!(
 				(simd - scalar).abs() < 1e-9,
 				"dim {}: simd={}, scalar={}, diff={}",
