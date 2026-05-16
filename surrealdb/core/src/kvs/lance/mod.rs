@@ -69,7 +69,6 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::Result as AnyResult;
 use async_trait::async_trait;
 use lance::Dataset as LanceDataset;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteParams};
@@ -85,7 +84,6 @@ use super::Direction;
 use super::api::ScanLimit;
 use super::config::LanceConfig;
 use super::err::{Error, Result};
-use crate::key::debug::Sprintable;
 use crate::kvs::api::Transactable;
 use crate::kvs::{Key, Val};
 
@@ -271,6 +269,8 @@ impl Datastore {
 	}
 
 	/// Shut down the datastore, flushing any background tasks.
+	// Will be called by the kvs::Datastore teardown path in Sprint II+.
+	#[allow(dead_code)]
 	pub(crate) async fn shutdown(&self) -> Result<()> {
 		if let Some(opt) = &self.background_optimizer {
 			opt.shutdown().await;
@@ -750,6 +750,7 @@ impl Transaction {
 	/// Unified scan/scanr implementation. Merges:
 	///   - pending writes (in-memory, overrides Lance)
 	///   - Lance dataset state at `read_version`
+	///
 	/// Then applies limit/skip/direction.
 	async fn scan_impl(
 		&self,

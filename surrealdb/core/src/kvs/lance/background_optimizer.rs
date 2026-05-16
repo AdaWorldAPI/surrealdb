@@ -49,6 +49,9 @@ pub(super) struct BackgroundOptimizer {
 	notify: Arc<Notify>,
 
 	/// Shutdown flag — when set, the background loop exits cleanly.
+	// Read by the background task via `shutdown_for_task`; the field itself
+	// is only written on construction and via `shutdown()`.
+	#[allow(dead_code)]
 	shutdown: Arc<AtomicBool>,
 }
 
@@ -99,6 +102,8 @@ impl BackgroundOptimizer {
 	}
 
 	/// Shut down the background task gracefully.
+	// Called by `Datastore::shutdown()`, which is itself deferred to Sprint II+.
+	#[allow(dead_code)]
 	pub async fn shutdown(&self) {
 		self.shutdown.store(true, Ordering::Release);
 		self.notify.notify_one();
