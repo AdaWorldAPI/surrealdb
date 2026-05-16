@@ -856,8 +856,10 @@ async fn test_get_at_specific_version() {
 #[tokio::test]
 async fn test_versioned_query_with_versioned_false_errors() {
     let path = unique_tmp_path();
-    let mut config = LanceConfig::default();
-    config.versioned = false;
+    let config = LanceConfig {
+        versioned: false,
+        ..LanceConfig::default()
+    };
     let ds = Datastore::new(path.to_str().unwrap(), config).await.expect("ds");
 
     let tx = ds.transaction(false, false).await.expect("tx");
@@ -999,10 +1001,10 @@ async fn test_property_matches_hashmap_reference() {
         }
 
         // Decide commit or cancel based on a coin flip — both paths exercised.
-        if lcg(&mut rng_state) % 4 != 0 {
+        if !lcg(&mut rng_state).is_multiple_of(4) {
             tx.commit().await.expect("commit");
             // Apply staged ops to reference.
-            for (k, v) in staged.into_iter() {
+            for (k, v) in staged {
                 match v {
                     Some(val) => { reference.insert(k, val); }
                     None => { reference.remove(&k); }
@@ -1249,7 +1251,7 @@ async fn test_concurrent_same_key_yields_one_winner() {
     let got_str = String::from_utf8_lossy(&got);
     assert!(
         got_str.starts_with('v')
-            && got_str[1..].parse::<usize>().map_or(false, |n| n < N_TASKS),
+            && got_str[1..].parse::<usize>().is_ok_and(|n| n < N_TASKS),
         "final value must be one of v0..v{}; got {:?}",
         N_TASKS - 1,
         got_str
@@ -1310,26 +1312,41 @@ async fn shutdown_drains_pending_commits() {
     // pulls them off the mpsc channel in its hot loop).
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
-    // Drain & shutdown — this must `.await` the coordinator task
-    // internally, so when this returns, every queued commit has either
-    // landed or been gracefully rejected.
-    Arc::try_unwrap(ds)
-        .map_err(|_| "ds still has outstanding refs")
-        .unwrap()
-        .shutdown()
-        .await
-        .expect("shutdown");
+    // Drain & shutdown via `Arc::deref` — we can NOT use
+    // `Arc::try_unwrap` here because the spawned commit tasks still
+    // hold their `Arc<Datastore>` clones (they only release them when
+    // their `commit()` returns, which is what we're driving via this
+    // shutdown). `Datastore::shutdown` takes `&self`, so call it
+    // through the Arc; the inner `CommitGate::shutdown` awaits the
+    // coordinator task and guarantees every queued commit has either
+    // landed or been gracefully rejected before this returns.
+    ds.shutdown().await.expect("shutdown");
 
     // Verify the contract: every commit either succeeded (was drained)
-    // or returned the clean "gate shut down" error. The pre-fix bug
-    // produced "coordinator dropped reply" which is what this test
-    // guards against.
+    // or returned the clean "gate shut down" rejection emitted by
+    // `CommitGate::commit` when the channel is closed BEFORE the
+    // submission lands. The pre-fix bug produced
+    // "commit gate coordinator dropped reply" — that string MUST NOT
+    // appear in any returned error, otherwise the regression has
+    // returned.
     for (i, handle) in handles.into_iter().enumerate() {
         match handle.await.expect("join") {
-            Ok(()) => { /* drained */ }
+            Ok(()) => { /* drained successfully */ }
             Err(crate::kvs::err::Error::Datastore(msg))
-                if msg.contains("commit gate") =>
-            { /* gracefully rejected post-shutdown */ }
+                if msg.contains("commit gate coordinator shut down")
+                    && !msg.contains("dropped reply") =>
+            {
+                /* gracefully rejected post-shutdown (the channel was
+                 * closed before this submission could be enqueued) */
+            }
+            Err(crate::kvs::err::Error::Datastore(msg))
+                if msg.contains("dropped reply") =>
+            {
+                panic!(
+                    "commit #{i} hit the pre-fix dropped-reply path: {msg} \
+                     — shutdown drain regression has returned"
+                );
+            }
             Err(e) => panic!(
                 "commit #{i} returned unexpected error after shutdown: {e}"
             ),
