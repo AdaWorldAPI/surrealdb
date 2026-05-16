@@ -1120,3 +1120,145 @@ async fn test_scan_limit_bytes_or_count_bytes_wins() {
     tx.cancel().await.expect("cancel");
     ds.shutdown().await.expect("shutdown");
 }
+
+// ============================================================================
+//  Concurrent-transaction property tests (Sprint U)
+// ============================================================================
+
+/// N concurrent transactions each writing to a DISJOINT key range. After all
+/// commits complete, every key is readable. Verifies Lance's OCC handles
+/// non-overlapping writes correctly (no false-positive conflicts).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_disjoint_writes() {
+    const N_TASKS: usize = 8;
+    const KEYS_PER_TASK: usize = 4;
+
+    let path = unique_tmp_path();
+    let ds = std::sync::Arc::new(
+        Datastore::new(path.to_str().unwrap(), LanceConfig::default())
+            .await
+            .expect("ds"),
+    );
+
+    let mut handles = Vec::with_capacity(N_TASKS);
+    for task_id in 0..N_TASKS {
+        let ds_clone = std::sync::Arc::clone(&ds);
+        handles.push(tokio::spawn(async move {
+            let tx = ds_clone.transaction(true, false).await.expect("tx");
+            for i in 0..KEYS_PER_TASK {
+                let key = format!("t{:02}_k{:02}", task_id, i).into_bytes();
+                let val = format!("v_{:02}_{:02}", task_id, i).into_bytes();
+                tx.set(key, val).await.expect("set");
+            }
+            tx.commit().await.expect("commit");
+            task_id
+        }));
+    }
+
+    // All 8 tasks must complete without panic.
+    for h in handles {
+        let _task_id = h.await.expect("task panic");
+    }
+
+    // Every key must be readable.
+    let tx = ds.transaction(false, false).await.expect("read tx");
+    for task_id in 0..N_TASKS {
+        for i in 0..KEYS_PER_TASK {
+            let key = format!("t{:02}_k{:02}", task_id, i).into_bytes();
+            let expected = format!("v_{:02}_{:02}", task_id, i).into_bytes();
+            let got = tx.get(key.clone(), None).await.expect("get");
+            assert_eq!(
+                got.as_deref(),
+                Some(expected.as_slice()),
+                "task {} key {:?} mismatch: got {:?}",
+                task_id,
+                key,
+                got
+            );
+        }
+    }
+    tx.cancel().await.expect("cancel");
+    std::sync::Arc::try_unwrap(ds)
+        .map_err(|_| "ds still has outstanding refs")
+        .unwrap()
+        .shutdown()
+        .await
+        .expect("shutdown");
+}
+
+/// N concurrent transactions all writing to the SAME key with different
+/// values. After all commits complete (or one is retried by Lance OCC),
+/// a final get must return ONE of the written values — not None, not garbage.
+/// We don't assert which value won (OCC race is implementation-defined).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_same_key_yields_one_winner() {
+    const N_TASKS: usize = 6;
+
+    let path = unique_tmp_path();
+    let ds = std::sync::Arc::new(
+        Datastore::new(path.to_str().unwrap(), LanceConfig::default())
+            .await
+            .expect("ds"),
+    );
+
+    let mut handles = Vec::with_capacity(N_TASKS);
+    for task_id in 0..N_TASKS {
+        let ds_clone = std::sync::Arc::clone(&ds);
+        handles.push(tokio::spawn(async move {
+            // Each task tries a few times; if Lance returns a retryable
+            // conflict, we re-issue. This is what SurrealDB's higher-level
+            // retry loop does in production.
+            for _ in 0..5 {
+                let tx = ds_clone.transaction(true, false).await.expect("tx");
+                let val = format!("v{}", task_id).into_bytes();
+                tx.set(b"shared".to_vec(), val).await.expect("set");
+                match tx.commit().await {
+                    Ok(()) => return Ok(()),
+                    Err(crate::kvs::err::Error::TransactionConflict(_)) => {
+                        // Retry — re-open a fresh transaction.
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(crate::kvs::err::Error::TransactionConflict(
+                "exceeded 5 retries".into(),
+            ))
+        }));
+    }
+
+    let mut success = 0;
+    for h in handles {
+        match h.await.expect("task panic") {
+            Ok(()) => success += 1,
+            Err(_e) => {
+                // Excessive retries — acceptable in extreme contention but
+                // every task should converge in 5 tries on default config.
+            }
+        }
+    }
+    assert!(success >= 1, "at least one task must commit successfully; got 0");
+
+    // Final value must be SOMETHING (one of v0..vN-1), not None.
+    let tx = ds.transaction(false, false).await.expect("read tx");
+    let got = tx
+        .get(b"shared".to_vec(), None)
+        .await
+        .expect("get");
+    let got = got.expect("expected Some(val), got None");
+    let got_str = String::from_utf8_lossy(&got);
+    assert!(
+        got_str.starts_with('v')
+            && got_str[1..].parse::<usize>().map_or(false, |n| n < N_TASKS),
+        "final value must be one of v0..v{}; got {:?}",
+        N_TASKS - 1,
+        got_str
+    );
+    tx.cancel().await.expect("cancel");
+    std::sync::Arc::try_unwrap(ds)
+        .map_err(|_| "ds still has outstanding refs")
+        .unwrap()
+        .shutdown()
+        .await
+        .expect("shutdown");
+}
