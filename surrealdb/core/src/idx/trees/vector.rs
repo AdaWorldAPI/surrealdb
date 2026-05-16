@@ -863,7 +863,7 @@ mod hpc_tests {
 			let a = Array1::from_vec(a_v.clone());
 			let b = Array1::from_vec(b_v.clone());
 
-			let simd = cosine_distance_f64(&a, &b);
+			let simd = Vector::cosine_distance_f64(&a, &b);
 			let scalar = scalar_cosine(&a_v, &b_v);
 
 			assert!(
