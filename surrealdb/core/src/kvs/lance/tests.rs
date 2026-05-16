@@ -856,8 +856,10 @@ async fn test_get_at_specific_version() {
 #[tokio::test]
 async fn test_versioned_query_with_versioned_false_errors() {
     let path = unique_tmp_path();
-    let mut config = LanceConfig::default();
-    config.versioned = false;
+    let config = LanceConfig {
+        versioned: false,
+        ..LanceConfig::default()
+    };
     let ds = Datastore::new(path.to_str().unwrap(), config).await.expect("ds");
 
     let tx = ds.transaction(false, false).await.expect("tx");
@@ -999,10 +1001,10 @@ async fn test_property_matches_hashmap_reference() {
         }
 
         // Decide commit or cancel based on a coin flip — both paths exercised.
-        if lcg(&mut rng_state) % 4 != 0 {
+        if !lcg(&mut rng_state).is_multiple_of(4) {
             tx.commit().await.expect("commit");
             // Apply staged ops to reference.
-            for (k, v) in staged.into_iter() {
+            for (k, v) in staged {
                 match v {
                     Some(val) => { reference.insert(k, val); }
                     None => { reference.remove(&k); }
@@ -1249,7 +1251,7 @@ async fn test_concurrent_same_key_yields_one_winner() {
     let got_str = String::from_utf8_lossy(&got);
     assert!(
         got_str.starts_with('v')
-            && got_str[1..].parse::<usize>().map_or(false, |n| n < N_TASKS),
+            && got_str[1..].parse::<usize>().is_ok_and(|n| n < N_TASKS),
         "final value must be one of v0..v{}; got {:?}",
         N_TASKS - 1,
         got_str
@@ -1261,4 +1263,93 @@ async fn test_concurrent_same_key_yields_one_winner() {
         .shutdown()
         .await
         .expect("shutdown");
+}
+
+/// Regression test for the codex P2 finding on PR #17 (Sprint Z):
+/// `Datastore::shutdown` must drain queued commits in the CollapseGate
+/// coordinator rather than dropping their reply channels.
+///
+/// Pattern: spawn a small race-prone batch of commits and shut down
+/// immediately afterwards. Every commit that the caller `.await`ed
+/// MUST observe either `Ok(())` (drained) or a clean
+/// "commit gate coordinator shut down" error — never a dangling
+/// "coordinator dropped reply", which was the pre-fix bug.
+#[tokio::test]
+async fn shutdown_drains_pending_commits() {
+    use std::sync::Arc;
+
+    let path = unique_tmp_path();
+    let path_str = path.to_str().expect("path is valid UTF-8");
+    let ds = Arc::new(
+        Datastore::new(path_str, LanceConfig::default())
+            .await
+            .expect("create dataset"),
+    );
+
+    // Spawn enough concurrent commits that some will be queued in the
+    // gate's channel while the coordinator is still draining the first
+    // batch. Each commit writes a unique key so BUNDLE-merge can't
+    // collapse them.
+    let mut handles = Vec::new();
+    for i in 0..16u32 {
+        let ds_clone = Arc::clone(&ds);
+        handles.push(tokio::spawn(async move {
+            let tx = ds_clone
+                .transaction(true, false)
+                .await
+                .expect("open tx");
+            tx.set(
+                format!("shutdown_drain_key_{i}").into_bytes(),
+                b"v".to_vec(),
+            )
+            .await
+            .expect("set");
+            tx.commit().await
+        }));
+    }
+
+    // Give the gate a moment to receive submissions (the coordinator
+    // pulls them off the mpsc channel in its hot loop).
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    // Drain & shutdown via `Arc::deref` — we can NOT use
+    // `Arc::try_unwrap` here because the spawned commit tasks still
+    // hold their `Arc<Datastore>` clones (they only release them when
+    // their `commit()` returns, which is what we're driving via this
+    // shutdown). `Datastore::shutdown` takes `&self`, so call it
+    // through the Arc; the inner `CommitGate::shutdown` awaits the
+    // coordinator task and guarantees every queued commit has either
+    // landed or been gracefully rejected before this returns.
+    ds.shutdown().await.expect("shutdown");
+
+    // Verify the contract: every commit either succeeded (was drained)
+    // or returned the clean "gate shut down" rejection emitted by
+    // `CommitGate::commit` when the channel is closed BEFORE the
+    // submission lands. The pre-fix bug produced
+    // "commit gate coordinator dropped reply" — that string MUST NOT
+    // appear in any returned error, otherwise the regression has
+    // returned.
+    for (i, handle) in handles.into_iter().enumerate() {
+        match handle.await.expect("join") {
+            Ok(()) => { /* drained successfully */ }
+            Err(crate::kvs::err::Error::Datastore(msg))
+                if msg.contains("commit gate coordinator shut down")
+                    && !msg.contains("dropped reply") =>
+            {
+                /* gracefully rejected post-shutdown (the channel was
+                 * closed before this submission could be enqueued) */
+            }
+            Err(crate::kvs::err::Error::Datastore(msg))
+                if msg.contains("dropped reply") =>
+            {
+                panic!(
+                    "commit #{i} hit the pre-fix dropped-reply path: {msg} \
+                     — shutdown drain regression has returned"
+                );
+            }
+            Err(e) => panic!(
+                "commit #{i} returned unexpected error after shutdown: {e}"
+            ),
+        }
+    }
 }
