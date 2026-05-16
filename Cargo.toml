@@ -147,6 +147,12 @@ native-tls = "0.2.14"
 # have created a diamond dep against crates.io's ndarray). Distance
 # helpers (l1/l2/linf) are inlined in surrealdb/core/src/idx/trees/vector.rs.
 ndarray = { git = "https://github.com/AdaWorldAPI/ndarray.git", default-features = false, features = ["std", "hpc-extras"] }
+# AdaWorldAPI/lance-graph workspace — pulled in via the `lance-graph` feature
+# in surrealdb-core. Only the zero-dep contract crate is wired today (this
+# PR's "agnostic build first" scope); implementation crates (lance-graph,
+# lance-graph-planner, blasgraph, bgz-tensor) are deferred until the
+# synergy sprints (HHTL bridge, GraphBLAS, etc.) land.
+lance-graph-contract = { git = "https://github.com/AdaWorldAPI/lance-graph.git" }
 nix = { version = "0.30.1", default-features = false }
 num-traits = "0.2.19"
 num_cpus = "1.17.0"

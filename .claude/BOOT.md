@@ -69,6 +69,46 @@ These come from Stefan's WoA project but apply equally here:
 8. **Stop and ask.** If a design decision will affect downstream
    work (e.g. schema change, transaction-semantic difference),
    surface it explicitly before proceeding.
+9. **Preflight the full canonical battery before every commit.**
+   CI is the second line of defense; preflight is the first.
+
+   **Canonical (every PR):**
+   - `cargo clippy -p <crate> --features "<set>" -- -D warnings`
+     Strict tier (when pedantic-clean is the goal):
+     `-- -D warnings -D clippy::pedantic -D clippy::nursery`
+     ~600 lints. Floor, not goal — fix at the source, don't
+     `#[allow]` past unless rationale is documented inline.
+   - `cargo fmt --check`
+     Rustfmt 1.95 (matches `rust-toolchain.toml`). Has hit every
+     sprint-11/12 PR's CI; preflighting it is non-negotiable.
+   - `cargo audit`
+     RustSec advisory scan.
+   - `cargo deny check`
+     License + dep + advisory + bans. Closest single-binary
+     "ruff-ish" multi-axis check.
+
+   **Quality / maintenance (per sprint or per substantial PR):**
+   - `cargo machete` — unused-dep detector.
+   - `cargo geiger` — unsafe scan. Every `unsafe` block needs
+     a `// SAFETY:` comment (upstream CLAUDE.md rule).
+   - `cargo semver-checks check-release` — public-API SemVer
+     compat (catches accidental breakage on shipped surfaces).
+   - `cargo spellcheck` — comments + docs.
+   - `cargo public-api` — surface diff (paired with semver-checks
+     for the "did I just add a public item?" check).
+
+   **Heavier / opt-in (all stable Rust):**
+   - `kani` — bounded model checker, `#[kani::proof]` harnesses
+     for invariant proofs.
+   - `loom` — concurrency model checker (lib, not CLI; wire into
+     `#[cfg(loom)]` tests).
+   - `cargo mutants` — mutation testing to validate test coverage
+     actually catches breakages.
+   - `cargo-tarpaulin` — coverage.
+
+   Iron rule applies to the **canonical** tier on every PR. Quality
+   tier should run before merging substantial changes. Heavy tier
+   is sprint-level or release-gate.
 
 ## 4. What to do first
 

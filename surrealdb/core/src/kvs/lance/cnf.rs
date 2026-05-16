@@ -47,6 +47,9 @@ pub(super) static LANCE_VERSION_RETENTION_SECS: LazyLock<u64> =
 /// Tombstone rows make scans see "deleted at version v" as data, which
 /// is useful for change-data-capture downstream of SurrealDB. The cost
 /// is one extra row per deletion.
+// The delete path that reads this flag is deferred to Sprint II+; the
+// env-var surface is part of the public config contract.
+#[allow(dead_code)]
 pub(super) static LANCE_DELETE_VIA_TOMBSTONE_ROW: LazyLock<bool> =
 	lazy_env_parse!("SURREAL_LANCE_DELETE_VIA_TOMBSTONE_ROW", bool, false);
 
@@ -65,5 +68,8 @@ pub(super) static LANCE_CREATE_KEY_INDEX_ON_OPEN: LazyLock<bool> =
 /// Very large transactions create equally large Lance fragments; the
 /// committer breaks them into chunks of this size to keep fragments
 /// well-shaped for downstream compaction.
+// The chunked-commit path is deferred to Sprint II+; the env-var surface
+// is part of the public config contract.
+#[allow(dead_code)]
 pub(super) static LANCE_COMMIT_MAX_BATCH_ROWS: LazyLock<usize> =
 	lazy_env_parse!("SURREAL_LANCE_COMMIT_MAX_BATCH_ROWS", usize, 10_000);

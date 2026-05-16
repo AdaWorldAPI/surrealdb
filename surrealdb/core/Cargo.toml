@@ -63,6 +63,12 @@ trace-doc-ops = []
 # feature only flips on the cfg-gated dispatch in idx/trees/vector.rs —
 # no extra crate pulled in.
 vector-hpc = []
+# Pulls in `lance-graph-contract` (zero-dep trait crate) from the
+# AdaWorldAPI/lance-graph workspace. This is the "agnostic build first"
+# wire — the contract types/traits are available when this feature is on,
+# but no synergies (HHTL bridge, GraphBLAS query routing, etc.) are wired
+# yet. Default off so a plain build doesn't grow.
+lance-graph = ["dep:lance-graph-contract"]
 
 # GraphQL support
 graphql = ["dep:async-graphql"]
@@ -141,6 +147,7 @@ humantime.workspace = true
 ipnet.workspace = true
 md-5.workspace = true
 ndarray.workspace = true
+lance-graph-contract = { workspace = true, optional = true }
 num_cpus.workspace = true
 num-traits.workspace = true
 object_store.workspace = true

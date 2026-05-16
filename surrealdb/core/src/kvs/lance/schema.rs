@@ -41,6 +41,10 @@ use crate::kvs::{Key, Val};
 /// Logical handle for the SurrealDB-on-Lance KV schema.
 pub struct KvSchema;
 
+// These methods build the Arrow schema and record batches used by the commit
+// path (Sprint II+) and the tombstone-row strategy.  The call sites live in
+// Transaction::commit which is not yet wired; suppress dead_code until then.
+#[allow(dead_code)]
 impl KvSchema {
 	/// Build the Arrow schema for the SurrealDB KV layer on Lance.
 	pub fn arrow_schema() -> Schema {
@@ -77,7 +81,7 @@ impl KvSchema {
 			.map(|(_, v)| Some(v.as_slice()))
 			.collect();
 		let version_array: UInt64Array =
-			std::iter::repeat(version).take(writes.len()).collect();
+			std::iter::repeat_n(version, writes.len()).collect();
 		let tombstone_array = BooleanArray::from(vec![false; writes.len()]);
 
 		RecordBatch::try_new(
@@ -108,9 +112,9 @@ impl KvSchema {
 		let key_array: BinaryArray =
 			deletes.iter().map(|k| Some(k.as_slice())).collect();
 		let val_array: BinaryArray =
-			std::iter::repeat(Some(empty_val)).take(deletes.len()).collect();
+			std::iter::repeat_n(Some(empty_val), deletes.len()).collect();
 		let version_array: UInt64Array =
-			std::iter::repeat(version).take(deletes.len()).collect();
+			std::iter::repeat_n(version, deletes.len()).collect();
 		let tombstone_array = BooleanArray::from(vec![true; deletes.len()]);
 
 		RecordBatch::try_new(

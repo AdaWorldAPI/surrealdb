@@ -89,6 +89,21 @@ pub(crate) mod types {
 #[cfg(feature = "ml")]
 pub use surrealml_core as ml;
 
+/// Re-export of the `lance-graph` contract crate (trait + type definitions
+/// only, zero runtime deps) from the AdaWorldAPI/lance-graph workspace.
+///
+/// Available when the `lance-graph` feature is enabled. Consumers can write:
+///
+/// ```ignore
+/// use surrealdb_core::lance_graph::orchestration::OrchestrationBridge;
+/// use surrealdb_core::lance_graph::plan::PlannerContract;
+/// ```
+///
+/// Implementations of these traits (HHTL cascade, blasgraph GraphBLAS, etc.)
+/// land via the synergy sprints on top of this agnostic-build wire.
+#[cfg(feature = "lance-graph")]
+pub use lance_graph_contract as lance_graph;
+
 /// Channels for receiving a SurrealQL database export
 pub mod channel {
 	pub use async_channel::{Receiver, Sender, bounded, unbounded};

@@ -58,10 +58,14 @@ impl PendingBuffer {
 	}
 
 	/// Number of pending entries.
+	// Useful introspection helpers for logging and future commit-path
+	// optimisations; not yet consumed by any caller (Sprint I deferred).
+	#[allow(dead_code)]
 	pub fn len(&self) -> usize {
 		self.entries.len()
 	}
 
+	#[allow(dead_code)]
 	pub fn is_empty(&self) -> bool {
 		self.entries.is_empty()
 	}
