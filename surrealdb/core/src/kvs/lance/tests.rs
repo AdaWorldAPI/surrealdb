@@ -1029,3 +1029,94 @@ async fn test_property_matches_hashmap_reference() {
 
     ds.shutdown().await.expect("shutdown");
 }
+
+// ============================================================================
+//  ScanLimit::Bytes accounting tests (Sprint T)
+// ============================================================================
+
+/// ScanLimit::Bytes returns at least the requested byte budget, then stops.
+/// Semantics: include the first entry that pushes the cumulative key+val byte
+/// total over the target. So a small budget still yields ≥ 1 row when data
+/// exists.
+#[tokio::test]
+async fn test_scan_limit_bytes_stops_at_budget() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+    seed_a_to_e(&ds).await;
+
+    let tx = ds.transaction(false, false).await.expect("tx");
+    // Each (key, val) = 1 + 1 = 2 bytes here. Budget = 5 → 3 entries
+    // (cumulative 2 → 4 → 6 ≥ 5; stop).
+    let result = tx.scan(
+        b"a".to_vec()..b"z".to_vec(),
+        ScanLimit::Bytes(5),
+        0,
+        None,
+    ).await.expect("scan");
+    assert_eq!(result.len(), 3,
+        "Bytes(5) over 2-byte rows should yield 3, got {}", result.len());
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// ScanLimit::Bytes with a very large budget returns everything.
+#[tokio::test]
+async fn test_scan_limit_bytes_large_budget_returns_all() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+    seed_a_to_e(&ds).await;
+
+    let tx = ds.transaction(false, false).await.expect("tx");
+    let result = tx.scan(
+        b"a".to_vec()..b"z".to_vec(),
+        ScanLimit::Bytes(1_000_000),
+        0,
+        None,
+    ).await.expect("scan");
+    assert_eq!(result.len(), 5, "large budget should yield all 5 seeded keys");
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// ScanLimit::BytesOrCount stops on whichever limit hits first — count first.
+#[tokio::test]
+async fn test_scan_limit_bytes_or_count_count_wins() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+    seed_a_to_e(&ds).await;
+
+    let tx = ds.transaction(false, false).await.expect("tx");
+    // Bytes=1_000_000 (large) + Count=2 → count wins.
+    let result = tx.scan(
+        b"a".to_vec()..b"z".to_vec(),
+        ScanLimit::BytesOrCount(1_000_000, 2),
+        0,
+        None,
+    ).await.expect("scan");
+    assert_eq!(result.len(), 2,
+        "BytesOrCount(huge, 2) should be capped at count=2, got {}", result.len());
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// ScanLimit::BytesOrCount — bytes side wins.
+#[tokio::test]
+async fn test_scan_limit_bytes_or_count_bytes_wins() {
+    let path = unique_tmp_path();
+    let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
+    seed_a_to_e(&ds).await;
+
+    let tx = ds.transaction(false, false).await.expect("tx");
+    // Bytes=3 + Count=100 → bytes wins after ≥ 2 entries
+    // (cumulative 2 → 4 ≥ 3; stop). Result: 2.
+    let result = tx.scan(
+        b"a".to_vec()..b"z".to_vec(),
+        ScanLimit::BytesOrCount(3, 100),
+        0,
+        None,
+    ).await.expect("scan");
+    assert_eq!(result.len(), 2,
+        "BytesOrCount(3, 100) should hit bytes after 2 rows, got {}", result.len());
+    tx.cancel().await.expect("cancel");
+    ds.shutdown().await.expect("shutdown");
+}

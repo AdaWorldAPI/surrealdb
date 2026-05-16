@@ -879,16 +879,50 @@ impl Transaction {
 			}
 
 			// ── (3) Apply skip + limit ─────────────────────────────────────────
-			// ScanLimit::Bytes: we count entries, not bytes (POC fallback).
-			// Byte-size accounting is deferred to a future sprint.
+			// Three limit kinds (see crate::kvs::api::ScanLimit):
+			//   Count(n)             — stop after n entries
+			//   Bytes(b)             — stop after key.len()+val.len() ≥ b
+			//   BytesOrCount(b, n)   — stop on whichever hits first
+			//
+			// Per-entry byte cost is key.len() + val.len() (matching the wire-
+			// layer accounting used by other backends). The Bytes variant uses
+			// "at least n bytes" semantics: we include the first entry that
+            // crosses the threshold (so a tiny limit still yields ≥1 row when
+			// data exists).
 			let skip_n = skip as usize;
-			let take_n = match limit {
-				ScanLimit::Count(n) => n as usize,
-				ScanLimit::Bytes(_) => 10_000, // POC: unbounded-bytes → generous cap
-				ScanLimit::BytesOrCount(_, n) => n as usize,
+			let post_skip = combined.into_iter().skip(skip_n);
+			let result: Vec<(Key, Val)> = match limit {
+				ScanLimit::Count(n) => post_skip.take(n as usize).collect(),
+				ScanLimit::Bytes(b_target) => {
+					let b_target = b_target as usize;
+					let mut acc = 0usize;
+					let mut out = Vec::new();
+					for (k, v) in post_skip {
+						let cost = k.len() + v.len();
+						out.push((k, v));
+						acc += cost;
+						if acc >= b_target {
+							break;
+						}
+					}
+					out
+				}
+				ScanLimit::BytesOrCount(b_target, n) => {
+					let b_target = b_target as usize;
+					let n = n as usize;
+					let mut acc = 0usize;
+					let mut out = Vec::new();
+					for (k, v) in post_skip {
+						let cost = k.len() + v.len();
+						out.push((k, v));
+						acc += cost;
+						if out.len() >= n || acc >= b_target {
+							break;
+						}
+					}
+					out
+				}
 			};
-			let result: Vec<(Key, Val)> =
-				combined.into_iter().skip(skip_n).take(take_n).collect();
 			Ok(result)
 		}
 	}
