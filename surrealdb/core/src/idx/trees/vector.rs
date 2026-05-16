@@ -232,6 +232,7 @@ impl Vector {
 		}
 	}
 
+	#[cfg(not(feature = "vector-hpc"))]
 	#[inline]
 	fn cosine_distance_f64(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
 		let dot_product = a.dot(b);
@@ -240,12 +241,72 @@ impl Vector {
 		1.0 - dot_product / (norm_a * norm_b)
 	}
 
+	#[cfg(feature = "vector-hpc")]
+	#[inline]
+	fn cosine_distance_f64(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+		// SIMD dispatch lineage:
+		//   ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd  (thin kernel)
+		//   └── built on ndarray_hpc::simd::F64x8  (8-lane polyfill type)
+		//       └── dispatches via static LazyLock<Tier> at simd.rs:92,
+		//           which runs CPU feature detection ONCE at startup.
+		//           Subsequent calls are hardware-agnostic: the same Rust
+		//           surface compiles for AVX-512, AVX2, NEON, or scalar
+		//           fallback, dispatched through the cached Tier.
+		//
+		// SAFETY: as_slice returns Some when storage is contiguous, which is
+		// the case for vectors constructed via Array1::from_vec (SurrealDB's
+		// standard path). For non-contiguous views (rare in this codebase),
+		// fall back to a one-shot to_vec().
+		match (a.as_slice(), b.as_slice()) {
+			(Some(a_s), Some(b_s)) => {
+				// Fast path — contiguous storage, zero-copy.
+				let similarity =
+					ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd(a_s, b_s);
+				1.0 - similarity
+			}
+			_ => {
+				// Fallback — non-contiguous; clone-to-owned first.
+				let a_v: Vec<f64> = a.iter().copied().collect();
+				let b_v: Vec<f64> = b.iter().copied().collect();
+				let similarity =
+					ndarray_hpc::hpc::heel_f64x8::cosine_f64_simd(&a_v, &b_v);
+				1.0 - similarity
+			}
+		}
+	}
+
+	#[cfg(not(feature = "vector-hpc"))]
 	#[inline]
 	fn cosine_distance_f32(a: &Array1<f32>, b: &Array1<f32>) -> f64 {
 		let dot_product = a.dot(b) as f64;
 		let norm_a = ((a * a).sum() as f64).sqrt();
 		let norm_b = ((b * b).sum() as f64).sqrt();
 		1.0 - dot_product / (norm_a * norm_b)
+	}
+
+	#[cfg(feature = "vector-hpc")]
+	#[inline]
+	fn cosine_distance_f32(a: &Array1<f32>, b: &Array1<f32>) -> f64 {
+		// SAFETY: as_slice returns Some when storage is contiguous, which is
+		// the case for vectors constructed via Array1::from_vec (SurrealDB's
+		// standard path). For non-contiguous views (rare in this codebase),
+		// fall back to a one-shot to_vec().
+		match (a.as_slice(), b.as_slice()) {
+			(Some(a_s), Some(b_s)) => {
+				// Fast path — contiguous storage, zero-copy.
+				let similarity =
+					ndarray_hpc::hpc::heel_f64x8::cosine_f32_to_f64_simd(a_s, b_s);
+				1.0 - similarity
+			}
+			_ => {
+				// Fallback — non-contiguous; clone-to-owned first.
+				let a_v: Vec<f32> = a.iter().copied().collect();
+				let b_v: Vec<f32> = b.iter().copied().collect();
+				let similarity =
+					ndarray_hpc::hpc::heel_f64x8::cosine_f32_to_f64_simd(&a_v, &b_v);
+				1.0 - similarity
+			}
+		}
 	}
 
 	#[inline]
@@ -769,5 +830,50 @@ mod tests {
 	fn test_distance_pearson() {
 		test_distance_collection(Distance::Pearson, 100, 1536);
 		test_distance(Distance::Pearson, &[1.0, 2.0, 3.0], &[2.0, 3.0, 4.0], 1.0);
+	}
+}
+
+#[cfg(all(test, feature = "vector-hpc"))]
+mod hpc_tests {
+	use ndarray::Array1;
+	use super::*;
+
+	/// SIMD cosine must agree with the scalar fallback to within fp tolerance,
+	/// across the dim sizes that matter (1, 128, 384, 768, 1024).
+	#[test]
+	fn test_cosine_hpc_matches_scalar() {
+		// We can't easily call the scalar version from inside the feature-gated
+		// module, so we compute scalar inline.
+		fn scalar_cosine(a: &[f64], b: &[f64]) -> f64 {
+			let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+			let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+			let nb: f64 = b.iter().map(|y| y * y).sum::<f64>().sqrt();
+			1.0 - dot / (na * nb)
+		}
+
+		let mut state: u64 = 0xC0FFEE;
+		fn lcg(s: &mut u64) -> f64 {
+			*s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+			((*s >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
+		}
+
+		for &dim in &[1usize, 128, 384, 768, 1024] {
+			let a_v: Vec<f64> = (0..dim).map(|_| lcg(&mut state)).collect();
+			let b_v: Vec<f64> = (0..dim).map(|_| lcg(&mut state)).collect();
+			let a = Array1::from_vec(a_v.clone());
+			let b = Array1::from_vec(b_v.clone());
+
+			let simd = cosine_distance_f64(&a, &b);
+			let scalar = scalar_cosine(&a_v, &b_v);
+
+			assert!(
+				(simd - scalar).abs() < 1e-9,
+				"dim {}: simd={}, scalar={}, diff={}",
+				dim,
+				simd,
+				scalar,
+				(simd - scalar).abs(),
+			);
+		}
 	}
 }
