@@ -1,6 +1,16 @@
 [build]
 rustflags = ["--cfg", "tokio_unstable"]
 
+# Enable AVX-512 baseline on x86_64 Linux (matches ndarray-hpc's
+# `.cargo/config.toml` convention) so the vector-hpc SIMD path can use
+# AVX-512 native intrinsics via the F64x8 polyfill's LazyLock<Tier>
+# cache. The polyfill still degrades gracefully on pre-v4 hardware via
+# the AVX2 / scalar tiers; this just lets a v4 build inline the best
+# code path. Override locally for older targets via:
+#   RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v4"]
+
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
 
