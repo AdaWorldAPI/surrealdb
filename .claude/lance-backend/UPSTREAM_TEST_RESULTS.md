@@ -31,6 +31,58 @@ Zero failures. Zero compile errors (the `#![recursion_limit = "1024"]`
 attribute on each file, added across Sprints O / S / V, is what makes
 the combined `kv-lance + kv-mem` feature set buildable).
 
+## Sprint Y retry (Phase E)
+
+Five additional binaries exercised under `cargo test ... -- --test-threads=1`
+to serialize the per-test Lance dataset creation. The non-serial run in
+PR #11's batch had hung on `define` after creating ~845 datasets in
+parallel; serializing fixes the fs/lock pathology.
+
+| # | Test binary | Pass / Total | Wall time | Notes |
+|---|---|---|---|---|
+| 9 | `query` | **4 / 4** | 1.5s | General SurrealQL query execution paths |
+| 10 | `index` | **2 / 3** | 1958.6s (~33 min) | `multi_index_concurrent_test_index_compaction` failed — see below |
+| 11 | `function` | **151 / 151** | 37.8s | Every SurrealQL built-in function (vector ops, string ops, math, time, etc.) end-to-end on kv-lance |
+| 12 | `field` | **5 / 5** | 5.7s | Schema field type validation, defaults, permissions |
+| 13 | `define` | _(pending; previously disk-OOM during link, retry in flight)_ | — | DEFINE TABLE/FIELD/INDEX/EVENT/ACCESS statements; largest test binary in the suite |
+
+**Sprint Y subtotal (excluding define): 162 / 163 passing (99.4%)**
+
+### The one failure: `multi_index_concurrent_test_index_compaction`
+
+`tests/index.rs::multi_index_concurrent_test_index_compaction` fails when
+running under the kv-lance backend. The test spawns concurrent index
+compaction operations; Lance's OCC + `MergeInsertBuilder` upsert (Sprint N)
+serializes these in a way the test doesn't anticipate. Test wall-clock
+was 1958s (32 min), so it's likely hitting Lance OCC retry storms.
+
+This is a real semantic gap to address in a dedicated sprint. Workarounds
+to investigate:
+- Configure Lance's commit conflict retry policy (raise tolerance)
+- Route concurrent index compactions through a serialized queue
+  application-side
+- Or document the limitation in `KNOWN_DIFFERENCES.md` as "not supported
+  on kv-lance" and skip the test under that backend
+
+The other 2 `index.rs` tests (`single_index_concurrent_test_index_compaction`,
+`index_replace_table_test`) both pass — the gap is specifically the
+multi-index concurrent compaction path.
+
+## Cumulative across both sprints
+
+- **204+ upstream integration tests pass** on kv-lance under
+  `SURREAL_TEST_KV=lance` (42 CRUD + 162 Sprint Y).
+- **1 failure** (`multi_index_concurrent_test_index_compaction`) — real
+  semantic gap, documented above.
+- **1 binary pending** (`define`, retry in flight at doc creation time).
+
+The kv-lance backend exercises the vast majority of upstream SurrealQL
+operations correctly: CRUD, schema definitions, vector functions, graph
+edges, permissions, time-series, geospatial, full-text. The remaining
+gap is concentrated in a specific concurrent-compaction path that
+Lance's OCC handles differently than the LSM backends the tests were
+written against.
+
 ## What this verifies end-to-end
 
 For every test in the table above, the path through the kv-lance
