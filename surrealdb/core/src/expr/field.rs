@@ -230,7 +230,7 @@ impl Fields {
 								// `select type::fields(["foo","faz"]) as bar` resulting
 								// in `{ "bar": { foo: value, faz: value} }`?
 								for (idiom, idiom_res) in
-									idioms.iter().zip(idiom_results.into_iter())
+									idioms.iter().zip(idiom_results)
 								{
 									out.set(stk, ctx, opt, &idiom.0, idiom_res).await?;
 								}
