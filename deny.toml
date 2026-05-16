@@ -40,6 +40,14 @@ unknown-registry = "deny"
 # if not specified. If it is specified but empty, no registries are allowed.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
+# Allowed git sources. Per the maintainer policy, "ndarray is NEVER crates.io
+# — always our fork at AdaWorldAPI". The fork brings the hpc/* and simd/*
+# modules used by the `vector-hpc` feature; its workspace also publishes
+# the transitive `p64` and `fractal` crates we consume. Allow the whole
+# AdaWorldAPI GitHub org so future ecosystem crates (lance-graph etc.)
+# don't have to be added one by one.
+allow-org = { github = ["AdaWorldAPI"] }
+
 # --------------------------------------------------
 # ADVISORIES
 # --------------------------------------------------
@@ -62,16 +70,22 @@ yanked = "warn"
 #   see https://github.com/RustCrypto/RSA/issues/19#issuecomment-1822995643 for more information
 # - for RUSTSEC-2024-0436, paste is now unmaintained and archived, but we only use paste in tests
 #   so we could wait for ${concat(...)} metavariable expressions (issue #124225) to stabilize
-# - for RUSTSEC-2026-0097, rand ThreadRng unsoundness under a narrow combination (custom log
-#   handler calling thread_rng while reseeding). Transitive rand 0.7/0.8 remain via surrealdb-tikv-client
-#   (fail, direct rand dep) and other crates on rand 0.8 until those dependencies move to rand
-#   >=0.9.3 or >=0.10.1. The lockfile uses rand 0.9.3 where the 0.9 series is selected.
-# - for RUSTSEC-2026-0098 and RUSTSEC-2026-0099, rustls-webpki 0.101.7 has name-constraint
-#   handling bugs (URI names accepted, wildcard DNS names accepted under subtree constraints).
-#   The fix requires >=0.103.12, but rustls-webpki 0.101.x is pinned transitively via
-#   surrealdb-tikv-client -> tonic 0.10.2 -> rustls 0.21.12. Remove once surrealdb-tikv-client
-#   moves to a tonic version that uses rustls 0.23+ (rustls-webpki >=0.103.12).
-ignore = ["RUSTSEC-2025-0134", "RUSTSEC-2025-0141", "RUSTSEC-2023-0071", "RUSTSEC-2024-0436", "RUSTSEC-2026-0097", "RUSTSEC-2026-0098", "RUSTSEC-2026-0099"]
+# - for RUSTSEC-2026-0098, RUSTSEC-2026-0099, and RUSTSEC-2026-0104,
+#   rustls-webpki 0.101.7 has three pending fixes (name-constraint handling
+#   bugs for URI names and wildcard DNS names; a reachable panic when parsing
+#   syntactically-valid empty BIT STRING in `onlySomeReasons` of an
+#   IssuingDistributionPoint CRL extension). All three require
+#   rustls-webpki >=0.103.12 (or >=0.103.13 for the latest), but
+#   rustls-webpki 0.101.x is pinned transitively via
+#   surrealdb-tikv-client -> tonic 0.10.2 -> rustls 0.21.12. Remove all three
+#   once surrealdb-tikv-client moves to a tonic version that uses rustls 0.23+
+#   (rustls-webpki >=0.103.13).
+#
+# Removed 2026-05-16: RUSTSEC-2026-0097 — was in the ignore list but no crate
+# in the current lockfile matches the advisory criteria (deny check reported
+# `advisory-not-detected`). The lockfile uses rand 0.9.3 / 0.8.5; the narrow
+# `ThreadRng` reseeding unsoundness path doesn't apply.
+ignore = ["RUSTSEC-2025-0134", "RUSTSEC-2025-0141", "RUSTSEC-2023-0071", "RUSTSEC-2024-0436", "RUSTSEC-2026-0098", "RUSTSEC-2026-0099", "RUSTSEC-2026-0104"]
 
 # --------------------------------------------------
 # LICENSES
