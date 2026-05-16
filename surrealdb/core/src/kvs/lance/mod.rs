@@ -63,8 +63,11 @@
 mod background_optimizer;
 mod cnf;
 mod commit_gate;
+mod flusher;
+mod memtable;
 mod schema;
 mod tx_buffer;
+mod wal;
 
 use std::ops::Range;
 use std::sync::Arc;
