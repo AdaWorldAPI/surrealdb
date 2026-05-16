@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used)]
+#![recursion_limit = "1024"]
 
 mod helpers;
 use anyhow::Result;
