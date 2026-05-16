@@ -8,7 +8,6 @@ use ahash::{AHasher, HashSet};
 use anyhow::{Result, ensure};
 use blake3::Hasher as Blake3Hasher;
 use ndarray::{Array1, LinalgScalar, Zip};
-use ndarray_stats::DeviationExt;
 use num_traits::Zero;
 use revision::{DeserializeRevisioned, SerializeRevisioned, revisioned};
 use rust_decimal::prelude::FromPrimitive;
@@ -218,16 +217,10 @@ impl Vector {
 	#[cfg(not(feature = "vector-hpc"))]
 	fn chebyshev_distance(&self, other: &Self) -> f64 {
 		match (self, other) {
-			(Self::F64(a), Self::F64(b)) => a.linf_dist(b).unwrap_or(f64::INFINITY),
-			(Self::F32(a), Self::F32(b)) => {
-				a.linf_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY)
-			}
-			(Self::I64(a), Self::I64(b)) => {
-				a.linf_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY)
-			}
-			(Self::I32(a), Self::I32(b)) => {
-				a.linf_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY)
-			}
+			(Self::F64(a), Self::F64(b)) => Self::inline_linf_dist(a, b),
+			(Self::F32(a), Self::F32(b)) => Self::inline_linf_dist(a, b),
+			(Self::I64(a), Self::I64(b)) => Self::inline_linf_dist(a, b),
+			(Self::I32(a), Self::I32(b)) => Self::inline_linf_dist(a, b),
 			(Self::I16(a), Self::I16(b)) => Self::chebyshev(a, b),
 			_ => f64::NAN,
 		}
@@ -250,12 +243,8 @@ impl Vector {
 				let b_v: Vec<f64> = b.iter().map(|&x| x as f64).collect();
 				Self::chebyshev_distance_f64_simd(&a_v, &b_v)
 			}
-			(Self::I64(a), Self::I64(b)) => {
-				a.linf_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY)
-			}
-			(Self::I32(a), Self::I32(b)) => {
-				a.linf_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY)
-			}
+			(Self::I64(a), Self::I64(b)) => Self::inline_linf_dist(a, b),
+			(Self::I32(a), Self::I32(b)) => Self::inline_linf_dist(a, b),
 			(Self::I16(a), Self::I16(b)) => Self::chebyshev(a, b),
 			_ => f64::NAN,
 		}
@@ -347,6 +336,59 @@ impl Vector {
 		let norm_a = a.mapv(|x| x.to_float() * x.to_float()).sum().sqrt();
 		let norm_b = b.mapv(|x| x.to_float() * x.to_float()).sum().sqrt();
 		1.0 - dot_product / (norm_a * norm_b)
+	}
+
+	/// Inline L1 (Manhattan) distance over a typed Array1 pair. Replaces
+	/// the `ndarray_stats::DeviationExt::l1_dist` we used to call so we
+	/// can keep the AdaWorldAPI ndarray fork without dragging
+	/// `ndarray-stats` (which is impl'd against crates.io's ndarray and
+	/// produced a diamond-dep). Both inputs must have matching length;
+	/// returns f64::INFINITY on mismatch (matches the prior
+	/// `.unwrap_or(f64::INFINITY)` pattern).
+	#[inline]
+	fn inline_l1_dist<T>(a: &Array1<T>, b: &Array1<T>) -> f64
+	where
+		T: ToFloat + Copy,
+	{
+		if a.len() != b.len() {
+			return f64::INFINITY;
+		}
+		Zip::from(a).and(b).fold(0.0_f64, |acc, x, y| {
+			acc + (x.to_float() - y.to_float()).abs()
+		})
+	}
+
+	/// Inline L2 (Euclidean) distance. See `inline_l1_dist` for rationale.
+	#[inline]
+	fn inline_l2_dist<T>(a: &Array1<T>, b: &Array1<T>) -> f64
+	where
+		T: ToFloat + Copy,
+	{
+		if a.len() != b.len() {
+			return f64::INFINITY;
+		}
+		Zip::from(a)
+			.and(b)
+			.fold(0.0_f64, |acc, x, y| {
+				let d = x.to_float() - y.to_float();
+				acc + d * d
+			})
+			.sqrt()
+	}
+
+	/// Inline L∞ (Chebyshev) distance.
+	#[inline]
+	fn inline_linf_dist<T>(a: &Array1<T>, b: &Array1<T>) -> f64
+	where
+		T: ToFloat + Copy,
+	{
+		if a.len() != b.len() {
+			return f64::INFINITY;
+		}
+		Zip::from(a).and(b).fold(0.0_f64, |acc, x, y| {
+			let d = (x.to_float() - y.to_float()).abs();
+			if d > acc { d } else { acc }
+		})
 	}
 
 	fn cosine_distance(&self, other: &Self) -> f64 {
@@ -481,10 +523,10 @@ impl Vector {
 	#[inline]
 	fn euclidean_distance(&self, other: &Self) -> f64 {
 		match (self, other) {
-			(Self::F64(a), Self::F64(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
-			(Self::F32(a), Self::F32(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
-			(Self::I64(a), Self::I64(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
-			(Self::I32(a), Self::I32(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
+			(Self::F64(a), Self::F64(b)) => Self::inline_l2_dist(a, b),
+			(Self::F32(a), Self::F32(b)) => Self::inline_l2_dist(a, b),
+			(Self::I64(a), Self::I64(b)) => Self::inline_l2_dist(a, b),
+			(Self::I32(a), Self::I32(b)) => Self::inline_l2_dist(a, b),
 			(Self::I16(a), Self::I16(b)) => Self::euclidean(a, b),
 			_ => f64::INFINITY,
 		}
@@ -508,8 +550,8 @@ impl Vector {
 				let b_v: Vec<f64> = b.iter().map(|&x| x as f64).collect();
 				Self::euclidean_distance_f64_simd(&a_v, &b_v)
 			}
-			(Self::I64(a), Self::I64(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
-			(Self::I32(a), Self::I32(b)) => a.l2_dist(b).unwrap_or(f64::INFINITY),
+			(Self::I64(a), Self::I64(b)) => Self::inline_l2_dist(a, b),
+			(Self::I32(a), Self::I32(b)) => Self::inline_l2_dist(a, b),
 			(Self::I16(a), Self::I16(b)) => Self::euclidean(a, b),
 			_ => f64::INFINITY,
 		}
@@ -604,10 +646,10 @@ impl Vector {
 	#[cfg(not(feature = "vector-hpc"))]
 	pub(super) fn manhattan_distance(&self, other: &Self) -> f64 {
 		match (self, other) {
-			(Self::F64(a), Self::F64(b)) => a.l1_dist(b).unwrap_or(f64::INFINITY),
-			(Self::F32(a), Self::F32(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
-			(Self::I64(a), Self::I64(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
-			(Self::I32(a), Self::I32(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
+			(Self::F64(a), Self::F64(b)) => Self::inline_l1_dist(a, b),
+			(Self::F32(a), Self::F32(b)) => Self::inline_l1_dist(a, b),
+			(Self::I64(a), Self::I64(b)) => Self::inline_l1_dist(a, b),
+			(Self::I32(a), Self::I32(b)) => Self::inline_l1_dist(a, b),
 			(Self::I16(a), Self::I16(b)) => Self::manhattan(a, b),
 			_ => f64::NAN,
 		}
@@ -630,8 +672,8 @@ impl Vector {
 				let b_v: Vec<f64> = b.iter().map(|&x| x as f64).collect();
 				Self::manhattan_distance_f64_simd(&a_v, &b_v)
 			}
-			(Self::I64(a), Self::I64(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
-			(Self::I32(a), Self::I32(b)) => a.l1_dist(b).map(|r| r as f64).unwrap_or(f64::INFINITY),
+			(Self::I64(a), Self::I64(b)) => Self::inline_l1_dist(a, b),
+			(Self::I32(a), Self::I32(b)) => Self::inline_l1_dist(a, b),
 			(Self::I16(a), Self::I16(b)) => Self::manhattan(a, b),
 			_ => f64::NAN,
 		}
