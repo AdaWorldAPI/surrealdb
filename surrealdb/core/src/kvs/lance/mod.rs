@@ -90,7 +90,7 @@ use wal::{Wal, WalOp, WalRecord};
 
 use super::Direction;
 use super::api::ScanLimit;
-use super::config::LanceConfig;
+use super::config::{LanceConfig, WritePath};
 use super::err::{Error, Result};
 use crate::kvs::api::Transactable;
 use crate::kvs::{Key, Val};
@@ -126,13 +126,21 @@ pub struct Datastore {
 	/// Set to `None` when running in test mode or when the user opts out.
 	background_optimizer: Option<Arc<BackgroundOptimizer>>,
 
-	/// Legacy commit coordinator. Retained for the rare bypass path
-	/// (e.g. forced synchronous Lance commits in tests) but the
-	/// production write path now goes WAL → memtable → background
-	/// flusher, NOT through this gate. Will be removed in a follow-up
-	/// once the LSM path has stabilised.
-	#[allow(dead_code)]
-	commit_gate: Arc<CommitGate>,
+	/// Which write-path `Transaction::commit` takes. Captured at
+	/// `Datastore::new` time from [`LanceConfig::write_path`] and
+	/// then propagated into each new `Transaction`. The two paths
+	/// own disjoint subsets of the per-Datastore state below
+	/// (`wal`/`memtable`/`flusher` are LSM-only; `commit_gate` is
+	/// LegacyCommitGate-only).
+	write_path: WritePath,
+
+	/// CommitGate coordinator. `Some` only when
+	/// `write_path == WritePath::LegacyCommitGate`; otherwise the
+	/// gate is not spawned and the field stays `None`. Tests that
+	/// want to exercise the gate against an LSM-default Datastore
+	/// can spawn one directly via [`CommitGate::spawn`] +
+	/// [`Datastore::dataset_for_tests`].
+	commit_gate: Option<Arc<CommitGate>>,
 
 	/// Write-ahead log for the LSM-style fast-commit path. Writers
 	/// append a [`WalRecord`] here (fsynced) before inserting into
@@ -264,10 +272,15 @@ impl Datastore {
 			None
 		};
 
-		// Spawn the commit coordinator. Shares the same `dataset_arc` so
-		// every batched commit lands on the same dataset that every other
-		// path (background optimizer, in-flight reads) sees.
-		let commit_gate = CommitGate::spawn(Arc::clone(&dataset_arc));
+		// Spawn the CommitGate coordinator only when the LegacyCommitGate
+		// write-path is selected. The LSM path doesn't use it; spawning
+		// would be wasted overhead (an idle tokio task waiting on a
+		// submission channel that never receives anything).
+		let commit_gate = if config.write_path == WritePath::LegacyCommitGate {
+			Some(CommitGate::spawn(Arc::clone(&dataset_arc)))
+		} else {
+			None
+		};
 
 		// Open the LSM write-ahead log and replay any uncommitted
 		// entries from a prior crash. The WAL lives inside the Lance
@@ -315,16 +328,21 @@ impl Datastore {
 		}
 
 		// Spawn the background memtable→Lance flusher. One per
-		// Datastore. The flusher will pick up the replayed entries
-		// on its first tick and roll them into Lance, then truncate
+		// Datastore. The flusher picks up the replayed entries on
+		// its first tick and rolls them into Lance, then truncates
 		// the WAL.
 		//
-		// `disable_background_flusher` keeps the flusher out of the
-		// picture entirely — WAL stays the sole durability source
-		// until `shutdown` drains explicitly. Used by the
-		// crash-recovery tests so the simulated kill cannot race
-		// with a mid-flush Lance manifest rewrite.
-		let flusher = if config.disable_background_flusher {
+		// Three conditions skip the spawn:
+		// - `write_path == LegacyCommitGate`: the gate path does its
+		//   own synchronous Lance commits, so the memtable never
+		//   accumulates entries that need flushing.
+		// - `disable_background_flusher` (LSM-only test knob): the
+		//   recovery tests use this so the WAL is the SOLE durability
+		//   source and a `Box::leak` simulated kill cannot race a
+		//   mid-flush Lance manifest rewrite.
+		let flusher = if config.write_path == WritePath::LegacyCommitGate
+			|| config.disable_background_flusher
+		{
 			None
 		} else {
 			Some(Flusher::spawn(
@@ -339,6 +357,7 @@ impl Datastore {
 			dataset: dataset_arc,
 			versioned: config.versioned,
 			background_optimizer,
+			write_path: config.write_path,
 			commit_gate,
 			wal,
 			memtable,
@@ -365,7 +384,8 @@ impl Datastore {
 			read_version,
 			dataset: Arc::clone(&self.dataset),
 			background_optimizer: self.background_optimizer.clone(),
-			commit_gate: Arc::clone(&self.commit_gate),
+			write_path: self.write_path,
+			commit_gate: self.commit_gate.clone(),
 			wal: Arc::clone(&self.wal),
 			memtable: Arc::clone(&self.memtable),
 			flusher: self.flusher.clone(),
@@ -402,9 +422,11 @@ impl Datastore {
 		if let Some(flusher) = &self.flusher {
 			flusher.shutdown().await;
 		}
-		// The commit gate is now an unused legacy path, but call its
-		// shutdown for symmetry until it is removed in a follow-up.
-		self.commit_gate.shutdown().await;
+		// If the LegacyCommitGate write-path was selected, drain its
+		// coordinator. `None` on the default LSM path — nothing to do.
+		if let Some(gate) = &self.commit_gate {
+			gate.shutdown().await;
+		}
 		if let Some(opt) = &self.background_optimizer {
 			opt.shutdown().await;
 		}
@@ -459,12 +481,14 @@ pub struct Transaction {
 	/// configured write-count threshold is reached.
 	background_optimizer: Option<Arc<BackgroundOptimizer>>,
 
-	/// Legacy commit gate handle. Retained on the Transaction so the
-	/// rare "force synchronous Lance commit" path remains reachable
-	/// in case the LSM path is opted out of in tests. Production
-	/// commit uses [`Self::wal`] + [`Self::memtable`].
-	#[allow(dead_code)]
-	commit_gate: Arc<CommitGate>,
+	/// Which write-path this transaction uses for commit/reads.
+	/// Copied from the parent Datastore at tx start so we can
+	/// dispatch in [`Self::commit`] and the read methods.
+	write_path: WritePath,
+
+	/// CommitGate handle. `Some` when `write_path ==
+	/// WritePath::LegacyCommitGate`; `None` on the default LSM path.
+	commit_gate: Option<Arc<CommitGate>>,
 
 	/// LSM write-ahead log. `commit()` appends to this (fsynced)
 	/// before touching the memtable so an acknowledged commit is
@@ -502,20 +526,16 @@ impl Transactable for Transaction {
 	//  Lifecycle: commit / cancel
 	// ------------------------------------------------------------------------
 
-	/// Atomically flush all pending writes/deletes to the Lance dataset
-	/// through the per-Datastore commit coordinator ([`commit_gate`]).
+	/// Atomically flush all pending writes/deletes via the configured
+	/// write-path. See [`WritePath`] for the semantic differences.
 	///
-	/// The coordinator batches concurrent submissions into a single Lance
-	/// `MergeInsertBuilder` commit per epoch (BUNDLE merge semantics: last
-	/// submitter wins per key). This collapses N concurrent writers into 1
-	/// Lance commit and eliminates the OCC retry cascade that would
-	/// otherwise hit the dataset under high contention (see the upstream
-	/// `multi_index_concurrent_test_index_compaction` regression test).
-	///
-	/// For a SINGLE-writer workload the coordinator's batch window
-	/// (500 µs) is a no-op — the submitter is alone, the window expires,
-	/// and the gate issues the same `MergeInsertBuilder` + `delete` pair
-	/// that the pre-Sprint-Z inline path issued.
+	/// - `WritePath::LsmWithWal` (Sprint AA default): WAL fsync →
+	///   memtable insert → notify flusher. Returns Ok as soon as the
+	///   WAL append is durable. Lance is updated asynchronously.
+	/// - `WritePath::LegacyCommitGate`: submit to the per-Datastore
+	///   CommitGate, which batches concurrent submissions into a
+	///   single `MergeInsertBuilder` + `delete` against Lance.
+	///   Returns only after the Lance commit lands.
 	async fn commit(&self) -> Result<()> {
 		if self.closed() {
 			return Err(Error::TransactionFinished);
@@ -532,65 +552,31 @@ impl Transactable for Transaction {
 			pending.partition()
 		};
 
-		// Fast-commit path (Sprint AA, LSM-style):
-		//
-		//   1. Allocate a monotonic memtable generation.
-		//   2. Append one WAL record containing all writes+deletes,
-		//      and `fsync` before returning. This is the durability
-		//      barrier — once the WAL write returns Ok, the commit
-		//      is recoverable across crashes.
-		//   3. Insert each op into the memtable. Memtable is concurrent
-		//      (dashmap), so concurrent transactions don't serialize.
-		//   4. Mark the transaction done; notify the flusher.
-		//
-		// Lance gets the data later, via the background flusher.
 		if writes.is_empty() && deletes.is_empty() {
 			self.done.store(true, Ordering::Release);
 			return Ok(());
 		}
 
-		let generation = self.memtable.next_generation();
-
-		// Build a single WAL record for this commit.
-		let mut wal_ops = Vec::with_capacity(writes.len() + deletes.len());
-		for (k, v) in &writes {
-			wal_ops.push(WalOp::Set {
-				key: k.clone(),
-				val: v.clone(),
-			});
-		}
-		for k in &deletes {
-			wal_ops.push(WalOp::Delete {
-				key: k.clone(),
-			});
-		}
-		let record = WalRecord {
-			generation,
-			ops: wal_ops,
-		};
-		self.wal.append(&record).await?;
-
-		// WAL is durable — now apply to memtable. Order matters:
-		// readers should never see a key whose WAL append failed.
-		for (k, v) in writes {
-			self.memtable.insert(k, MemOp::Set(v), generation);
-		}
-		for k in deletes {
-			self.memtable.insert(k, MemOp::Delete, generation);
+		match self.write_path {
+			WritePath::LsmWithWal => self.commit_lsm(writes, deletes).await?,
+			WritePath::LegacyCommitGate => {
+				self.commit_legacy_gate(writes, deletes).await?
+			}
 		}
 
 		self.done.store(true, Ordering::Release);
 
-		// Wake the flusher (when one is spawned); if the memtable has
-		// grown past the threshold it drains on this nudge rather
-		// than waiting for the next tick.
+		// Wake the flusher (when one is spawned — `None` on the
+		// LegacyCommitGate path or when explicitly disabled); if the
+		// memtable has grown past the threshold it drains on this
+		// nudge rather than waiting for the next tick.
 		if let Some(flusher) = &self.flusher {
 			flusher.notify_pending();
 		}
 
-		// Notify optimizer (kept for parity with the pre-LSM path);
-		// it gauges write activity and may trigger compaction once
-		// the underlying Lance dataset has enough flushed commits.
+		// Notify the optimizer on both paths — it gauges write activity
+		// and may trigger Lance dataset compaction once enough commits
+		// have landed.
 		if let Some(opt) = &self.background_optimizer {
 			opt.notify_commit().await;
 		}
@@ -636,18 +622,19 @@ impl Transactable for Transaction {
 			});
 		}
 
-		// (2) Check the memtable. This is the LSM-style hot read path:
-		//     committed-but-not-yet-flushed writes live here, and
-		//     reading them before falling through to Lance is what
-		//     makes the post-Sprint-AA backend appear consistent
-		//     to subsequent transactions.
+		// (2) Check the memtable — but only on the LSM path.
 		//
-		//     Versioned reads (`version.is_some()`) skip the memtable
-		//     and go straight to Lance — the memtable only holds the
-		//     latest write per key, not historical versions, so a
-		//     `get(k, Some(v))` for some past `v` has no business
-		//     consulting it.
-		if version.is_none() {
+		// On `LsmWithWal`, committed-but-not-yet-flushed writes live
+		// in the memtable; reading them before falling through to
+		// Lance is what gives the post-Sprint-AA hot path its speed.
+		// On `LegacyCommitGate`, every commit goes directly to Lance,
+		// so the memtable is empty and consulting it is dead weight.
+		//
+		// Versioned reads (`version.is_some()`) skip the memtable on
+		// either path — the memtable only holds the latest write per
+		// key, not historical versions, so a `get(k, Some(v))` for a
+		// past `v` has no business consulting it.
+		if version.is_none() && self.write_path == WritePath::LsmWithWal {
 			if let Some(entry) = self.memtable.get(&key) {
 				return Ok(match entry.op {
 					MemOp::Set(v) => Some(v),
@@ -658,32 +645,37 @@ impl Transactable for Transaction {
 
 		// (3) Fall through to Lance scan.
 		//
-		// `version.is_some()` — explicit "read at version V" — uses
-		// `checkout_version` so the historical snapshot semantics
-		// hold.
+		// Snapshot selection depends on the write-path:
 		//
-		// `version.is_none()` — the common case — reads the LATEST
-		// Lance dataset state, NOT the manifest version frozen at
-		// `Transaction::new`. This is the LSM relaxation discussed in
-		// the Sprint AA design notes: the flusher migrates rows from
-		// the memtable into Lance asynchronously, so a tx's
-		// `read_version` snapshot may be stale by the time the
-		// reader actually runs. Pinning to a stale manifest would
-		// hide rows the flusher has just published, while
-		// `memtable.get` returns `None` for the same key (it was
-		// drained). Reading Lance @ latest keeps the
+		// - `LsmWithWal`, `version.is_none()` → read Lance @ LATEST.
+		//   The Sprint AA relaxation: the flusher migrates rows from
+		//   the memtable into Lance asynchronously, so a tx's
+		//   `read_version` snapshot may be stale by the time the
+		//   reader actually runs. Pinning to a stale manifest would
+		//   hide rows the flusher has just published. Reading Lance
+		//   @ latest keeps `memtable[now] ∪ lance[latest]` internally
+		//   consistent.
 		//
-		//   memtable[now]  ∪  lance[latest]
+		// - `LegacyCommitGate`, `version.is_none()` → read Lance @
+		//   `read_version` for strict snapshot iso. The gate path
+		//   never writes to Lance outside of its own commits, so the
+		//   manifest at `read_version` is the correct snapshot.
 		//
-		// view internally consistent — the same key cannot vanish
-		// across the flusher hand-off.
+		// - `version.is_some()` → use `checkout_version` on either
+		//   path. Caller asked for a specific historical version.
 		let ds = self.dataset.read().await;
-		let snapshot = match version {
-			Some(v) => match ds.inner.checkout_version(v).await {
+		let snapshot = match (self.write_path, version) {
+			(_, Some(v)) => match ds.inner.checkout_version(v).await {
 				Ok(s) => s,
 				Err(_) => return Ok(None),
 			},
-			None => ds.inner.clone(),
+			(WritePath::LsmWithWal, None) => ds.inner.clone(),
+			(WritePath::LegacyCommitGate, None) => {
+				match ds.inner.checkout_version(self.read_version).await {
+					Ok(s) => s,
+					Err(_) => return Ok(None),
+				}
+			}
 		};
 
 		let filter = KvSchema::build_get_predicate(&key);
@@ -916,6 +908,69 @@ impl Transactable for Transaction {
 // ============================================================================
 
 impl Transaction {
+	// ─── Sprint BB: write-path dispatch helpers ──────────────────────────
+
+	/// LSM-style fast commit: append one WAL record (fsync), insert
+	/// every op into the memtable, return. Lance is updated later by
+	/// the background flusher.
+	async fn commit_lsm(
+		&self,
+		writes: Vec<(Key, Val)>,
+		deletes: Vec<Key>,
+	) -> Result<()> {
+		let generation = self.memtable.next_generation();
+
+		let mut wal_ops = Vec::with_capacity(writes.len() + deletes.len());
+		for (k, v) in &writes {
+			wal_ops.push(WalOp::Set {
+				key: k.clone(),
+				val: v.clone(),
+			});
+		}
+		for k in &deletes {
+			wal_ops.push(WalOp::Delete {
+				key: k.clone(),
+			});
+		}
+		let record = WalRecord {
+			generation,
+			ops: wal_ops,
+		};
+		self.wal.append(&record).await?;
+
+		// WAL is durable — now apply to memtable. Order matters:
+		// readers should never see a key whose WAL append failed.
+		for (k, v) in writes {
+			self.memtable.insert(k, MemOp::Set(v), generation);
+		}
+		for k in deletes {
+			self.memtable.insert(k, MemOp::Delete, generation);
+		}
+		Ok(())
+	}
+
+	/// Legacy CommitGate commit: submit (writes, deletes) to the
+	/// per-Datastore coordinator and wait for the synchronous Lance
+	/// merge-insert + delete to land. The version stamp is
+	/// `read_version + 1` so the row carries a fresh per-row version
+	/// monotonically increasing with this transaction's snapshot
+	/// boundary.
+	async fn commit_legacy_gate(
+		&self,
+		writes: Vec<(Key, Val)>,
+		deletes: Vec<Key>,
+	) -> Result<()> {
+		let gate = self.commit_gate.as_ref().ok_or_else(|| {
+			Error::Datastore(
+				"LegacyCommitGate write-path selected but no gate was spawned \
+                 on this Datastore — internal invariant violated"
+					.into(),
+			)
+		})?;
+		gate.commit(writes, deletes, self.read_version.saturating_add(1))
+			.await
+	}
+
 	/// Build a `RecordBatch` for the Lance `MergeInsertBuilder` / `Dataset::append`
 	/// path. Sprint R unified the arrow type tree: our Cargo.toml pins
 	/// `arrow-array = "57"`, which is the same version lance 4.0 uses internally,
@@ -979,20 +1034,30 @@ impl Transaction {
 
 		// ── (1) Read Lance rows in range ───────────────────────────────────────
 		//
-		// Same LSM relaxation as in `Transaction::get`: an unversioned
-		// scan reads Lance @ latest, NOT the manifest version frozen
-		// at tx start. See the long comment in `get` for the rationale
-		// (flusher-races-tx race).
+		// Snapshot selection mirrors `Transaction::get`:
+		// - LsmWithWal + unversioned → Lance @ latest (Sprint AA
+		//   relaxation; see the long comment in `get`).
+		// - LegacyCommitGate + unversioned → Lance @ read_version
+		//   for strict snapshot iso.
+		// - versioned → checkout_version(v) on either path.
 		let mut lance_rows: Vec<(Key, Val)> = Vec::new();
 		{
 			let ds = self.dataset.read().await;
-			let snapshot_result: Option<LanceDataset> = match version {
-				Some(v) => match ds.inner.checkout_version(v).await {
-					Ok(s) => Some(s),
-					Err(_) => None,
-				},
-				None => Some(ds.inner.clone()),
-			};
+			let snapshot_result: Option<LanceDataset> =
+				match (self.write_path, version) {
+					(_, Some(v)) => match ds.inner.checkout_version(v).await {
+						Ok(s) => Some(s),
+						Err(_) => None,
+					},
+					(WritePath::LsmWithWal, None) => Some(ds.inner.clone()),
+					(WritePath::LegacyCommitGate, None) => {
+						match ds.inner.checkout_version(self.read_version).await
+						{
+							Ok(s) => Some(s),
+							Err(_) => None,
+						}
+					}
+				};
 			if let Some(snapshot) = snapshot_result {
 				let filter = KvSchema::build_range_predicate(&rng.start, &rng.end);
 
@@ -1076,8 +1141,11 @@ impl Transaction {
 			for (k, v) in lance_rows {
 				merged.insert(k, Some(v));
 			}
-			// Overlay memtable entries within the range.
-			if version.is_none() {
+			// Overlay memtable entries within the range — but only on
+			// the LSM path. The LegacyCommitGate path never writes to
+			// the memtable, so overlaying it would be a no-op anyway,
+			// and skipping the iteration saves time on large memtables.
+			if version.is_none() && self.write_path == WritePath::LsmWithWal {
 				for (k, entry) in self.memtable.scan_range(&rng) {
 					match entry.op {
 						MemOp::Set(v) => {
