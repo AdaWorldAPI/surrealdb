@@ -1,6 +1,27 @@
 #![cfg(feature = "kv-lance")]
+// The whole module is preserved as an "alternative route" for
+// implementation tests (see Sprint AA note in the header below) — its
+// public surface is currently exercised ONLY by `tests.rs` via the
+// `commit_gate_*` tests. From the production `lib` build, every
+// CommitGate item is unused, so `cfg_attr(not(test), allow(dead_code))`
+// suppresses the per-item dead-code warnings while keeping the warning
+// LIVE for the test build (where a missing call WOULD signal a
+// regression).
+#![cfg_attr(not(test), allow(dead_code))]
 
 //! # Commit coordinator — CollapseGate / BUNDLE merge for concurrent commits
+//!
+//! > **Sprint AA note (2026-05):** the production Transaction commit path
+//! > now goes through the WAL + memtable + background-flusher pipeline in
+//! > [`super::wal`], [`super::memtable`], and [`super::flusher`]. The
+//! > CommitGate below is **preserved as an alternative route** that
+//! > implementation tests can spawn directly via [`CommitGate::spawn`]
+//! > to compare LSM-style hot-path behaviour against the older
+//! > synchronous-batched-commit semantics, or to drive workloads that
+//! > prefer strict snapshot isolation over throughput. It is NOT
+//! > currently invoked by [`Transaction::commit`], so the per-Datastore
+//! > coordinator task is effectively idle in production — that idleness
+//! > is intentional and the file must not be deleted.
 //!
 //! Multiple in-flight Transactions calling [`Transaction::commit`] concurrently
 //! would otherwise each issue their own `MergeInsertBuilder::execute_reader`

@@ -301,6 +301,18 @@ pub struct LanceConfig {
 	/// Whether to write deletions as explicit tombstone rows
 	/// (in addition to using Lance's native deletion vectors).
 	pub delete_via_tombstone_row: bool,
+
+	/// If `true`, the background memtable→Lance flusher task is
+	/// NOT spawned. Writes still land in WAL + memtable, and the
+	/// memtable still fronts every read, but nothing migrates rows
+	/// into Lance until [`Datastore::shutdown`] explicitly drains.
+	///
+	/// Test-only knob for the LSM crash-recovery tests: with the
+	/// flusher disabled, the WAL is the SOLE durability mechanism
+	/// for in-flight commits, so simulating a process kill via
+	/// `Box::leak` cannot race with a mid-flush Lance manifest
+	/// rewrite. Production code never sets this.
+	pub disable_background_flusher: bool,
 }
 
 #[cfg(feature = "kv-lance")]
@@ -309,6 +321,7 @@ impl Default for LanceConfig {
 		Self {
 			versioned: true,
 			delete_via_tombstone_row: false,
+			disable_background_flusher: false,
 		}
 	}
 }
