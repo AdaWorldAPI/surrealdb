@@ -1353,3 +1353,116 @@ async fn shutdown_drains_pending_commits() {
         }
     }
 }
+
+// ============================================================================
+//  LSM crash-recovery (Sprint AA: WAL + memtable)
+// ============================================================================
+
+/// Acked commits survive a process crash that happens before the
+/// flusher has had a chance to push memtable rows into Lance.
+///
+/// Scenario: write N rows, drop the Datastore WITHOUT calling
+/// `shutdown` (i.e. no flusher drain). Re-open the same path. Every
+/// row that returned Ok from `commit()` must be readable in the
+/// re-opened Datastore — that is the durability contract advertised
+/// by the WAL.
+///
+/// Implementation notes:
+///   - We `Box::leak` the first datastore so its `Drop` does NOT
+///     run, simulating a hard process kill rather than a graceful
+///     shutdown. `shutdown` would drain the flusher and erase the
+///     test's point.
+///   - The flusher's tick is 100 ms; we don't sleep between commits
+///     and immediately drop, so the WAL is essentially the only
+///     surviving record.
+#[tokio::test]
+async fn lsm_recovery_replays_uncommitted_wal_records() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().expect("utf-8 path");
+
+    // ── (1) First datastore: write a bunch of rows and leak it ─────
+    let written: Vec<(Vec<u8>, Vec<u8>)> = (0..50)
+        .map(|i| {
+            (
+                format!("recovery_key_{:03}", i).into_bytes(),
+                format!("recovery_val_{:03}", i).into_bytes(),
+            )
+        })
+        .collect();
+
+    {
+        let ds = Datastore::new(path_str, LanceConfig::default())
+            .await
+            .expect("ds open #1");
+        for (k, v) in &written {
+            let tx = ds.transaction(true, false).await.expect("tx");
+            tx.set(k.clone(), v.clone()).await.expect("set");
+            tx.commit().await.expect("commit");
+        }
+        // SIMULATE A CRASH: leak the Datastore so its `Drop` (and
+        // any in-flight flusher task) never observes a graceful
+        // shutdown. The WAL remains on disk.
+        Box::leak(Box::new(ds));
+    }
+
+    // ── (2) Re-open. The WAL must replay into the memtable. ────────
+    let ds2 = Datastore::new(path_str, LanceConfig::default())
+        .await
+        .expect("ds open #2");
+
+    // ── (3) Every Ack'd write must be readable. ────────────────────
+    let tx = ds2.transaction(false, false).await.expect("read tx");
+    for (k, v) in &written {
+        let got = tx.get(k.clone(), None).await.expect("get");
+        assert_eq!(
+            got.as_deref(),
+            Some(v.as_slice()),
+            "key {:?} missing after recovery (WAL replay regression)",
+            String::from_utf8_lossy(k)
+        );
+    }
+    tx.cancel().await.expect("cancel");
+    ds2.shutdown().await.expect("shutdown #2");
+}
+
+/// A delete committed before the crash is preserved across recovery:
+/// the key returns `None` (not the pre-delete value) after re-open.
+///
+/// Same crash-simulation pattern as the recovery test above; the
+/// novelty here is the WAL `Delete` op exercising replay.
+#[tokio::test]
+async fn lsm_recovery_preserves_delete_tombstones() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().expect("utf-8 path");
+
+    {
+        let ds = Datastore::new(path_str, LanceConfig::default())
+            .await
+            .expect("ds open #1");
+
+        // Write k=v, then immediately delete k. Both ops land in the
+        // WAL before the crash.
+        let tx = ds.transaction(true, false).await.expect("tx-set");
+        tx.set(b"k".to_vec(), b"v".to_vec()).await.expect("set");
+        tx.commit().await.expect("commit-set");
+
+        let tx = ds.transaction(true, false).await.expect("tx-del");
+        tx.del(b"k".to_vec()).await.expect("del");
+        tx.commit().await.expect("commit-del");
+
+        Box::leak(Box::new(ds));
+    }
+
+    let ds2 = Datastore::new(path_str, LanceConfig::default())
+        .await
+        .expect("ds open #2");
+    let tx = ds2.transaction(false, false).await.expect("read tx");
+    let got = tx.get(b"k".to_vec(), None).await.expect("get");
+    assert!(
+        got.is_none(),
+        "delete tombstone lost across recovery: got {:?}",
+        got
+    );
+    tx.cancel().await.expect("cancel");
+    ds2.shutdown().await.expect("shutdown");
+}

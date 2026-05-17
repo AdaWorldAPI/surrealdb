@@ -63,8 +63,11 @@
 mod background_optimizer;
 mod cnf;
 mod commit_gate;
+mod flusher;
+mod memtable;
 mod schema;
 mod tx_buffer;
+mod wal;
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -79,8 +82,11 @@ use tokio::sync::RwLock;
 
 use background_optimizer::BackgroundOptimizer;
 use commit_gate::CommitGate;
+use flusher::{Flusher, FlusherConfig};
+use memtable::{Memtable, Op as MemOp};
 use schema::KvSchema;
 use tx_buffer::{PendingBuffer, PendingEntry};
+use wal::{Wal, WalOp, WalRecord};
 
 use super::Direction;
 use super::api::ScanLimit;
@@ -120,12 +126,27 @@ pub struct Datastore {
 	/// Set to `None` when running in test mode or when the user opts out.
 	background_optimizer: Option<Arc<BackgroundOptimizer>>,
 
-	/// Commit coordinator implementing the CollapseGate / BUNDLE merge
-	/// pattern. All in-flight `Transaction::commit` calls flow through
-	/// this single coordinator, which batches concurrent submissions into
-	/// one Lance `MergeInsertBuilder` call per epoch. See
-	/// [`commit_gate`] for the protocol details.
+	/// Legacy commit coordinator. Retained for the rare bypass path
+	/// (e.g. forced synchronous Lance commits in tests) but the
+	/// production write path now goes WAL → memtable → background
+	/// flusher, NOT through this gate. Will be removed in a follow-up
+	/// once the LSM path has stabilised.
+	#[allow(dead_code)]
 	commit_gate: Arc<CommitGate>,
+
+	/// Write-ahead log for the LSM-style fast-commit path. Writers
+	/// append a [`WalRecord`] here (fsynced) before inserting into
+	/// the memtable, so a process crash never loses an acknowledged
+	/// commit. Replayed once on `Datastore::new`.
+	wal: Arc<Wal>,
+
+	/// In-memory write buffer that fronts the Lance dataset. Concurrent
+	/// commits land here without blocking on a Lance write; the
+	/// background flusher drains the memtable into Lance in batches.
+	memtable: Arc<Memtable>,
+
+	/// Background memtable→Lance flusher. Drained on `shutdown`.
+	flusher: Arc<Flusher>,
 }
 
 /// Opaque handle to a Lance dataset.
@@ -246,11 +267,70 @@ impl Datastore {
 		// path (background optimizer, in-flight reads) sees.
 		let commit_gate = CommitGate::spawn(Arc::clone(&dataset_arc));
 
+		// Open the LSM write-ahead log and replay any uncommitted
+		// entries from a prior crash. The WAL lives inside the Lance
+		// dataset's directory; for non-filesystem URIs (e.g. `s3://`)
+		// the open will surface a clear "wal mkdir" error — those
+		// are not supported by the LSM path.
+		let wal_dir = std::path::Path::new(path);
+		let wal = Wal::open(wal_dir).await?;
+		let replayed = wal.replay().await?;
+
+		// Build the memtable. Pre-populate from the replayed WAL so
+		// that the first read after restart returns the same answers
+		// as if the writer had just committed them.
+		let memtable = Memtable::new();
+		let mut max_replayed_gen: u64 = 0;
+		for record in &replayed {
+			max_replayed_gen = max_replayed_gen.max(record.generation);
+			for op in &record.ops {
+				match op {
+					WalOp::Set { key, val } => memtable.insert(
+						key.clone(),
+						MemOp::Set(val.clone()),
+						record.generation,
+					),
+					WalOp::Delete { key } => memtable.insert(
+						key.clone(),
+						MemOp::Delete,
+						record.generation,
+					),
+				}
+			}
+		}
+		if !replayed.is_empty() {
+			info!(
+				target: TARGET,
+				"Replayed {} WAL records into memtable (up to gen {max_replayed_gen})",
+				replayed.len()
+			);
+			// Advance the memtable's atomic counter past the highest
+			// replayed generation so future commits get strictly
+			// monotonic generations across the restart.
+			while memtable.current_generation() < max_replayed_gen {
+				let _ = memtable.next_generation();
+			}
+		}
+
+		// Spawn the background memtable→Lance flusher. One per
+		// Datastore. The flusher will pick up the replayed entries
+		// on its first tick and roll them into Lance, then truncate
+		// the WAL.
+		let flusher = Flusher::spawn(
+			Arc::clone(&dataset_arc),
+			Arc::clone(&memtable),
+			Arc::clone(&wal),
+			FlusherConfig::default(),
+		);
+
 		Ok(Datastore {
 			dataset: dataset_arc,
 			versioned: config.versioned,
 			background_optimizer,
 			commit_gate,
+			wal,
+			memtable,
+			flusher,
 		})
 	}
 
@@ -274,6 +354,9 @@ impl Datastore {
 			dataset: Arc::clone(&self.dataset),
 			background_optimizer: self.background_optimizer.clone(),
 			commit_gate: Arc::clone(&self.commit_gate),
+			wal: Arc::clone(&self.wal),
+			memtable: Arc::clone(&self.memtable),
+			flusher: Arc::clone(&self.flusher),
 		})
 	}
 
@@ -288,8 +371,12 @@ impl Datastore {
 	// Will be called by the kvs::Datastore teardown path in Sprint II+.
 	#[allow(dead_code)]
 	pub(crate) async fn shutdown(&self) -> Result<()> {
-		// Drain the commit gate first so any in-flight batch lands before
-		// the optimizer stops watching the dataset.
+		// Drain the flusher first so every WAL-acked write lands in
+		// Lance before the optimizer stops watching the dataset and
+		// the underlying files are released.
+		self.flusher.shutdown().await;
+		// The commit gate is now an unused legacy path, but call its
+		// shutdown for symmetry until it is removed in a follow-up.
 		self.commit_gate.shutdown().await;
 		if let Some(opt) = &self.background_optimizer {
 			opt.shutdown().await;
@@ -337,11 +424,27 @@ pub struct Transaction {
 	/// configured write-count threshold is reached.
 	background_optimizer: Option<Arc<BackgroundOptimizer>>,
 
-	/// Per-datastore commit coordinator. `commit()` submits this
-	/// transaction's pending writes/deletes to the gate, which batches
-	/// concurrent submissions into a single Lance `MergeInsertBuilder`
-	/// commit per epoch.
+	/// Legacy commit gate handle. Retained on the Transaction so the
+	/// rare "force synchronous Lance commit" path remains reachable
+	/// in case the LSM path is opted out of in tests. Production
+	/// commit uses [`Self::wal`] + [`Self::memtable`].
+	#[allow(dead_code)]
 	commit_gate: Arc<CommitGate>,
+
+	/// LSM write-ahead log. `commit()` appends to this (fsynced)
+	/// before touching the memtable so an acknowledged commit is
+	/// always recoverable.
+	wal: Arc<Wal>,
+
+	/// In-memory write buffer that fronts the Lance dataset. Reads
+	/// check this BEFORE falling through to a Lance scan; writes
+	/// land here after the WAL append.
+	memtable: Arc<Memtable>,
+
+	/// Handle to the background flusher; commits ping it via
+	/// `notify_pending()` so it picks the new entries up promptly
+	/// rather than waiting for the next periodic tick.
+	flusher: Arc<Flusher>,
 }
 
 #[async_trait]
@@ -384,21 +487,71 @@ impl Transactable for Transaction {
 			return Err(Error::TransactionReadonly);
 		}
 
-		// Drain the pending buffer into owned microcopies. After this point
-		// the transaction has no more state to flush, so we drop the read
-		// guard before crossing the await boundary on the gate.
+		// Drain the pending buffer into owned microcopies. After this
+		// point the transaction owns the bytes and we drop the read
+		// guard before crossing any await boundary.
 		let (writes, deletes) = {
 			let pending = self.pending.read().await;
 			pending.partition()
 		};
 
-		let new_version = self.read_version + 1;
-		self.commit_gate.commit(writes, deletes, new_version).await?;
+		// Fast-commit path (Sprint AA, LSM-style):
+		//
+		//   1. Allocate a monotonic memtable generation.
+		//   2. Append one WAL record containing all writes+deletes,
+		//      and `fsync` before returning. This is the durability
+		//      barrier — once the WAL write returns Ok, the commit
+		//      is recoverable across crashes.
+		//   3. Insert each op into the memtable. Memtable is concurrent
+		//      (dashmap), so concurrent transactions don't serialize.
+		//   4. Mark the transaction done; notify the flusher.
+		//
+		// Lance gets the data later, via the background flusher.
+		if writes.is_empty() && deletes.is_empty() {
+			self.done.store(true, Ordering::Release);
+			return Ok(());
+		}
+
+		let generation = self.memtable.next_generation();
+
+		// Build a single WAL record for this commit.
+		let mut wal_ops = Vec::with_capacity(writes.len() + deletes.len());
+		for (k, v) in &writes {
+			wal_ops.push(WalOp::Set {
+				key: k.clone(),
+				val: v.clone(),
+			});
+		}
+		for k in &deletes {
+			wal_ops.push(WalOp::Delete {
+				key: k.clone(),
+			});
+		}
+		let record = WalRecord {
+			generation,
+			ops: wal_ops,
+		};
+		self.wal.append(&record).await?;
+
+		// WAL is durable — now apply to memtable. Order matters:
+		// readers should never see a key whose WAL append failed.
+		for (k, v) in writes {
+			self.memtable.insert(k, MemOp::Set(v), generation);
+		}
+		for k in deletes {
+			self.memtable.insert(k, MemOp::Delete, generation);
+		}
 
 		self.done.store(true, Ordering::Release);
 
-		// Notify optimizer; may trigger compaction if write-threshold
-		// is exceeded.
+		// Wake the flusher; if the memtable has grown past the
+		// threshold the flusher will drain it on this nudge rather
+		// than waiting for the next tick.
+		self.flusher.notify_pending();
+
+		// Notify optimizer (kept for parity with the pre-LSM path);
+		// it gauges write activity and may trigger compaction once
+		// the underlying Lance dataset has enough flushed commits.
 		if let Some(opt) = &self.background_optimizer {
 			opt.notify_commit().await;
 		}
@@ -444,16 +597,54 @@ impl Transactable for Transaction {
 			});
 		}
 
-		// (2) Fall through to Lance scan at the appropriate version.
-		let scan_version = version.unwrap_or(self.read_version);
-		let ds = self.dataset.read().await;
+		// (2) Check the memtable. This is the LSM-style hot read path:
+		//     committed-but-not-yet-flushed writes live here, and
+		//     reading them before falling through to Lance is what
+		//     makes the post-Sprint-AA backend appear consistent
+		//     to subsequent transactions.
+		//
+		//     Versioned reads (`version.is_some()`) skip the memtable
+		//     and go straight to Lance — the memtable only holds the
+		//     latest write per key, not historical versions, so a
+		//     `get(k, Some(v))` for some past `v` has no business
+		//     consulting it.
+		if version.is_none() {
+			if let Some(entry) = self.memtable.get(&key) {
+				return Ok(match entry.op {
+					MemOp::Set(v) => Some(v),
+					MemOp::Delete => None,
+				});
+			}
+		}
 
-		// On a fresh dataset with no commits yet, checkout_version may fail.
-		// Treat any checkout failure here as "not found" — equivalent to
-		// no rows matching the filter.
-		let snapshot = match ds.inner.checkout_version(scan_version).await {
-			Ok(s) => s,
-			Err(_) => return Ok(None),
+		// (3) Fall through to Lance scan.
+		//
+		// `version.is_some()` — explicit "read at version V" — uses
+		// `checkout_version` so the historical snapshot semantics
+		// hold.
+		//
+		// `version.is_none()` — the common case — reads the LATEST
+		// Lance dataset state, NOT the manifest version frozen at
+		// `Transaction::new`. This is the LSM relaxation discussed in
+		// the Sprint AA design notes: the flusher migrates rows from
+		// the memtable into Lance asynchronously, so a tx's
+		// `read_version` snapshot may be stale by the time the
+		// reader actually runs. Pinning to a stale manifest would
+		// hide rows the flusher has just published, while
+		// `memtable.get` returns `None` for the same key (it was
+		// drained). Reading Lance @ latest keeps the
+		//
+		//   memtable[now]  ∪  lance[latest]
+		//
+		// view internally consistent — the same key cannot vanish
+		// across the flusher hand-off.
+		let ds = self.dataset.read().await;
+		let snapshot = match version {
+			Some(v) => match ds.inner.checkout_version(v).await {
+				Ok(s) => s,
+				Err(_) => return Ok(None),
+			},
+			None => ds.inner.clone(),
 		};
 
 		let filter = KvSchema::build_get_predicate(&key);
@@ -747,16 +938,23 @@ impl Transaction {
 			return Err(Error::TransactionFinished);
 		}
 
-		let scan_version = version.unwrap_or(self.read_version);
-
 		// ── (1) Read Lance rows in range ───────────────────────────────────────
+		//
+		// Same LSM relaxation as in `Transaction::get`: an unversioned
+		// scan reads Lance @ latest, NOT the manifest version frozen
+		// at tx start. See the long comment in `get` for the rationale
+		// (flusher-races-tx race).
 		let mut lance_rows: Vec<(Key, Val)> = Vec::new();
 		{
 			let ds = self.dataset.read().await;
-
-			// Empty dataset / no commits yet → checkout_version may fail. Treat
-			// as empty result (same idiom as Transaction::get).
-			if let Ok(snapshot) = ds.inner.checkout_version(scan_version).await {
+			let snapshot_result: Option<LanceDataset> = match version {
+				Some(v) => match ds.inner.checkout_version(v).await {
+					Ok(s) => Some(s),
+					Err(_) => None,
+				},
+				None => Some(ds.inner.clone()),
+			};
+			if let Some(snapshot) = snapshot_result {
 				let filter = KvSchema::build_range_predicate(&rng.start, &rng.end);
 
 				let mut scanner = snapshot.scan();
@@ -823,18 +1021,37 @@ impl Transaction {
 			}
 		}
 
-		// ── (2) Merge with pending buffer ──────────────────────────────────────
+		// ── (2) Merge with memtable + pending buffer ─────────────────────────
+		// Layering, oldest → newest (later layers win on key collision):
+		//
+		//   Lance     <  memtable  <  pending
+		//
+		// Versioned reads (`version.is_some()`) skip the memtable: the
+		// memtable only holds the latest write per key, not historical
+		// versions, so it has no business answering "what did key K
+		// look like at version V?" queries.
 		{
 			let pending = self.pending.read().await;
-			// Build a BTreeMap for O(N+P) merge; lance already returned rows in
-			// direction order, but we re-sort here after applying pending overlays.
 			let mut merged: std::collections::BTreeMap<Key, Option<Val>> =
 				std::collections::BTreeMap::new();
 			for (k, v) in lance_rows {
 				merged.insert(k, Some(v));
 			}
-			// Overlay pending writes: Set overrides lance row, Delete removes it.
-			// Filter to keys strictly within [rng.start, rng.end).
+			// Overlay memtable entries within the range.
+			if version.is_none() {
+				for (k, entry) in self.memtable.scan_range(&rng) {
+					match entry.op {
+						MemOp::Set(v) => {
+							merged.insert(k, Some(v));
+						}
+						MemOp::Delete => {
+							merged.insert(k, None);
+						}
+					}
+				}
+			}
+			// Overlay pending writes: Set overrides everything below,
+			// Delete masks the key entirely.
 			for (k, entry) in pending.iter() {
 				if k.as_slice() >= rng.start.as_slice()
 					&& k.as_slice() < rng.end.as_slice()
@@ -844,7 +1061,7 @@ impl Transaction {
 							merged.insert(k.clone(), Some(v.clone()));
 						}
 						PendingEntry::Delete => {
-							merged.remove(k);
+							merged.insert(k.clone(), None);
 						}
 					}
 				}
