@@ -154,11 +154,11 @@ impl Memtable {
 	/// because a newer write may have raced the flush and updated
 	/// the entry's generation while we were committing to Lance.
 	pub(super) fn drop_committed(&self, flushed: &[(Key, u64)]) {
-		for (k, gen) in flushed {
+		for (k, generation) in flushed {
 			// `remove_if` keeps the entry when the closure returns
 			// false; we want to drop only if the entry hasn't been
 			// touched by a newer commit.
-			self.entries.remove_if(k, |_k, v| v.generation <= *gen);
+			self.entries.remove_if(k, |_k, v| v.generation <= *generation);
 		}
 	}
 
