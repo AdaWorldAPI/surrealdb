@@ -367,6 +367,18 @@ impl Datastore {
 		self.dataset.read().await.inner.version().version
 	}
 
+	/// Test-only accessor for the underlying dataset Arc.
+	///
+	/// Lets `lance::tests` exercise alternative write paths (notably
+	/// the preserved [`CommitGate`] route) directly against the same
+	/// Lance handle the production Transaction methods would use,
+	/// without exposing the field through any public API. Not
+	/// reachable from outside the `lance` module tree.
+	#[cfg(test)]
+	pub(super) fn dataset_for_tests(&self) -> &Arc<RwLock<DatasetHandle>> {
+		&self.dataset
+	}
+
 	/// Shut down the datastore, flushing any background tasks.
 	// Will be called by the kvs::Datastore teardown path in Sprint II+.
 	#[allow(dead_code)]

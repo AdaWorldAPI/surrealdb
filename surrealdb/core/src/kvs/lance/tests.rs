@@ -1466,3 +1466,83 @@ async fn lsm_recovery_preserves_delete_tombstones() {
     tx.cancel().await.expect("cancel");
     ds2.shutdown().await.expect("shutdown");
 }
+
+// ============================================================================
+//  CommitGate as alternative route
+// ============================================================================
+//
+// Sprint AA introduced the WAL + memtable + flusher hot-path; the older
+// `CommitGate` coordinator is preserved as an alternative route (see the
+// header of `commit_gate.rs`). The test below spawns a CommitGate
+// directly against a fresh Datastore handle and round-trips one
+// commit + one delete through it, asserting that the gate's
+// merge-insert-and-delete contract still holds end-to-end.
+//
+// Keeping this test in the suite ensures the alternative route does not
+// bit-rot as the LSM path evolves.
+
+/// Directly exercise `CommitGate::commit` + `CommitGate::shutdown`
+/// against a fresh dataset. Verifies that the legacy synchronous
+/// commit path still produces a readable Lance row and that delete
+/// removes it again, independent of the WAL+memtable pipeline.
+#[tokio::test]
+async fn commit_gate_alternative_route_roundtrips_a_write() {
+    use super::commit_gate::CommitGate;
+
+    // Build a Datastore on a fresh path so we can borrow its
+    // internal `dataset` Arc for the gate. We use the public
+    // `Datastore::new` path because spinning up the bare Lance
+    // dataset by hand would duplicate Sprint A scaffolding.
+    let path = unique_tmp_path();
+    let path_str = path.to_str().expect("utf-8 path");
+    let ds = Datastore::new(path_str, LanceConfig::default())
+        .await
+        .expect("ds open");
+
+    // Spawn a fresh CommitGate against the same underlying Lance
+    // dataset handle. This is what an "alternative implementation
+    // test" would do: bypass the production WAL+memtable path and
+    // drive Lance via the gate directly.
+    let gate = CommitGate::spawn(std::sync::Arc::clone(ds.dataset_for_tests()));
+
+    let key = b"gate_route_key".to_vec();
+    let val = b"gate_route_val".to_vec();
+
+    // Submit one write through the gate. The `version` we pass is
+    // the per-row version stamp written to the `version` column —
+    // it does NOT have to match Lance's manifest version, and the
+    // gate accepts any monotonically-increasing u64 here.
+    let next_version = ds.current_version().await.saturating_add(1);
+    gate.commit(vec![(key.clone(), val.clone())], vec![], next_version)
+        .await
+        .expect("gate commit");
+
+    // The row must now be readable through a fresh Transaction.
+    let tx = ds.transaction(false, false).await.expect("read tx");
+    let got = tx.get(key.clone(), None).await.expect("get");
+    assert_eq!(
+        got.as_deref(),
+        Some(val.as_slice()),
+        "row written via CommitGate missing on read-through-tx"
+    );
+    tx.cancel().await.expect("cancel");
+
+    // Submit one delete through the gate.
+    let next_version = ds.current_version().await.saturating_add(1);
+    gate.commit(vec![], vec![key.clone()], next_version)
+        .await
+        .expect("gate delete");
+
+    // The row must now be gone.
+    let tx = ds.transaction(false, false).await.expect("read tx");
+    let got = tx.get(key.clone(), None).await.expect("get");
+    assert!(
+        got.is_none(),
+        "row not removed after CommitGate delete: got {:?}",
+        got
+    );
+    tx.cancel().await.expect("cancel");
+
+    gate.shutdown().await;
+    ds.shutdown().await.expect("ds shutdown");
+}

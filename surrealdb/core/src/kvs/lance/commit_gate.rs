@@ -2,6 +2,18 @@
 
 //! # Commit coordinator — CollapseGate / BUNDLE merge for concurrent commits
 //!
+//! > **Sprint AA note (2026-05):** the production Transaction commit path
+//! > now goes through the WAL + memtable + background-flusher pipeline in
+//! > [`super::wal`], [`super::memtable`], and [`super::flusher`]. The
+//! > CommitGate below is **preserved as an alternative route** that
+//! > implementation tests can spawn directly via [`CommitGate::spawn`]
+//! > to compare LSM-style hot-path behaviour against the older
+//! > synchronous-batched-commit semantics, or to drive workloads that
+//! > prefer strict snapshot isolation over throughput. It is NOT
+//! > currently invoked by [`Transaction::commit`], so the per-Datastore
+//! > coordinator task is effectively idle in production — that idleness
+//! > is intentional and the file must not be deleted.
+//!
 //! Multiple in-flight Transactions calling [`Transaction::commit`] concurrently
 //! would otherwise each issue their own `MergeInsertBuilder::execute_reader`
 //! against the shared Lance dataset, producing N independent dataset versions
