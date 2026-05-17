@@ -1,4 +1,13 @@
 #![cfg(feature = "kv-lance")]
+// The whole module is preserved as an "alternative route" for
+// implementation tests (see Sprint AA note in the header below) — its
+// public surface is currently exercised ONLY by `tests.rs` via the
+// `commit_gate_*` tests. From the production `lib` build, every
+// CommitGate item is unused, so `cfg_attr(not(test), allow(dead_code))`
+// suppresses the per-item dead-code warnings while keeping the warning
+// LIVE for the test build (where a missing call WOULD signal a
+// regression).
+#![cfg_attr(not(test), allow(dead_code))]
 
 //! # Commit coordinator — CollapseGate / BUNDLE merge for concurrent commits
 //!

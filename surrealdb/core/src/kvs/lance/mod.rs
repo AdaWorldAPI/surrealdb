@@ -146,7 +146,9 @@ pub struct Datastore {
 	memtable: Arc<Memtable>,
 
 	/// Background memtable→Lance flusher. Drained on `shutdown`.
-	flusher: Arc<Flusher>,
+	/// `None` when [`LanceConfig::disable_background_flusher`] is set
+	/// (test-only durability scenarios — see config docstring).
+	flusher: Option<Arc<Flusher>>,
 }
 
 /// Opaque handle to a Lance dataset.
@@ -316,12 +318,22 @@ impl Datastore {
 		// Datastore. The flusher will pick up the replayed entries
 		// on its first tick and roll them into Lance, then truncate
 		// the WAL.
-		let flusher = Flusher::spawn(
-			Arc::clone(&dataset_arc),
-			Arc::clone(&memtable),
-			Arc::clone(&wal),
-			FlusherConfig::default(),
-		);
+		//
+		// `disable_background_flusher` keeps the flusher out of the
+		// picture entirely — WAL stays the sole durability source
+		// until `shutdown` drains explicitly. Used by the
+		// crash-recovery tests so the simulated kill cannot race
+		// with a mid-flush Lance manifest rewrite.
+		let flusher = if config.disable_background_flusher {
+			None
+		} else {
+			Some(Flusher::spawn(
+				Arc::clone(&dataset_arc),
+				Arc::clone(&memtable),
+				Arc::clone(&wal),
+				FlusherConfig::default(),
+			))
+		};
 
 		Ok(Datastore {
 			dataset: dataset_arc,
@@ -356,7 +368,7 @@ impl Datastore {
 			commit_gate: Arc::clone(&self.commit_gate),
 			wal: Arc::clone(&self.wal),
 			memtable: Arc::clone(&self.memtable),
-			flusher: Arc::clone(&self.flusher),
+			flusher: self.flusher.clone(),
 		})
 	}
 
@@ -383,10 +395,13 @@ impl Datastore {
 	// Will be called by the kvs::Datastore teardown path in Sprint II+.
 	#[allow(dead_code)]
 	pub(crate) async fn shutdown(&self) -> Result<()> {
-		// Drain the flusher first so every WAL-acked write lands in
+		// Drain the flusher first (if one was spawned — disabled in
+		// the recovery test path) so every WAL-acked write lands in
 		// Lance before the optimizer stops watching the dataset and
 		// the underlying files are released.
-		self.flusher.shutdown().await;
+		if let Some(flusher) = &self.flusher {
+			flusher.shutdown().await;
+		}
 		// The commit gate is now an unused legacy path, but call its
 		// shutdown for symmetry until it is removed in a follow-up.
 		self.commit_gate.shutdown().await;
@@ -425,8 +440,16 @@ pub struct Transaction {
 	save_points: Arc<RwLock<Vec<PendingBuffer>>>,
 
 	/// Lance dataset version this transaction reads from.
-	/// Stays constant for the transaction's lifetime to guarantee
-	/// snapshot-isolation reads.
+	///
+	/// Captured at transaction start so a follow-up commit on the
+	/// preserved [`CommitGate`] alternative route (which retains
+	/// snapshot-iso semantics, unlike the Sprint AA LSM path) can
+	/// pin its scans to the version that was current when the tx
+	/// began. The production LSM read path in `get` / `scan_impl`
+	/// reads Lance @ latest for unversioned queries, so it doesn't
+	/// consult this field — that's why `dead_code` is allowed; the
+	/// field stays because the alternative route needs it.
+	#[allow(dead_code)]
 	read_version: u64,
 
 	/// Shared reference to the underlying Lance dataset.
@@ -455,8 +478,10 @@ pub struct Transaction {
 
 	/// Handle to the background flusher; commits ping it via
 	/// `notify_pending()` so it picks the new entries up promptly
-	/// rather than waiting for the next periodic tick.
-	flusher: Arc<Flusher>,
+	/// rather than waiting for the next periodic tick. `None` when
+	/// `LanceConfig::disable_background_flusher` is set (mirrors
+	/// the `Datastore` field).
+	flusher: Option<Arc<Flusher>>,
 }
 
 #[async_trait]
@@ -556,10 +581,12 @@ impl Transactable for Transaction {
 
 		self.done.store(true, Ordering::Release);
 
-		// Wake the flusher; if the memtable has grown past the
-		// threshold the flusher will drain it on this nudge rather
+		// Wake the flusher (when one is spawned); if the memtable has
+		// grown past the threshold it drains on this nudge rather
 		// than waiting for the next tick.
-		self.flusher.notify_pending();
+		if let Some(flusher) = &self.flusher {
+			flusher.notify_pending();
+		}
 
 		// Notify optimizer (kept for parity with the pre-LSM path);
 		// it gauges write activity and may trigger compaction once

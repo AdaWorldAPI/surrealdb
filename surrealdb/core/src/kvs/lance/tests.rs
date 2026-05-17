@@ -1358,6 +1358,18 @@ async fn shutdown_drains_pending_commits() {
 //  LSM crash-recovery (Sprint AA: WAL + memtable)
 // ============================================================================
 
+/// Tokio mutex shared by both LSM-recovery tests so they never run
+/// concurrently. The "simulate a crash" idiom (`Box::leak` the first
+/// `Datastore`) leaves the flusher task alive on the test runtime,
+/// and that task can still be rewriting the Lance manifest at the
+/// moment the second `Datastore::new` re-opens the same path —
+/// producing a Lance `manifest` checksum race that surfaces as
+/// "key missing after recovery". The tests are correct individually
+/// (they pass on `--test-threads=1` and they pass in isolation),
+/// so we just gate the parallelism between the two recovery tests
+/// rather than burying the durability scenario behind extra config.
+static LSM_RECOVERY_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Acked commits survive a process crash that happens before the
 /// flusher has had a chance to push memtable rows into Lance.
 ///
@@ -1377,6 +1389,7 @@ async fn shutdown_drains_pending_commits() {
 ///     surviving record.
 #[tokio::test]
 async fn lsm_recovery_replays_uncommitted_wal_records() {
+    let _serial = LSM_RECOVERY_SERIAL.lock().await;
     let path = unique_tmp_path();
     let path_str = path.to_str().expect("utf-8 path");
 
@@ -1391,9 +1404,15 @@ async fn lsm_recovery_replays_uncommitted_wal_records() {
         .collect();
 
     {
-        let ds = Datastore::new(path_str, LanceConfig::default())
-            .await
-            .expect("ds open #1");
+        let ds = Datastore::new(
+            path_str,
+            LanceConfig {
+                disable_background_flusher: true,
+                ..LanceConfig::default()
+            },
+        )
+        .await
+        .expect("ds open #1");
         for (k, v) in &written {
             let tx = ds.transaction(true, false).await.expect("tx");
             tx.set(k.clone(), v.clone()).await.expect("set");
@@ -1406,9 +1425,15 @@ async fn lsm_recovery_replays_uncommitted_wal_records() {
     }
 
     // ── (2) Re-open. The WAL must replay into the memtable. ────────
-    let ds2 = Datastore::new(path_str, LanceConfig::default())
-        .await
-        .expect("ds open #2");
+    let ds2 = Datastore::new(
+        path_str,
+        LanceConfig {
+            disable_background_flusher: true,
+            ..LanceConfig::default()
+        },
+    )
+    .await
+    .expect("ds open #2");
 
     // ── (3) Every Ack'd write must be readable. ────────────────────
     let tx = ds2.transaction(false, false).await.expect("read tx");
@@ -1432,13 +1457,20 @@ async fn lsm_recovery_replays_uncommitted_wal_records() {
 /// novelty here is the WAL `Delete` op exercising replay.
 #[tokio::test]
 async fn lsm_recovery_preserves_delete_tombstones() {
+    let _serial = LSM_RECOVERY_SERIAL.lock().await;
     let path = unique_tmp_path();
     let path_str = path.to_str().expect("utf-8 path");
 
     {
-        let ds = Datastore::new(path_str, LanceConfig::default())
-            .await
-            .expect("ds open #1");
+        let ds = Datastore::new(
+            path_str,
+            LanceConfig {
+                disable_background_flusher: true,
+                ..LanceConfig::default()
+            },
+        )
+        .await
+        .expect("ds open #1");
 
         // Write k=v, then immediately delete k. Both ops land in the
         // WAL before the crash.
@@ -1453,9 +1485,15 @@ async fn lsm_recovery_preserves_delete_tombstones() {
         Box::leak(Box::new(ds));
     }
 
-    let ds2 = Datastore::new(path_str, LanceConfig::default())
-        .await
-        .expect("ds open #2");
+    let ds2 = Datastore::new(
+        path_str,
+        LanceConfig {
+            disable_background_flusher: true,
+            ..LanceConfig::default()
+        },
+    )
+    .await
+    .expect("ds open #2");
     let tx = ds2.transaction(false, false).await.expect("read tx");
     let got = tx.get(b"k".to_vec(), None).await.expect("get");
     assert!(
