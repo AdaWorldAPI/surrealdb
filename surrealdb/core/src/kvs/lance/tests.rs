@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::Datastore;
 use crate::kvs::api::Transactable;
-use crate::kvs::config::LanceConfig;
+use crate::kvs::config::{LanceConfig, WritePath};
 
 /// Return a unique path inside the OS temp directory for use as a
 /// Lance dataset root. Each call returns a distinct path.
@@ -1762,6 +1762,141 @@ async fn bench_lsm_memtable_warm_read_throughput() {
          {:.0} reads/sec  |  {:.2} µs/read",
         N_READS, N_KEYS, elapsed, throughput, per_read_us
     );
+
+    ds.shutdown().await.expect("shutdown");
+}
+
+// ============================================================================
+//  WritePath enum (Sprint BB): runtime-selectable LSM vs LegacyCommitGate
+// ============================================================================
+
+/// `WritePath::LegacyCommitGate` routes commits through the
+/// CommitGate and reads to `checkout_version(read_version)`. Smoke:
+/// set / get / overwrite / delete via the public Transactable surface.
+#[tokio::test]
+async fn writepath_legacy_commit_gate_smoke() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().expect("utf-8 path");
+    let ds = Datastore::new(
+        path_str,
+        LanceConfig {
+            write_path: WritePath::LegacyCommitGate,
+            ..LanceConfig::default()
+        },
+    )
+    .await
+    .expect("ds open");
+
+    let tx = ds.transaction(true, false).await.expect("tx1");
+    tx.set(b"wp_k".to_vec(), b"wp_v1".to_vec()).await.expect("set");
+    tx.commit().await.expect("commit 1");
+
+    let tx = ds.transaction(false, false).await.expect("tx2");
+    assert_eq!(
+        tx.get(b"wp_k".to_vec(), None).await.expect("get").as_deref(),
+        Some(b"wp_v1".as_ref()),
+        "Legacy-gate path failed to make set visible across transactions"
+    );
+    tx.cancel().await.expect("cancel");
+
+    let tx = ds.transaction(true, false).await.expect("tx3");
+    tx.set(b"wp_k".to_vec(), b"wp_v2".to_vec()).await.expect("set");
+    tx.commit().await.expect("commit 2");
+
+    let tx = ds.transaction(false, false).await.expect("tx4");
+    assert_eq!(
+        tx.get(b"wp_k".to_vec(), None).await.expect("get").as_deref(),
+        Some(b"wp_v2".as_ref()),
+        "Legacy-gate path failed to overwrite a previously committed value"
+    );
+    tx.cancel().await.expect("cancel");
+
+    let tx = ds.transaction(true, false).await.expect("tx5");
+    tx.del(b"wp_k".to_vec()).await.expect("del");
+    tx.commit().await.expect("commit 3");
+
+    let tx = ds.transaction(false, false).await.expect("tx6");
+    assert!(
+        tx.get(b"wp_k".to_vec(), None).await.expect("get").is_none(),
+        "Legacy-gate path failed to delete a previously committed key"
+    );
+    tx.cancel().await.expect("cancel");
+
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// `LegacyCommitGate` does NOT spawn a flusher: the gate's own
+/// synchronous commit cycle handles every write. Proven by a clean
+/// `Datastore::shutdown` (no flusher to drain → no hangs).
+#[tokio::test]
+async fn writepath_legacy_commit_gate_does_not_spawn_flusher() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().expect("utf-8 path");
+    let ds = Datastore::new(
+        path_str,
+        LanceConfig {
+            write_path: WritePath::LegacyCommitGate,
+            ..LanceConfig::default()
+        },
+    )
+    .await
+    .expect("ds open");
+
+    let tx = ds.transaction(true, false).await.expect("tx");
+    tx.set(b"only_gate".to_vec(), b"v".to_vec()).await.expect("set");
+    tx.commit().await.expect("commit");
+
+    ds.shutdown().await.expect("shutdown");
+}
+
+/// Strict snapshot isolation on the LegacyCommitGate path: a read
+/// transaction opened BEFORE a write commits must NOT see the write,
+/// even though the write commits successfully in the meantime. This
+/// is the semantic distinction from `LsmWithWal`, which reads Lance
+/// @ latest and would observe the post-commit value.
+#[tokio::test]
+async fn writepath_legacy_commit_gate_provides_snapshot_iso() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().expect("utf-8 path");
+    let ds = Datastore::new(
+        path_str,
+        LanceConfig {
+            write_path: WritePath::LegacyCommitGate,
+            ..LanceConfig::default()
+        },
+    )
+    .await
+    .expect("ds open");
+
+    // Seed one row in V0.
+    let tx = ds.transaction(true, false).await.expect("tx-seed");
+    tx.set(b"snap_k".to_vec(), b"v_seed".to_vec()).await.expect("set");
+    tx.commit().await.expect("commit-seed");
+
+    // Open a read tx; it pins to the current Lance version.
+    let read_tx = ds.transaction(false, false).await.expect("read tx");
+
+    // Concurrently, a writer overwrites the row.
+    let writer_tx = ds.transaction(true, false).await.expect("writer tx");
+    writer_tx
+        .set(b"snap_k".to_vec(), b"v_overwrite".to_vec())
+        .await
+        .expect("set");
+    writer_tx.commit().await.expect("commit-overwrite");
+
+    // The pre-existing read tx must still see the seed value — the
+    // overwrite landed AFTER it pinned its snapshot.
+    let got = read_tx
+        .get(b"snap_k".to_vec(), None)
+        .await
+        .expect("get from pinned snapshot");
+    assert_eq!(
+        got.as_deref(),
+        Some(b"v_seed".as_ref()),
+        "LegacyCommitGate read tx saw a value that committed AFTER it started — \
+         snapshot iso violated"
+    );
+    read_tx.cancel().await.expect("cancel");
 
     ds.shutdown().await.expect("shutdown");
 }

@@ -290,6 +290,44 @@ impl RocksDbConfig {
 ///
 /// Most knobs live in env-vars (see `kvs/lance/cnf.rs`); this struct
 /// only carries the per-Datastore options that the SurrealDB CLI/config
+/// Which write-path the kv-lance Datastore uses for `Transaction::commit`.
+///
+/// Sprint AA introduced the LSM-style WAL + memtable + background-flusher
+/// path; the pre-Sprint-AA CommitGate path is retained as an alternative
+/// route so implementation tests can compare the two side-by-side, and
+/// so workloads that prefer strict snapshot iso (CommitGate) over raw
+/// commit throughput (LSM) can opt in at Datastore construction time.
+#[cfg(feature = "kv-lance")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WritePath {
+	/// **Sprint AA default.** Each commit appends to the WAL (fsync),
+	/// inserts into the in-memory memtable, and returns `Ok` without
+	/// touching Lance. A background flusher periodically migrates
+	/// memtable rows into the Lance dataset (and truncates the WAL).
+	/// Reads check the pending buffer → memtable → Lance @ latest.
+	///
+	/// **Isolation:** relaxed — unversioned reads see the latest
+	/// memtable + the latest Lance dataset, not a frozen snapshot at
+	/// transaction-start. This matches "read committed" semantics.
+	///
+	/// **Throughput:** WAL-fsync bounded for single writers,
+	/// scales linearly with concurrent writers.
+	#[default]
+	LsmWithWal,
+	/// **Pre-Sprint-AA legacy.** Each commit submits its writes +
+	/// deletes to the per-Datastore CommitGate coordinator, which
+	/// batches concurrent submissions into a single Lance commit
+	/// inside a small time window. `Transaction::commit` returns only
+	/// after the Lance commit lands. Reads pin to `Dataset::checkout(
+	/// tx.read_version)` for strict snapshot iso.
+	///
+	/// **Isolation:** strict snapshot iso — every read inside a
+	/// transaction sees the dataset state frozen at tx start.
+	///
+	/// **Throughput:** Lance-commit-latency bounded.
+	LegacyCommitGate,
+}
+
 /// layer needs to know about.
 #[cfg(feature = "kv-lance")]
 #[derive(Debug, Clone)]
@@ -302,16 +340,25 @@ pub struct LanceConfig {
 	/// (in addition to using Lance's native deletion vectors).
 	pub delete_via_tombstone_row: bool,
 
-	/// If `true`, the background memtable→Lance flusher task is
-	/// NOT spawned. Writes still land in WAL + memtable, and the
-	/// memtable still fronts every read, but nothing migrates rows
-	/// into Lance until [`Datastore::shutdown`] explicitly drains.
+	/// Which write-path to use. See [`WritePath`] for the two
+	/// options and their semantics. Defaults to
+	/// [`WritePath::LsmWithWal`] — the Sprint AA hot path.
+	pub write_path: WritePath,
+
+	/// If `true` AND `write_path == LsmWithWal`, the background
+	/// memtable→Lance flusher task is NOT spawned. Writes still
+	/// land in WAL + memtable, and the memtable still fronts every
+	/// read, but nothing migrates rows into Lance until
+	/// [`Datastore::shutdown`] explicitly drains.
 	///
 	/// Test-only knob for the LSM crash-recovery tests: with the
 	/// flusher disabled, the WAL is the SOLE durability mechanism
 	/// for in-flight commits, so simulating a process kill via
 	/// `Box::leak` cannot race with a mid-flush Lance manifest
 	/// rewrite. Production code never sets this.
+	///
+	/// Ignored when `write_path == LegacyCommitGate` (the gate path
+	/// has no flusher).
 	pub disable_background_flusher: bool,
 }
 
@@ -321,6 +368,7 @@ impl Default for LanceConfig {
 		Self {
 			versioned: true,
 			delete_via_tombstone_row: false,
+			write_path: WritePath::default(),
 			disable_background_flusher: false,
 		}
 	}
