@@ -617,16 +617,34 @@ impl Transactable for Transaction {
 			}
 		}
 
-		// (3) Fall through to Lance scan at the appropriate version.
-		let scan_version = version.unwrap_or(self.read_version);
+		// (3) Fall through to Lance scan.
+		//
+		// `version.is_some()` — explicit "read at version V" — uses
+		// `checkout_version` so the historical snapshot semantics
+		// hold.
+		//
+		// `version.is_none()` — the common case — reads the LATEST
+		// Lance dataset state, NOT the manifest version frozen at
+		// `Transaction::new`. This is the LSM relaxation discussed in
+		// the Sprint AA design notes: the flusher migrates rows from
+		// the memtable into Lance asynchronously, so a tx's
+		// `read_version` snapshot may be stale by the time the
+		// reader actually runs. Pinning to a stale manifest would
+		// hide rows the flusher has just published, while
+		// `memtable.get` returns `None` for the same key (it was
+		// drained). Reading Lance @ latest keeps the
+		//
+		//   memtable[now]  ∪  lance[latest]
+		//
+		// view internally consistent — the same key cannot vanish
+		// across the flusher hand-off.
 		let ds = self.dataset.read().await;
-
-		// On a fresh dataset with no commits yet, checkout_version may fail.
-		// Treat any checkout failure here as "not found" — equivalent to
-		// no rows matching the filter.
-		let snapshot = match ds.inner.checkout_version(scan_version).await {
-			Ok(s) => s,
-			Err(_) => return Ok(None),
+		let snapshot = match version {
+			Some(v) => match ds.inner.checkout_version(v).await {
+				Ok(s) => s,
+				Err(_) => return Ok(None),
+			},
+			None => ds.inner.clone(),
 		};
 
 		let filter = KvSchema::build_get_predicate(&key);
@@ -920,16 +938,23 @@ impl Transaction {
 			return Err(Error::TransactionFinished);
 		}
 
-		let scan_version = version.unwrap_or(self.read_version);
-
 		// ── (1) Read Lance rows in range ───────────────────────────────────────
+		//
+		// Same LSM relaxation as in `Transaction::get`: an unversioned
+		// scan reads Lance @ latest, NOT the manifest version frozen
+		// at tx start. See the long comment in `get` for the rationale
+		// (flusher-races-tx race).
 		let mut lance_rows: Vec<(Key, Val)> = Vec::new();
 		{
 			let ds = self.dataset.read().await;
-
-			// Empty dataset / no commits yet → checkout_version may fail. Treat
-			// as empty result (same idiom as Transaction::get).
-			if let Ok(snapshot) = ds.inner.checkout_version(scan_version).await {
+			let snapshot_result: Option<LanceDataset> = match version {
+				Some(v) => match ds.inner.checkout_version(v).await {
+					Ok(s) => Some(s),
+					Err(_) => None,
+				},
+				None => Some(ds.inner.clone()),
+			};
+			if let Some(snapshot) = snapshot_result {
 				let filter = KvSchema::build_range_predicate(&rng.start, &rng.end);
 
 				let mut scanner = snapshot.scan();
