@@ -7,6 +7,11 @@ description = "Glue #1 — SurrealDB live queries / change-feed events → racto
 
 # See §5 of .claude/plans/integration-plan.md for the full API sketch.
 
+# PP-13 wave-2 fix: present in parent workspace's `exclude` list, so cargo
+# would otherwise refuse to compile this crate standalone. The empty
+# [workspace] table marks this crate as its own workspace root.
+[workspace]
+
 [dependencies]
 surrealdb = { path = "../surrealdb", default-features = false }
 ractor = "*"
