@@ -25,6 +25,11 @@ members = [
     "profiling",
 ]
 
+exclude = [
+    # Sprint 1 scaffold of Glue #1 (see .claude/plans/integration-plan.md §5).
+    "surrealdb-ractor",
+]
+
 [workspace.package]
 authors = ["Tobie Morgan Hitchcock <tobie@surrealdb.com>"]
 edition = "2024"
@@ -500,3 +505,30 @@ panic = 'unwind'
 # that crates.io 0.16 entry requires upstream lance-index to bump.
 [patch.crates-io]
 ndarray = { git = "https://github.com/AdaWorldAPI/ndarray.git" }
+
+# ============================================================================
+# Cross-repo git → local-path redirects (local dev convenience)
+# ============================================================================
+# When the four-repo workspace is checked out side-by-side at the standard
+# /home/user/{ndarray, lance-graph, sea-orm, surrealdb} layout, these patches
+# make local edits to ndarray + lance-graph-contract immediately visible to
+# surrealdb-core without going through a remote push + commit-pin cycle.
+#
+# Cargo errors at resolve time if a patch target path is missing, so if you
+# check out surrealdb in isolation, COMMENT THESE BLOCKS OUT (or use a
+# top-level .cargo/config.toml override). The published surrealdb release
+# does NOT ship these patches — they exist only on the four-repo dev branch.
+#
+# Pairs with the workspace.dependencies entries at the top of this file:
+#   - ndarray             = { git = ".../ndarray.git" }    → ../ndarray
+#   - lance-graph-contract = { git = ".../lance-graph.git" } → ../lance-graph/crates/lance-graph-contract
+# ndarray is intentionally NOT patched here: the workspace already pulls the
+# AdaWorldAPI fork via `git = "..."` AND `[patch.crates-io]` above redirects
+# crates.io's ndarray to the same fork. Adding a third source for the same
+# crate via path-patch produces a "previously selected package" conflict
+# in Cargo.lock. If you want LOCAL edits to /home/user/ndarray to be picked
+# up by surrealdb-core, edit the workspace dep at line ~154 to `path = "../ndarray"`
+# directly (and pair with a matching change in `[patch.crates-io]`).
+
+[patch."https://github.com/AdaWorldAPI/lance-graph.git"]
+lance-graph-contract = { path = "../lance-graph/crates/lance-graph-contract" }
