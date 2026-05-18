@@ -1,0 +1,16 @@
+[package]
+name = "surrealdb-ractor"
+version = "0.1.0"
+edition = "2024"
+license-file = "../LICENSE"
+description = "Glue #1 — SurrealDB live queries / change-feed events → ractor actor mailboxes (Sprint 1 stub)"
+
+# See §5 of .claude/plans/integration-plan.md for the full API sketch.
+
+[dependencies]
+surrealdb = { path = "../surrealdb", default-features = false }
+ractor = "*"
+arrow-array = "*"
+futures = "*"
+anyhow = "*"
+tokio = { version = "*", features = ["rt-multi-thread", "macros"] }

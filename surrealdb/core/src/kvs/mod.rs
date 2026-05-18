@@ -17,6 +17,9 @@
 
 pub mod config;
 pub mod export;
+// Glue #2 — additive MvccSource trait (PD HLC via kv-tikv-native-mvcc, or local generated counter elsewhere).
+// See .claude/plans/integration-plan.md §1 + §5b (Sprint 2).
+pub mod mvcc_source;
 
 mod api;
 mod batch;

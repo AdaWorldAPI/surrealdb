@@ -25,6 +25,11 @@ members = [
     "profiling",
 ]
 
+exclude = [
+    # Sprint 1 scaffold of Glue #1 (see .claude/plans/integration-plan.md §5).
+    "surrealdb-ractor",
+]
+
 [workspace.package]
 authors = ["Tobie Morgan Hitchcock <tobie@surrealdb.com>"]
 edition = "2024"
