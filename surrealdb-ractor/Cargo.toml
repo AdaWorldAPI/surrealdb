@@ -3,7 +3,7 @@ name = "surrealdb-ractor"
 version = "0.1.0"
 edition = "2024"
 license-file = "../LICENSE"
-description = "Glue #1 — SurrealDB live queries / change-feed events → ractor actor mailboxes (Sprint 1 stub)"
+description = "Glue #1 — SurrealDB live queries / change-feed events → ractor actor mailboxes (Sprint 1)"
 
 # See §5 of .claude/plans/integration-plan.md for the full API sketch.
 
@@ -13,9 +13,15 @@ description = "Glue #1 — SurrealDB live queries / change-feed events → racto
 [workspace]
 
 [dependencies]
-surrealdb = { path = "../surrealdb", default-features = false }
+# kv-mem enables the in-memory engine used in tests and the `mem://` URL scheme.
+# kv-mem also gates ExtraFeatures::LiveQueries for the local router (engine/any/native.rs).
+surrealdb = { path = "../surrealdb", default-features = false, features = ["kv-mem"] }
 ractor = "*"
 arrow-array = "*"
+arrow-schema = "*"
 futures = "*"
 anyhow = "*"
-tokio = { version = "*", features = ["rt-multi-thread", "macros"] }
+serde_json = "*"
+serde = { version = "*", features = ["derive"] }
+tracing = "*"
+tokio = { version = "*", features = ["rt-multi-thread", "macros", "time"] }
