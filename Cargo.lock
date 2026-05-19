@@ -5926,7 +5926,8 @@ dependencies = [
 
 [[package]]
 name = "lance-graph-contract"
-version = "0.2.0"
+version = "0.1.0"
+source = "git+https://github.com/AdaWorldAPI/lance-graph.git#b5264854f0c32e57289dd8d02943508985618dc5"
 dependencies = [
  "glob",
  "serde",
