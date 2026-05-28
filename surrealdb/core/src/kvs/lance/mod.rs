@@ -76,7 +76,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use lance::Dataset as LanceDataset;
 use lance::dataset::WriteParams;
-use lance_index::{DatasetIndexExt, IndexType};
+use lance::index::DatasetIndexExt;
+use lance_index::IndexType;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use tokio::sync::RwLock;
 
