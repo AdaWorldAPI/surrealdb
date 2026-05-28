@@ -495,7 +495,7 @@ panic = 'unwind'
 # crates.io 0.17.2 (used by ort). They have distinct TypeIds, so any
 # value flowing between them would require a conversion.
 #
-# Scope: 0.17 line only. `lance-index 4.0` depends on `ndarray = "0.16"`,
+# Scope: 0.17 line only. `lance-index 6.0` still depends on `ndarray = "0.16"`,
 # a separate major version that this patch does not affect; eliminating
 # that crates.io 0.16 entry requires upstream lance-index to bump.
 [patch.crates-io]
