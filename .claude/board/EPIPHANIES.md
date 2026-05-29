@@ -57,3 +57,22 @@ guard invariant 1; invariant 2 needs new range-scan tests once
 
 **Cross-ref:** `lance/mod.rs:362-417` (get path), `lance/mod.rs:607-642`
 (scan_impl), `lance-backend/README.md` § "Transaction Model".
+
+## 2026-05-29 — kvs-lance Timeline: Lance-native versioning IS the time-series view
+**Status:** FINDING
+**Scope:** surrealdb/core/src/kvs/lance/{timeline.rs,mod.rs}
+
+The "SurrealDB-as-view-over-Lance" (Rubicon) surface needs no new storage:
+Lance 6.0.0 already exposes the full timeline. `Dataset::versions() ->
+Vec<Version{version:u64, timestamp:DateTime<Utc>, metadata}>` enumerates the
+history; `checkout_version(u64)` pins an immutable snapshot. Confirmed against
+fetched lance-6.0.0 source (dataset.rs:202 Version struct; dataset.rs:2000
+versions()) AND against in-org usage in lance-graph
+crates/lance-graph/src/graph/versioned.rs:432. The new `Timeline` /
+`TimelineView` types are read-only BY CONSTRUCTION (they own a checked-out
+snapshot, expose no set/del/commit), so "SurrealDB never mutates the leading
+store" is a type-system guarantee, not a convention. Per-key time-travel
+(`checkout_version` + tombstone-as-data) was already wired in get()/scan_impl();
+this only adds the timeline *enumeration* + a read-only view handle. Compiles
+clean under `cargo check -p surrealdb-core --features kv-lance` (Finished, 0
+errors; the only warnings are never-used on the not-yet-wired consumer side).

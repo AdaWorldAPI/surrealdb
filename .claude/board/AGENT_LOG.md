@@ -72,3 +72,26 @@
   one work path).
 
 **Commit(s):** _filled in by the committing session_
+
+## 2026-05-29 — kvs-lance time-series view (SoA/Rubicon step 1)
+**Branch:** claude/sleepy-cori-aRK2x
+**Added:**
+- `kvs/lance/timeline.rs` (264 LOC) — `Timeline` (read-only view over Lance
+  version history) + `TimelineView` (immutable snapshot at one version) +
+  `VersionInfo{version:u64, timestamp_us:Option<i64>}`. Uses only confirmed
+  Lance 6.0.0 surface: versions(), checkout_version(), version().version,
+  scan().project()/filter(). Tombstone-aware reads.
+- `kvs/lance/mod.rs` — `Datastore::timeline()` accessor (shares the live
+  dataset handle, no second open).
+- `kvs/mvcc_source.rs` (170 LOC) — `MvccSource` trait + `LocalGeneratedMvcc`,
+  borrowed verbatim from reverted PR #24 (2a54a32); additive, dead_code-gated
+  until its consumer (kv-tikv native MVCC / lance version source) lands.
+- `kvs/lance/tests.rs` — 2 tests: versions grow+monotone with commits; a
+  historical TimelineView reads the SoA as it stood (present at write version,
+  absent before).
+**Verify:** `cargo check -p surrealdb-core --features kv-lance` → Finished, 0
+errors (6m43s cold). Timeline tests: see commit (run pending at log time).
+**Deferred (per user):** thinking-style i4-32 `I4x32::pack/unpack` are todo!()
+in lance-graph-contract (carrier glitch) — NOT touched; wiring first.
+**Next:** ractor mailbox owns SoA → publishes link onto this timeline (kanban);
+EpisodicWitness64; replace BindSpace; wire deprecated→cognitive-shader-driver.

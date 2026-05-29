@@ -36,6 +36,7 @@ mod indxdb;
 #[cfg(feature = "kv-lance")]
 mod lance;
 mod mem;
+mod mvcc_source;
 mod rocksdb;
 mod surrealkv;
 mod tikv;

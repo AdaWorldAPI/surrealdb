@@ -1900,3 +1900,94 @@ async fn writepath_legacy_commit_gate_provides_snapshot_iso() {
 
     ds.shutdown().await.expect("shutdown");
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Timeline — read-only time-series view (the Rubicon "SurrealDB-as-view")
+// ──────────────────────────────────────────────────────────────────────────
+
+/// The timeline enumerates Lance's native version history and that history
+/// grows by (at least) one entry per committed transaction.
+#[tokio::test]
+async fn test_timeline_versions_grow_with_commits() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("path is valid UTF-8");
+	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+	let timeline = ds.timeline();
+	let v_start = timeline.versions().await.expect("versions @ start").len();
+
+	// Two committed write transactions → at least two new Lance versions.
+	for (k, v) in [(b"a".as_ref(), b"1".as_ref()), (b"b".as_ref(), b"2".as_ref())] {
+		let tx = ds.transaction(true, false).await.expect("tx");
+		tx.set(k.to_vec(), v.to_vec()).await.expect("set");
+		tx.commit().await.expect("commit");
+	}
+
+	let versions = timeline.versions().await.expect("versions @ end");
+	assert!(
+		versions.len() >= v_start + 2,
+		"expected ≥{} versions after 2 commits, got {}",
+		v_start + 2,
+		versions.len()
+	);
+	// Version numbers are monotone non-decreasing along the timeline.
+	for w in versions.windows(2) {
+		assert!(w[0].version <= w[1].version, "timeline not monotone: {:?}", versions);
+	}
+	// The latest entry matches the datastore's current version.
+	let latest = timeline.latest_version().await;
+	assert_eq!(
+		versions.last().map(|vi| vi.version),
+		Some(latest),
+		"timeline tail must equal current_version"
+	);
+
+	ds.shutdown().await.expect("shutdown");
+}
+
+/// A historical [`TimelineView`] reads the SoA as it stood at that version:
+/// a key written at version N is absent from a view pinned before N and
+/// present from the view at/after N.
+#[tokio::test]
+async fn test_timeline_view_reads_historical_soa() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("path is valid UTF-8");
+	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+	let timeline = ds.timeline();
+	let v_before = timeline.latest_version().await;
+
+	// Commit a single key.
+	{
+		let tx = ds.transaction(true, false).await.expect("tx");
+		tx.set(b"hist".to_vec(), b"present".to_vec()).await.expect("set");
+		tx.commit().await.expect("commit");
+	}
+	let v_after = timeline.latest_version().await;
+	assert!(v_after > v_before, "commit did not advance the dataset version");
+
+	// View at the latest version sees the value.
+	let view_after = timeline.view_at(v_after).await.expect("view @ after");
+	assert_eq!(view_after.version(), v_after);
+	assert_eq!(
+		view_after.get(&b"hist".to_vec()).await.expect("get @ after").as_deref(),
+		Some(b"present".as_ref()),
+		"view at the write version must see the key"
+	);
+
+	// View at the pre-write version must NOT see the value.
+	let view_before = timeline.view_at(v_before).await.expect("view @ before");
+	assert!(
+		view_before.get(&b"hist".to_vec()).await.expect("get @ before").is_none(),
+		"view before the write must not see the key (time-travel violated)"
+	);
+
+	// scan() at the latest version surfaces the live row.
+	let rows = view_after.scan().await.expect("scan @ after");
+	assert!(
+		rows.iter().any(|(k, v)| k == b"hist" && v == b"present"),
+		"timeline scan must surface the committed row; got {rows:?}"
+	);
+
+	ds.shutdown().await.expect("shutdown");
+}

@@ -66,8 +66,16 @@ mod commit_gate;
 mod flusher;
 mod memtable;
 mod schema;
+mod timeline;
 mod tx_buffer;
 mod wal;
+
+// `Timeline` is consumed now (the `Datastore::timeline()` return type);
+// `TimelineView` + `VersionInfo` are the read-side surface a kanban/replay
+// consumer reaches for next. Re-exported crate-wide so that wiring lands
+// without churn; `allow(unused_imports)` until the first in-tree consumer.
+#[allow(unused_imports)]
+pub(crate) use timeline::{Timeline, TimelineView, VersionInfo};
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -398,6 +406,17 @@ impl Datastore {
 	/// Used to seed `read_version` for new transactions.
 	async fn current_version(&self) -> u64 {
 		self.dataset.read().await.inner.version().version
+	}
+
+	/// Open a read-only [`Timeline`] over this datastore's version history.
+	///
+	/// This is the "SurrealDB-as-view-over-Lance" surface (the Rubicon
+	/// ruling): the timeline enumerates Lance's native dataset versions and
+	/// hands out immutable [`TimelineView`]s. It shares the same dataset
+	/// handle as live transactions — no second open — and exposes reads
+	/// only, so it cannot mutate the leading store.
+	pub(crate) fn timeline(&self) -> Timeline {
+		Timeline::new(Arc::clone(&self.dataset))
 	}
 
 	/// Test-only accessor for the underlying dataset Arc.
