@@ -1906,12 +1906,27 @@ async fn writepath_legacy_commit_gate_provides_snapshot_iso() {
 // ──────────────────────────────────────────────────────────────────────────
 
 /// The timeline enumerates Lance's native version history and that history
-/// grows by (at least) one entry per committed transaction.
+/// grows by one entry per committed transaction.
+///
+/// Uses `WritePath::LegacyCommitGate`: only the gate path makes every commit
+/// land synchronously as its own Lance dataset version. On the default
+/// `LsmWithWal` path, commits batch through the WAL+memtable and the
+/// background flusher migrates them into Lance asynchronously, so the
+/// timeline reflects *flush boundaries*, not individual commits — the
+/// correct granularity for a per-commit Rubicon kanban is the gate path.
 #[tokio::test]
 async fn test_timeline_versions_grow_with_commits() {
 	let path = unique_tmp_path();
 	let path_str = path.to_str().expect("path is valid UTF-8");
-	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+	let ds = Datastore::new(
+		path_str,
+		LanceConfig {
+			write_path: WritePath::LegacyCommitGate,
+			..LanceConfig::default()
+		},
+	)
+	.await
+	.expect("create");
 
 	let timeline = ds.timeline();
 	let v_start = timeline.versions().await.expect("versions @ start").len();
@@ -1952,7 +1967,18 @@ async fn test_timeline_versions_grow_with_commits() {
 async fn test_timeline_view_reads_historical_soa() {
 	let path = unique_tmp_path();
 	let path_str = path.to_str().expect("path is valid UTF-8");
-	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+	// LegacyCommitGate: each commit lands synchronously as its own Lance
+	// version, so `v_before < v_after` holds per-commit (see the companion
+	// test's note on the LSM flush-boundary semantics).
+	let ds = Datastore::new(
+		path_str,
+		LanceConfig {
+			write_path: WritePath::LegacyCommitGate,
+			..LanceConfig::default()
+		},
+	)
+	.await
+	.expect("create");
 
 	let timeline = ds.timeline();
 	let v_before = timeline.latest_version().await;

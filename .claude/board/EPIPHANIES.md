@@ -76,3 +76,21 @@ store" is a type-system guarantee, not a convention. Per-key time-travel
 this only adds the timeline *enumeration* + a read-only view handle. Compiles
 clean under `cargo check -p surrealdb-core --features kv-lance` (Finished, 0
 errors; the only warnings are never-used on the not-yet-wired consumer side).
+
+## 2026-05-30 — kvs-lance timeline granularity = write-path-dependent (corrects 2026-05-29)
+**Status:** FINDING
+**Scope:** surrealdb/core/src/kvs/lance/{timeline.rs,tests.rs}
+
+The 2026-05-29 timeline tests wrongly assumed "1 commit = 1 Lance version".
+On the DEFAULT `WritePath::LsmWithWal`, commits land in WAL+memtable and the
+background flusher batches them into Lance asynchronously — so the timeline
+reflects FLUSH BOUNDARIES, not individual commits (observed: 2 commits → 1
+version; a single commit left latest_version unchanged). For per-commit
+timeline granularity (which the Rubicon kanban needs — each commit/plan/prune
+a distinct entry) the datastore must use `WritePath::LegacyCommitGate`, where
+`Transaction::commit` returns only after its own Lance commit lands. Tests
+fixed to construct LegacyCommitGate configs; both pass (2/2). The timeline CODE
+was correct; the test HARNESS used the wrong write-path. Design consequence:
+the ractor/kanban consumer that publishes onto the timeline must run on the
+gate path (or call an explicit flush) to get one timeline entry per Rubicon
+commit. Cross-ref: config.rs WritePath docs; writepath_legacy_commit_gate_smoke.
