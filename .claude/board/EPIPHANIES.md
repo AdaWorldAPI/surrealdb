@@ -204,3 +204,28 @@ can coexist but the version-coupling risk is real. Version pin skew: repo on
 lance =6.0.0/arrow 58; spec pins lance 6.0.1/lancedb 0.29/datafusion 53.
 
 **Cross-ref:** PR #29/#30; lance-graph .claude/specs/ (sha d1635db).
+
+## 2026-05-30 — Audit: GRIDLAKE §8 Phase 1 & Phase 2 are IMPLEMENTED, not ROADMAP
+**Status:** FINDING
+**Scope:** surrealdb/core/src/kvs/lance/{flusher,schema,mod}.rs vs .claude/lance-backend/GRIDLAKE.md §8
+
+A fresh-session audit of the tree on `claude/sleepy-cori-aRK2x` (HEAD 55fc45c)
+against the GRIDLAKE §8 phased roadmap finds the §8 tags stale: Phase 1
+(adaptive batching) and Phase 2 (per-row seq) are both shipped + tested while
+§8 still reads ROADMAP / IN PROGRESS. Evidence — Phase 1: `FlusherConfig`
+carries the byte trigger `max_pending_bytes` (flusher.rs:74, default 8 MiB)
+and the rate floor `min_flush_interval` (flusher.rs:79, default 50 ms);
+`should_flush` (flusher.rs:271-285) gates trigger-driven + periodic flushes on
+the floor; locked by `should_flush_triggers_on_bytes` (flusher.rs:441) and
+`should_flush_respects_rate_floor` (flusher.rs:460). Phase 2: `seq: UInt64` is
+the 5th schema column (schema.rs:62), threaded through both batch builders with
+parallel-length assertions (mod.rs:1180 build_write_batch_lance, mod.rs:1242
+build_tombstone_batch_lance); `commit_seq` (mod.rs:177) seeds from the on-disk
+max via `max_persisted_seq` (mod.rs:203-239) — the savant BLOCKER fix — and
+55fc45c fails fast on a legacy 4-column dataset. `cargo check -p surrealdb-core
+--features kv-lance --tests` → 0 errors, 6 dead-code warnings (unwired
+TimelineView consumer); prior run 98 kvs::lance tests pass. §8 should read
+IMPLEMENTED for Phases 1-2. Per the append-only discipline the GRIDLAKE doc
+body was NOT mutated; this entry is the canonical re-tag record.
+
+**Cross-ref:** commits 7266acf, e329a7a, 55fc45c; GRIDLAKE.md §8; this session's grep/check audit.
