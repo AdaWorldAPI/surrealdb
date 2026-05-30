@@ -267,3 +267,32 @@ kanban UI/renderer (item C) is now **TBD**, not q2. Everything else stands: the
 lance-graph pr-ce64-mb-* specs, the ndarray SoA carrier, the ractor primitive,
 and the kv-lance/#31 substrate are unaffected by this correction.
 **Cross-ref:** INTEGRATION_PLANS.md (corrected this session); AGENT_LOG.md:96-97.
+
+## 2026-05-30 — CORRECTED ARCHITECTURE: per-mailbox triple + pointer table; ractor owns Rubicon phases; EW64+CE64
+**Status:** FINDING / DESIGN-direction (from user, 2026-05-30). Supersedes the
+*framing* of the earlier "Next-arc integration plans" finding (the plan items
+A/B/C still hold, but the backbone below is the corrected model).
+
+- **q2 is OUT OF SCOPE** — it's a separate OSINT-harvesting scaffold (aspiring to
+  a Palantir-Foundry shape), unrelated to this arc. Do not wire it in.
+- **Per-mailbox TRIPLE (1:1:1):** each ractor mailbox owns one BindSpace SoA + one
+  kanban. A **pointer table** meta-coordinates the {mailbox, SoA, kanban} triples
+  as **O(1)** references.
+- **Kanban substrate = ractor mailbox + surrealdb** (kv-lance / Rubicon timeline),
+  NOT q2. Per #31, one card-move = one commit = one version (free).
+- **ractor owns the Rubicon PHASES** ("übernimmt die Phasen"): each phase
+  transition = one commit on the timeline = one kanban move.
+- **Planning:** actor model needs an expansive **pre-planning phase**; the
+  collapsed **final plan runs JIT-adjacent** in the mailbox or as
+  **SurrealQL→elixir-like templates**, inside cognitive-shader-strategy
+  orchestration. **lance-graph-planner must become a DTO** wired to ractor + the
+  surrealdb kanban.
+- **SoA rows:** CausalEdge64 (existing, the pr-ce64-mb-* series) + **EpisodicWitness64
+  (NEW)** → synergies.
+- **AriGraph SPO is partially disconnected** → fix by wiring into **EpisodicWitness64
+  inside the SoA**, fed by BOTH the mailboxes (hot) and cold-path SPO/AriGraph
+  facts. (N1: EW64 payload one layer up, not in kv-lance columns.)
+- **Interpretation flags (need confirmation):** the "SurrealQL→elixir-like
+  templates" layer + the `>` meaning; pointer-table location; pre-plan→JIT
+  collapse boundary. Full model + open decisions in INTEGRATION_PLANS.md (rev 2026-05-30).
+**Cross-ref:** INTEGRATION_PLANS.md (rev); supersedes framing of the two prior 2026-05-30 findings.
