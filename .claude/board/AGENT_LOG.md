@@ -160,3 +160,28 @@ EpisodicWitness64; replace BindSpace; wire deprecated→cognitive-shader-driver.
   per-commit seq on the gate path; max-seq via manifest metadata not a scan.
 
 **Commit(s):** (this commit)
+
+## 2026-05-30T14:40 — phase3-step1 (full-auto session)
+**Branch:** claude/sleepy-cori-aRK2x
+**Scope:**
+- surrealdb/core/src/kvs/config.rs (WritePath::LsmColumnar variant)
+- surrealdb/core/src/kvs/lance/mod.rs (exhaustive write_path dispatch)
+- surrealdb/core/src/kvs/lance/tests.rs (writepath_lsm_columnar_smoke)
+**Verdict:** PASS
+
+**What was done (max 5 lines):**
+- Added the opt-in `WritePath::LsmColumnar` variant (GRIDLAKE §8 Phase 3 seam).
+- Wired it through every write_path match in mod.rs via or-patterns with
+  LsmWithWal (commit dispatch, get + scan_impl snapshot selection, the two
+  read-path `== LsmWithWal` checks) — currently aliases the proven LSM hot path.
+- The single-pass columnar flush builder lands in step-2 behind this seam.
+
+**Tests run:**
+- `cargo check -p surrealdb-core --features kv-lance --tests` → Finished, 6 pre-existing warnings
+- `cargo test -p surrealdb-core --features kv-lance --lib kvs::lance` → 99 passed; 0 failed; 3 ignored
+
+**Open questions / follow-ups:**
+- Step-2: FlusherConfig.columnar flag → do_flush branch → build_columnar_merge_batch
+  (single up-front-sized Arrow builder pass) + extracted execute_merge; parity test.
+
+**Commit(s):** 00f0e12
