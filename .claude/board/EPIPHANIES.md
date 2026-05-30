@@ -250,3 +250,20 @@ EpisodicWitness64-onto-timeline design; writer-of-record vs DataFusion view (F2)
 lance 6.0.0 vs 6.0.1 pin skew. Full matrix + cross-repo diagram in INTEGRATION_PLANS.md.
 
 **Cross-ref:** PR #31; lance-graph/.claude/specs/pr-ce64-mb-{3,4,5}; ndarray 3DGS-4x4-SoA plan; AGENT_LOG.md:96-97.
+
+## 2026-05-30 — CORRECTION: q2 is conjecture; removed from INTEGRATION_PLANS; AriGraph "shipped" retracted
+**Status:** CORRECTION (supersedes the q2 + AriGraph-SHIPPED claims in the
+"2026-05-30 Next-arc integration plans located + consolidated" finding above).
+
+Per user: **q2 is conjecture.** All q2 references have been removed from
+INTEGRATION_PLANS.md — q2 had been cited as the kanban UI (item C), the
+provenance consumer (item B), and a BindSpace driver (item A), none verified
+against the q2 repo. Consequently the earlier finding's claim that **AriGraph
+is SHIPPED (~4.7k LOC, graph/arigraph/)** is **RETRACTED**: that figure was
+sourced only from a q2 knowledge doc. AriGraph's grounded status is now
+**SPEC'D in lance-graph** (pr-ce64-mb-4-arigraph-spo-g); whether the module is
+already shipped must be verified directly in the lance-graph repo. The Rubicon
+kanban UI/renderer (item C) is now **TBD**, not q2. Everything else stands: the
+lance-graph pr-ce64-mb-* specs, the ndarray SoA carrier, the ractor primitive,
+and the kv-lance/#31 substrate are unaffected by this correction.
+**Cross-ref:** INTEGRATION_PLANS.md (corrected this session); AGENT_LOG.md:96-97.

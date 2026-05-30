@@ -27,43 +27,41 @@
 
 ## A. BindSpace → SoA migration
 **Status:** SPEC'D (substrate) + INTENT (replacement).
-**Lives in:** ndarray (SoA carrier math), lance-graph (BindSpace columns + driver), q2 (current BindSpace driver), surrealdb (substrate).
+**Lives in:** ndarray (SoA carrier math), lance-graph (BindSpace columns + driver), surrealdb (substrate).
 **Plans that exist:**
 - `lance-graph:.claude/specs/pr-ce64-mb-3-bindspace-efgh.md` — BindSpace EFGH (the SoA-column expansion).
 - `ndarray:.claude/plans/3DGS-4x4-cognitive-shader-SoA-plan.md` — the **`BindSpace4`** 4-lane SoA carrier (lane0 id, lane1 covariance/edge, lane2 confidence, lane3 time/phase/provenance) + `(4x4)^4` block fanout. This is the numeric substrate BindSpace's columns migrate onto.
 - `surrealdb:.claude/board/AGENT_LOG.md:96-97` — "**replace BindSpace**; wire deprecated→cognitive-shader-driver".
 - `ndarray:.claude/prompts/05_cross_repo_map.md:88-101` — consumer migration tracked (ladybug-rs, crewai-rust use rustynum *via BindSpace*; graph-flow-memory crate planned as AriGraph schema port).
-- Today BindSpace IS the universal DTO (~2087 lines, in cognitive-shader-driver; `q2:.claude/reference/aiwar/INTEGRATION_PLAN_SCHEMA_CHANGES.md`).
+- BindSpace is today's universal DTO, living in the cognitive-shader-driver (a lance-graph crate; patterns.md F) and reached by consumers via rustynum (`ndarray:.claude/prompts/05_cross_repo_map.md:88-101`).
 **Gaps/forks:** "migrate BindSpace's columns onto BindSpace4 SoA" vs "replace BindSpace with kv-lance substrate" are two different endpoints — reconcile. Version-pin skew: surrealdb on lance 6.0.0/arrow 58; lance-graph specs pin lance 6.0.1/lancedb 0.29/datafusion 53.
 
 ## B. AriGraph as a witness arc in the SoA
-**Status:** AriGraph SHIPPED; witness-arc onto-SoA SPEC'D + INTENT.
-**Lives in:** lance-graph (AriGraph + witness), surrealdb (timeline = the arc), q2 (provenance consumer).
+**Status:** AriGraph SPEC'D in lance-graph (shipped-status UNVERIFIED — prior "shipped" claim came from a conjectural source, now retracted; see EPIPHANIES); witness-arc onto-SoA SPEC'D + INTENT.
+**Lives in:** lance-graph (AriGraph + witness), surrealdb (timeline = the arc).
 **Plans that exist:**
-- AriGraph is **SHIPPED** in lance-graph at `crates/lance-graph/src/graph/arigraph/` (~4,696 lines; coordinator `orchestrator.rs`) — `q2:.claude/knowledge/chess-nars-vertical-slice.md:51-61`.
+- AriGraph is referenced by lance-graph's own specs (pr-ce64-mb-4-arigraph-spo-g, below), so it is at least **SPEC'D** there. ⚠️ Any "already shipped / ~4,696 lines / `arigraph/` path / `orchestrator.rs`" detail came from a conjectural source and is REMOVED as unverified — confirm AriGraph's actual status directly in the lance-graph repo.
 - `lance-graph:.claude/specs/pr-ce64-mb-4-arigraph-spo-g.md` — AriGraph SPO-G (the quad/graph form).
 - `lance-graph:.claude/specs/pr-sprint-13-witness-cam-pq.md` — witness + CAM-PQ.
 - Witness ingestion pattern is defined: **`witness → splat → RowDelta → apply()`** (`lance-graph:.claude/pattern.md:236`).
 - `surrealdb:.claude/board/AGENT_LOG.md:97` — "**EpisodicWitness64**" (attach episodic-memory witness to the SoA/timeline).
-- AriGraph already used as a **provenance label** in q2 (`source:"AriGraph"`, `q2:crates/cockpit-server/src/scene_player.rs:150`).
 **Gaps:** "AriGraph as a *witness arc on the Rubicon version-timeline*" (EpisodicWitness64) is **INTENT** — no concrete surrealdb-side design yet for how an episodic-witness edge attaches to `Dataset::versions()` entries. Per invariant N1, the witness payload (CAM hash, SPO-G quad) goes one layer up (in `val`/lance-graph datasets), NOT into kv-lance columns.
 
 ## C. ractor mailbox "Rubicon kanban + mailbox SoA"
 **Status:** SPEC'D (mailbox SoA + ractor supervisor); substrate MERGED; consumer not built.
-**Lives in:** lance-graph (mailbox-SoA + ractor supervisor), ractor (actor/mailbox primitive), surrealdb (Rubicon timeline = publish target), q2 (kanban UI).
+**Lives in:** lance-graph (mailbox-SoA + ractor supervisor), ractor (actor/mailbox primitive), surrealdb (Rubicon timeline = publish target).
 **Plans that exist:**
 - `lance-graph:.claude/specs/pr-ce64-mb-5-mailbox-soa-attentionmask.md` — **mailbox SoA** + attention mask.
 - `lance-graph:.claude/specs/pr-f-1-ractor-supervisor.md` + `pr-g2-ractor-supervisor.md`; pattern F "ractor/BEAM supervisor, design shape-proven" at `crates/cognitive-shader-driver/src/grpc.rs` (`lance-graph:.claude/patterns.md:434,611`).
 - `surrealdb:.claude/board/AGENT_LOG.md:96` — "**ractor mailbox owns SoA → publishes link onto this timeline (kanban)**".
 - ractor primitive: `ractor:ractor/src/port.rs`, `ractor:docs/runtime-semantics.md` (mailbox semantics).
-- Kanban UI exists in q2 (`q2:q2-demos/kanban/*`, `q2:crates/cockpit-server/src/{shader_stream,scene_player}.rs`).
-**Gaps:** the ractor mailbox that *owns the SoA and drives the Rubicon timeline* is **not built**. With #31, the per-commit granularity it needs is now free (every commit = one version), so the build reduces to: ractor mailbox actor → on each card-move, one kv-lance commit (= one timeline/kanban entry) → q2 renders the timeline. Decide writer-of-record (kv-lance direct, the merged path) vs DataFusion-federated view (the F2 fork, EPIPHANIES 2026-05-30).
+**Gaps:** the ractor mailbox that *owns the SoA and drives the Rubicon timeline* is **not built**. With #31, the per-commit granularity it needs is now free (every commit = one version), so the build reduces to: ractor mailbox actor → on each card-move, one kv-lance commit (= one timeline/kanban entry) → a UI renders the timeline (renderer TBD). Decide writer-of-record (kv-lance direct, the merged path) vs DataFusion-federated view (the F2 fork, EPIPHANIES 2026-05-30).
 
 ---
 
 ## Cross-repo map (how A/B/C interlock)
 ```
-q2 kanban UI ─────────────────────────────────┐ (renders)
+UI (renderer TBD) ────────────────────────────┐ (renders)
                                                ▼
 ractor mailbox (owns SoA) ──commit per move──▶ surrealdb kv-lance  ──one version──▶ Rubicon Timeline   [C, substrate=MERGED #31]
         ▲ owns                                   (Substrate row 1, policy-free)        ▲ witnessed by
@@ -72,7 +70,7 @@ ndarray BindSpace4 SoA carrier  ◀──migrate cols── BindSpace (cognitive
         [A: SoA math, SPEC'D]              [A: replace, INTENT]                         [B: witness arc, SHIPPED+INTENT]
                                                                                         (witness→splat→RowDelta→apply)
 ```
-Canonical spec home: **lance-graph/.claude/specs/pr-ce64-mb-* (the CE64-MailBox series)**. Substrate home: **surrealdb kv-lance + timeline (#31)**. SoA-math home: **ndarray**. UI: **q2**.
+Canonical spec home: **lance-graph/.claude/specs/pr-ce64-mb-* (the CE64-MailBox series)**. Substrate home: **surrealdb kv-lance + timeline (#31)**. SoA-math home: **ndarray**. UI: renderer TBD.
 
 ## Open decisions blocking the build
 1. BindSpace endpoint: migrate-onto-BindSpace4 vs replace-with-kv-lance (or both, layered).
