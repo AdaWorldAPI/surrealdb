@@ -236,3 +236,13 @@ EpisodicWitness64; replace BindSpace; wire deprecated→cognitive-shader-driver.
   ENOSPC (13G free); needs more reclaim or a scoped run.
 
 **Commit(s):** (this commit)
+
+## 2026-05-30T16:10 — kv-lance NATIVE REWRITE: orchestration start (full-auto)
+**Branch:** claude/sleepy-cori-aRK2x
+**Scope:** .claude/lance-backend/specs/{00,10,20,30}-*.md
+**Verdict:** IN PROGRESS
+**Plan:** delete hand-rolled LSM (memtable/wal/flusher/commit_gate + WritePath);
+rewire kv-lance to native lance read/write (MergeInsert commit, checkout_version
+reads, lance optimize) — same path lance-graph uses. Pipeline: 1 Opus agent/file
+(mod.rs, config.rs, tests.rs) → savant testers → fix → strip `// ///REVIEW:` →
+clippy (sole gate) → PR → subscribe+fix. tee-only, no compiles until clippy.
