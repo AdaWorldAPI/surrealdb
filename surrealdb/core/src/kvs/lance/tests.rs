@@ -1026,7 +1026,7 @@ async fn test_get_at_specific_version() {
 	tx.cancel().await.expect("cancel");
 
 	// Read at v_after_first → the value as of v1's commit.
-	// ///REVIEW: under "one commit = one lance version" with MergeInsert
+
 	// (delete-then-insert keyed on `key`), whether checkout_version(v1) sees
 	// Some(v1) or None depends on whether lance preserves per-version
 	// deletion vectors. POC tolerates both; we only pin that a version-pinned
@@ -1500,7 +1500,7 @@ async fn test_timeline_versions_grow_with_commits() {
 	}
 
 	let versions = timeline.versions().await.expect("versions @ end");
-	// ///REVIEW: "two commits add ≥2 versions" assumes one-commit-one-version
+
 	// on the native path. If a commit that contains both writes AND a delete
 	// folds into a single version (the intended invariant) this holds; but an
 	// optimize/compaction firing mid-test could also ADD a version. Lower-bound
@@ -1546,7 +1546,7 @@ async fn test_timeline_view_reads_historical_state() {
 		tx.commit().await.expect("commit");
 	}
 	let v_after = timeline.latest_version().await;
-	// ///REVIEW: assumes the single commit advanced the dataset version by ≥1
+
 	// (one-commit-one-version on the native path). Holds unless commits are
 	// coalesced; on the native single path each commit is its own lance
 	// version so `v_after > v_before` should be exact.
@@ -1611,7 +1611,7 @@ async fn test_timeline_write_delete_commit_is_single_atomic_version() {
 	}
 
 	let versions_after = timeline.versions().await.expect("versions after").len();
-	// ///REVIEW: pins "one write+delete commit == exactly ONE new lance
+
 	// version". This is the intended native invariant (writes + tombstones
 	// folded into a single MergeInsert). If the native commit instead applies
 	// inserts and deletes as two separate lance operations this becomes +2 and

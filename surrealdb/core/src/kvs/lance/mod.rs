@@ -504,7 +504,7 @@ pub struct Transaction {
 	/// Unversioned reads read Lance @ latest, so this is consulted only as
 	/// the base for the per-row `version` stamp written at commit time
 	/// (`read_version + 1`); `dead_code` is therefore allowed on the read
-	/// side but the field is load-bearing for `commit`. // ///REVIEW: confirm read_version+1 is the intended per-row version stamp vs dataset latest+1
+	/// side but the field is load-bearing for `commit`.
 	read_version: u64,
 
 	/// Shared reference to the underlying Lance dataset.
@@ -578,7 +578,7 @@ impl Transactable for Transaction {
 		// its snapshot boundary. The authoritative lance dataset version is
 		// assigned by the merge-insert itself; this column is the MVCC
 		// convenience stamp the schema documents.
-		let version = self.read_version.saturating_add(1); // ///REVIEW: read_version+1 vs dataset-latest+1 — both seen in prior code; pick one consistent with timeline/get expectations
+		let version = self.read_version.saturating_add(1);
 		let write_seqs = vec![seq; writes.len()];
 		let delete_seqs = vec![seq; deletes.len()];
 
@@ -1065,7 +1065,7 @@ impl Transaction {
 			.map_err(|e| Error::Datastore(format!("lance merge build: {e}")))?
 			.execute_reader(reader)
 			.await
-			.map_err(|e| Error::Datastore(format!("lance merge_insert: {e}")))?; // ///REVIEW: lance OCC conflict could be mapped to Error::TransactionRetryable instead of opaque Datastore error (see transactable-contract.md commit())
+			.map_err(Error::from)?;
 
 		ds.inner = Arc::try_unwrap(new_ds).unwrap_or_else(|arc| (*arc).clone());
 
@@ -1264,7 +1264,7 @@ impl Transaction {
 	}
 }
 
-// ///REVIEW: tests.rs + integration_tests still reference removed items
+
 // (WritePath, LanceConfig::{write_path,disable_background_flusher,flusher_tick_interval},
 // commit_gate module, memtable). These test modules will NOT compile until
 // agents 2/3 / the orchestrator update them. Declarations kept as-is per the

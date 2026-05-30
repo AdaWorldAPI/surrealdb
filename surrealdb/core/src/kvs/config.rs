@@ -303,7 +303,7 @@ pub struct LanceConfig {
 	/// Whether to enable per-key versioning (MVCC reads via
 	/// `Dataset::checkout(version)`).
 	pub versioned: bool,
-	// ///REVIEW: spec 20-config-rs KEEP list mentions `retention_ns`, but the current LanceConfig never carried it (env-var `SURREAL_LANCE_*` / background_optimizer owns retention). Not adding a field here — flag for agents 1/3 if a struct-level retention knob is actually wanted.
+
 }
 
 #[cfg(feature = "kv-lance")]

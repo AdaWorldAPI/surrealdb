@@ -186,6 +186,11 @@ impl From<lance::Error> for Error {
 			lance::Error::IncompatibleTransaction { .. } => {
 				Error::TransactionConflict(err.to_string())
 			}
+			// lance auto-retries merge commits internally; on exhaustion it
+			// surfaces TooMuchWriteContention -- treat as a retryable conflict.
+			lance::Error::TooMuchWriteContention { .. } => {
+				Error::TransactionConflict(err.to_string())
+			}
 			// Dataset not found — most likely a misconfigured path.
 			lance::Error::DatasetNotFound { .. } => {
 				Error::Datastore(format!("dataset not found: {err}"))
