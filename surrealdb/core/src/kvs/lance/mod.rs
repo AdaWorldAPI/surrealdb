@@ -839,13 +839,12 @@ impl Transactable for Transaction {
 		// past `v` has no business consulting it.
 		if version.is_none()
 			&& matches!(self.write_path, WritePath::LsmWithWal | WritePath::LsmColumnar)
+			&& let Some(entry) = self.memtable.get(&key)
 		{
-			if let Some(entry) = self.memtable.get(&key) {
-				return Ok(match entry.op {
-					MemOp::Set(v) => Some(v),
-					MemOp::Delete => None,
-				});
-			}
+			return Ok(match entry.op {
+				MemOp::Set(v) => Some(v),
+				MemOp::Delete => None,
+			});
 		}
 
 		// (3) Fall through to Lance scan.
@@ -1326,19 +1325,12 @@ impl Transaction {
 			let ds = self.dataset.read().await;
 			let snapshot_result: Option<LanceDataset> =
 				match (self.write_path, version) {
-					(_, Some(v)) => match ds.inner.checkout_version(v).await {
-						Ok(s) => Some(s),
-						Err(_) => None,
-					},
+					(_, Some(v)) => ds.inner.checkout_version(v).await.ok(),
 					(WritePath::LsmWithWal | WritePath::LsmColumnar, None) => {
 						Some(ds.inner.clone())
 					}
 					(WritePath::LegacyCommitGate, None) => {
-						match ds.inner.checkout_version(self.read_version).await
-						{
-							Ok(s) => Some(s),
-							Err(_) => None,
-						}
+						ds.inner.checkout_version(self.read_version).await.ok()
 					}
 				};
 			if let Some(snapshot) = snapshot_result {
