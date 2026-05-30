@@ -7,15 +7,21 @@ use_field_init_shorthand = true
 use_small_heuristics = "Off"
 
 # -----------------------------------
-# Unstable options we would like to use in future
+# Unstable options (nightly-only rustfmt) — DISABLED.
+#
+# Org policy is 99% stable Rust (nightly is reserved for Miri in
+# `ndarray`). The job that would apply these — the pinned
+# `rust-toolchain.nightly` fmt in ci.yml — is not running (GitHub Actions
+# is not enabled on this fork), so these options were enforced by NOTHING
+# while still making stable `cargo fmt` warn and reformat divergently.
+# Commented out so stable `cargo fmt` (toolchain 1.95, per
+# rust-toolchain.toml) is the single authoritative formatter. Re-enable as
+# a block IF/WHEN a nightly-fmt CI job is turned on AND the tree is
+# normalized under it in one dedicated pass.
+# See .claude/board/EPIPHANIES.md (2026-05-30 CI/rustfmt finding).
 # -----------------------------------
 
-imports_granularity = "Module"
-#blank_lines_lower_bound = 1
-group_imports = "StdExternalCrate"
-#indent_style = "Block"
-#match_arm_blocks = true
-#reorder_impl_items = true
-wrap_comments = true
-
-comment_width = 100
+# imports_granularity = "Module"
+# group_imports = "StdExternalCrate"
+# wrap_comments = true
+# comment_width = 100
