@@ -48,8 +48,13 @@ pointer table:
 
 - **Per mailbox (1:1:1):** each ractor mailbox owns one **BindSpace SoA** and one
   **kanban**.
-- **Meta-coordination:** a **pointer table** indexes the {mailbox, SoA, kanban}
-  triples as **O(1)** references. *(Open: where it lives — see §5.)*
+- **Meta-coordination (ractor as meta, direct reach — not detached actors):** a
+  **pointer table** indexes the {mailbox, SoA, kanban} triples as **O(1)**
+  references, and **ractor-as-meta reaches and coordinates the mailboxes through
+  it directly**. The mailboxes therefore **do not run detached** behind slow
+  Tokio messages — the meta touches their SoA/kanban in-process (hot path), and
+  ractor/Tokio messages are kept only for genuine cross-task async boundaries.
+  *(Open: how the meta owns/reaches the triples — see §5.)*
 - **Kanban substrate = ractor mailbox + surrealdb** (kv-lance + Rubicon timeline).
   **Not q2.** Each kanban card-move = one commit = one timeline version (free, per #31).
 - **Rubicon phases:** **ractor owns the phase transitions in Rubicon**
@@ -65,6 +70,13 @@ pointer table:
   **durable** Rubicon commit at the phase boundary. Net: the kanban has two faces
   — a **hot** in-memory projection (no Tokio cost) and a **durable** Rubicon-
   timeline projection (one batched version per phase transition).
+- **Zero-copy SoA on phase transition:** a phase transition drives the
+  **lance-graph SoA update** (the `witness → splat → RowDelta → apply` path).
+  Because the meta reaches the SoA directly (no message-shipped payload), the
+  **cognitive-shader-driver reads the very buffers lance-graph writes** — the SoA
+  is **zero-copy** across the lance-graph-write → shader-read boundary (no
+  marshaling/copy). The CausalEdge64 + EpisodicWitness64 rows (§2) are what the
+  update touches. *(Buffer ownership/mutability contract — see §5.)*
 - **Planning model (pre-planning → JIT):**
   - The actor model needs an explicit **pre-planning phase** with **wide
     expansion potential** (branch / elaborate the plan up front).
@@ -153,3 +165,5 @@ Actor/mailbox primitive: **ractor**. Planner: **lance-graph-planner → DTO**.
 6. **AriGraph shipped-status** — verify directly in the lance-graph repo (prior "shipped" claim was retracted).
 7. **Version-pin skew** — surrealdb on lance 6.0.0/arrow 58 vs lance-graph specs on lance 6.0.1/lancedb 0.29/datafusion 53.
 8. **Hot-path kanban mechanism** — exact ractor mechanism to keep kanban updates off the per-message Tokio path: same-actor in-handler mutation vs a shared `Arc`/arc-swap/lock-free snapshot resolved via the pointer table; and where the durable-commit batching boundary sits (one Rubicon version per phase transition, not per message).
+9. **Meta ownership/reach model** — how ractor-as-meta owns & reaches the triples *without* detaching each mailbox as a separate message-driven Tokio task: one meta task owning all triples vs shared `Arc`/lock-free handles resolved via the pointer table — and what still legitimately needs an async message boundary.
+10. **Zero-copy SoA contract** — buffer ownership + lifetime/visibility between lance-graph `apply()` (writer, on phase transition) and the cognitive-shader-driver (reader): which buffers are shared, and how to reconcile Arrow's immutable-buffer convention with a mutable per-mailbox SoA (e.g. double-buffer / arena / mutable column read each pass) so `apply` doesn't reallocate the columns the driver holds.

@@ -310,3 +310,22 @@ boundary (one version per phase transition, not per message). Kanban thus has tw
 faces: a hot in-memory projection (no Tokio cost) + a durable Rubicon-timeline
 projection. Recorded in INTEGRATION_PLANS.md §1 (Hot path bullet) + §5(8).
 **Cross-ref:** INTEGRATION_PLANS.md (rev 2026-05-30).
+
+## 2026-05-30 — REFINEMENT (cont.): ractor-as-meta reaches mailboxes directly; zero-copy SoA on phase transition
+**Status:** DESIGN refinement (user nudge, 2026-05-30; extends the hot-path entry above).
+- **ractor as meta, direct reach (not detached):** if ractor-as-meta can reach &
+  coordinate the mailboxes through the O(1) pointer table, the mailboxes **do not
+  need to run detached** behind slow Tokio messages — the meta touches their
+  SoA/kanban in-process; Tokio messages are reserved for genuine cross-task async
+  boundaries only. Fewer Tokio tasks, no per-coordination message cost.
+- **Zero-copy SoA on phase transition:** the phase transition drives lance-graph's
+  SoA update (`witness→splat→RowDelta→apply`); because the meta reaches the SoA
+  directly, the **cognitive-shader-driver reads the very buffers lance-graph
+  writes** → **zero-copy** across the write→read boundary (no marshaling). CE64 +
+  EW64 rows are what the update touches.
+- **Open contracts:** meta ownership/reach model (one meta task owning all triples
+  vs shared Arc/lock-free handles); and the zero-copy buffer contract — reconcile
+  Arrow's immutable-buffer convention with a mutable per-mailbox SoA (double-buffer
+  / arena / mutable column) so `apply` doesn't reallocate columns the driver holds.
+Recorded in INTEGRATION_PLANS.md §1 (Meta-coordination + Zero-copy bullets) + §5(9,10).
+**Cross-ref:** INTEGRATION_PLANS.md (rev 2026-05-30); extends the hot-path refinement entry.
