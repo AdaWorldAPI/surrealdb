@@ -20,6 +20,12 @@
 //!                            this version. Lance's native deletion
 //!                            vectors handle this too, but we keep an
 //!                            explicit column for visibility in scans.
+//!  seq:        UInt64       — per-commit transaction sequence number.
+//!                            Distinct from `version` (which is
+//!                            batch-granular / per-flush): every row
+//!                            written by one transaction shares one
+//!                            `seq`, so per-commit replay is decoupled
+//!                            from physical batching. NOT NULL.
 //! ```
 //!
 //! ## Future extension: typed columns
@@ -53,6 +59,7 @@ impl KvSchema {
 			Field::new("val", DataType::Binary, false),
 			Field::new("version", DataType::UInt64, false),
 			Field::new("tombstone", DataType::Boolean, false),
+			Field::new("seq", DataType::UInt64, false),
 		])
 	}
 
@@ -83,6 +90,10 @@ impl KvSchema {
 		let version_array: UInt64Array =
 			std::iter::repeat_n(version, writes.len()).collect();
 		let tombstone_array = BooleanArray::from(vec![false; writes.len()]);
+		// This helper has no per-row seq input; default `seq = version`.
+		// The production builders in `mod.rs` carry true per-commit seqs.
+		let seq_array: UInt64Array =
+			std::iter::repeat_n(version, writes.len()).collect();
 
 		RecordBatch::try_new(
 			schema,
@@ -91,6 +102,7 @@ impl KvSchema {
 				Arc::new(val_array),
 				Arc::new(version_array),
 				Arc::new(tombstone_array),
+				Arc::new(seq_array),
 			],
 		)
 	}
@@ -116,6 +128,10 @@ impl KvSchema {
 		let version_array: UInt64Array =
 			std::iter::repeat_n(version, deletes.len()).collect();
 		let tombstone_array = BooleanArray::from(vec![true; deletes.len()]);
+		// No per-row seq input here; default `seq = version` (see the
+		// note in `build_write_batch`).
+		let seq_array: UInt64Array =
+			std::iter::repeat_n(version, deletes.len()).collect();
 
 		RecordBatch::try_new(
 			schema,
@@ -124,6 +140,7 @@ impl KvSchema {
 				Arc::new(val_array),
 				Arc::new(version_array),
 				Arc::new(tombstone_array),
+				Arc::new(seq_array),
 			],
 		)
 	}
@@ -167,11 +184,12 @@ mod tests {
 	#[test]
 	fn schema_has_expected_fields() {
 		let schema = KvSchema::arrow_schema();
-		assert_eq!(schema.fields().len(), 4);
+		assert_eq!(schema.fields().len(), 5);
 		assert_eq!(schema.field(0).name(), "key");
 		assert_eq!(schema.field(1).name(), "val");
 		assert_eq!(schema.field(2).name(), "version");
 		assert_eq!(schema.field(3).name(), "tombstone");
+		assert_eq!(schema.field(4).name(), "seq");
 	}
 
 	#[test]
@@ -182,7 +200,7 @@ mod tests {
 		];
 		let batch = KvSchema::build_write_batch(&writes, 42).unwrap();
 		assert_eq!(batch.num_rows(), 2);
-		assert_eq!(batch.num_columns(), 4);
+		assert_eq!(batch.num_columns(), 5);
 	}
 
 	#[test]

@@ -1587,6 +1587,105 @@ async fn lsm_recovery_atomic_multi_op_batch() {
 }
 
 // ============================================================================
+//  Per-commit `seq` column (commit-sequence, distinct from `version`)
+// ============================================================================
+
+/// The `seq` column is present in Lance, carries a per-commit
+/// monotonic sequence number, and two commits that coalesce into a
+/// SINGLE Lance version still carry DISTINCT seqs.
+///
+/// Strategy: default LSM path with the flusher ENABLED. Commit two
+/// separate single-key transactions back-to-back (no sleep) so the
+/// background flusher batches both into one `do_flush` → one Lance
+/// version. `shutdown()` drains the flusher so every row is in Lance.
+/// Then scan the raw `seq` column and assert: both keys present, seqs
+/// distinct, and ordered by commit order.
+#[tokio::test]
+async fn seq_column_is_per_commit_monotonic_and_survives_coalescing() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("utf-8 path");
+	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+	let v_before = ds.timeline().latest_version().await;
+
+	// Two distinct commits. Each is its own transaction → its own seq.
+	let tx = ds.transaction(true, false).await.expect("tx1");
+	tx.set(b"seq_a".to_vec(), b"1".to_vec()).await.expect("set a");
+	tx.commit().await.expect("commit a");
+
+	let tx = ds.transaction(true, false).await.expect("tx2");
+	tx.set(b"seq_b".to_vec(), b"2".to_vec()).await.expect("set b");
+	tx.commit().await.expect("commit b");
+
+	// Drain the flusher so both rows are materialised into Lance. The
+	// two commits are issued back-to-back with no `.await` that yields
+	// to the flusher task in between, so the flusher's `notify_pending`
+	// nudges coalesce and the shutdown final-drain writes BOTH rows in
+	// one `do_flush` → exactly ONE new Lance version.
+	ds.shutdown().await.expect("shutdown");
+
+	let v_after = ds.timeline().latest_version().await;
+	assert_eq!(
+		v_after - v_before,
+		1,
+		"the two commits should coalesce into exactly one Lance version \
+		 (delta was {}), so the distinct-seq assertion below proves seqs \
+		 survive coalescing",
+		v_after - v_before
+	);
+
+	let rows = ds.scan_seqs_for_tests().await.expect("scan seqs");
+	let seq_of = |want: &[u8]| -> u64 {
+		rows.iter()
+			.find(|(k, _, tomb)| k.as_slice() == want && !*tomb)
+			.unwrap_or_else(|| panic!("key {:?} missing from Lance seq scan", want))
+			.1
+	};
+	let sa = seq_of(b"seq_a");
+	let sb = seq_of(b"seq_b");
+
+	// Both commits carry a non-zero, DISTINCT seq…
+	assert!(sa > 0, "first commit seq should be > 0, got {sa}");
+	assert_ne!(sa, sb, "coalesced commits must carry distinct seqs");
+	// …and the second commit's seq is strictly greater (monotonic).
+	assert!(sb > sa, "seq must be monotonic across commits: {sa} then {sb}");
+}
+
+/// A delete carries the seq of the transaction that issued it, distinct
+/// from the seq of the earlier transaction that wrote the key — even
+/// though both rows key on the same SurrealDB key. Proves the tombstone
+/// path threads `seq` per-commit too.
+#[tokio::test]
+async fn seq_column_tombstone_carries_deleting_commit_seq() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("utf-8 path");
+	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+	// Commit 1: write the key.
+	let tx = ds.transaction(true, false).await.expect("tx-set");
+	tx.set(b"k".to_vec(), b"v".to_vec()).await.expect("set");
+	tx.commit().await.expect("commit set");
+	// Commit 2 (a later, higher seq): delete it.
+	let tx = ds.transaction(true, false).await.expect("tx-del");
+	tx.del(b"k".to_vec()).await.expect("del");
+	tx.commit().await.expect("commit del");
+
+	ds.shutdown().await.expect("shutdown");
+
+	// The memtable coalesces the key to its latest op (Delete) before
+	// flushing, so Lance holds one tombstone row for `k` carrying the
+	// DELETING transaction's seq — which must be > 0 (a real per-commit
+	// seq, not a default).
+	let rows = ds.scan_seqs_for_tests().await.expect("scan seqs");
+	let row = rows
+		.iter()
+		.find(|(key, _, _)| key.as_slice() == b"k")
+		.expect("key 'k' present in Lance (as tombstone)");
+	assert!(row.2, "row for 'k' should be a tombstone after delete");
+	assert!(row.1 >= 2, "tombstone seq should be the 2nd commit's seq, got {}", row.1);
+}
+
+// ============================================================================
 //  CommitGate as alternative route
 // ============================================================================
 //

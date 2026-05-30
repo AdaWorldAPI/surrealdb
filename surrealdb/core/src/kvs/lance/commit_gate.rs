@@ -324,7 +324,13 @@ async fn execute_batch(dataset: &Arc<RwLock<DatasetHandle>>, batch: Vec<Submissi
 		}
 	}
 
-	let result = single_lance_commit(dataset, writes, deletes, max_version).await;
+	// The legacy gate does not track a per-row commit seq (that lives on
+	// the LSM memtable path); stamp every row with `max_version` so the
+	// non-null `seq` column is populated consistently with `version`.
+	let write_seqs = vec![max_version; writes.len()];
+	let delete_seqs = vec![max_version; deletes.len()];
+	let result =
+		single_lance_commit(dataset, writes, write_seqs, deletes, delete_seqs, max_version).await;
 
 	let outcome = match &result {
 		Ok(()) => BatchOutcome::Ok,
@@ -361,7 +367,9 @@ async fn execute_batch(dataset: &Arc<RwLock<DatasetHandle>>, batch: Vec<Submissi
 async fn single_lance_commit(
 	dataset: &Arc<RwLock<DatasetHandle>>,
 	writes: Vec<(Key, Val)>,
+	write_seqs: Vec<u64>,
 	deletes: Vec<Key>,
+	delete_seqs: Vec<u64>,
 	version: u64,
 ) -> Result<()> {
 	use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
@@ -375,13 +383,13 @@ async fn single_lance_commit(
 	let mut batches: Vec<arrow_array::RecordBatch> = Vec::with_capacity(2);
 	if !writes.is_empty() {
 		batches.push(
-			super::Transaction::build_write_batch_lance(&writes, version)
+			super::Transaction::build_write_batch_lance(&writes, version, &write_seqs)
 				.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?,
 		);
 	}
 	if !deletes.is_empty() {
 		batches.push(
-			super::Transaction::build_tombstone_batch_lance(&deletes, version)
+			super::Transaction::build_tombstone_batch_lance(&deletes, version, &delete_seqs)
 				.map_err(|e| Error::Datastore(format!("lance build tombstones: {e}")))?,
 		);
 	}

@@ -79,7 +79,7 @@ pub(crate) use timeline::{Timeline, TimelineView, VersionInfo};
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use lance::Dataset as LanceDataset;
@@ -166,6 +166,15 @@ pub struct Datastore {
 	/// `None` when [`LanceConfig::disable_background_flusher`] is set
 	/// (test-only durability scenarios — see config docstring).
 	flusher: Option<Arc<Flusher>>,
+
+	/// Monotonic per-commit sequence counter. Each committing
+	/// transaction fetches one `seq` here (at commit time) and stamps
+	/// it on every row it writes, materialised into Lance's `seq`
+	/// column. Distinct from the memtable `generation` (which paces
+	/// flush boundaries): two commits coalesced into a single Lance
+	/// version still carry distinct `seq`s, so per-commit replay is
+	/// decoupled from physical batching.
+	commit_seq: Arc<AtomicU64>,
 }
 
 /// Opaque handle to a Lance dataset.
@@ -211,6 +220,7 @@ impl Datastore {
 					arrow_schema::Field::new("val", arrow_schema::DataType::Binary, false),
 					arrow_schema::Field::new("version", arrow_schema::DataType::UInt64, false),
 					arrow_schema::Field::new("tombstone", arrow_schema::DataType::Boolean, false),
+					arrow_schema::Field::new("seq", arrow_schema::DataType::UInt64, false),
 				]));
 				let empty_reader = arrow_array::RecordBatchIterator::new(
 					std::iter::empty::<
@@ -300,6 +310,16 @@ impl Datastore {
 		let wal = Wal::open(wal_dir).await?;
 		let replayed = wal.replay().await?;
 
+		// Per-commit sequence counter. Replayed WAL records do not carry
+		// a persisted seq (the WAL is keyed on `generation`), so each
+		// replayed record — one per original commit — is assigned a
+		// fresh monotonic seq here, in WAL order, before any live
+		// transaction can fetch one. Live commits then continue past
+		// this point. This keeps the `seq` column monotonic and
+		// per-commit-distinct across a restart even though the exact
+		// pre-crash seq values are not recovered.
+		let commit_seq = Arc::new(AtomicU64::new(0));
+
 		// Build the memtable. Pre-populate from the replayed WAL so
 		// that the first read after restart returns the same answers
 		// as if the writer had just committed them.
@@ -307,17 +327,21 @@ impl Datastore {
 		let mut max_replayed_gen: u64 = 0;
 		for record in &replayed {
 			max_replayed_gen = max_replayed_gen.max(record.generation);
+			// One seq per replayed commit (record), shared by its ops.
+			let seq = commit_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
 			for op in &record.ops {
 				match op {
-					WalOp::Set { key, val } => memtable.insert(
+					WalOp::Set { key, val } => memtable.insert_with_seq(
 						key.clone(),
 						MemOp::Set(val.clone()),
 						record.generation,
+						seq,
 					),
-					WalOp::Delete { key } => memtable.insert(
+					WalOp::Delete { key } => memtable.insert_with_seq(
 						key.clone(),
 						MemOp::Delete,
 						record.generation,
+						seq,
 					),
 				}
 			}
@@ -371,6 +395,7 @@ impl Datastore {
 			wal,
 			memtable,
 			flusher,
+			commit_seq,
 		})
 	}
 
@@ -398,6 +423,7 @@ impl Datastore {
 			wal: Arc::clone(&self.wal),
 			memtable: Arc::clone(&self.memtable),
 			flusher: self.flusher.clone(),
+			commit_seq: Arc::clone(&self.commit_seq),
 		})
 	}
 
@@ -429,6 +455,53 @@ impl Datastore {
 	#[cfg(test)]
 	pub(super) fn dataset_for_tests(&self) -> &Arc<RwLock<DatasetHandle>> {
 		&self.dataset
+	}
+
+	/// Test-only: scan the Lance dataset @ latest and return every
+	/// row's `(key, seq, tombstone)`, regardless of tombstone state.
+	///
+	/// Used by the `seq`-column tests to assert the per-commit sequence
+	/// number actually landed in Lance after a flush. Mirrors the
+	/// project/stream idiom of [`Transaction::scan_impl`] but projects
+	/// the `key`, `seq`, and `tombstone` columns.
+	#[cfg(test)]
+	pub(super) async fn scan_seqs_for_tests(&self) -> Result<Vec<(Key, u64, bool)>> {
+		use futures::TryStreamExt;
+
+		let ds = self.dataset.read().await;
+		let snapshot = ds.inner.clone();
+		let mut scanner = snapshot.scan();
+		scanner
+			.project(&["key", "seq", "tombstone"])
+			.map_err(|e| Error::Datastore(format!("seq scan project: {e}")))?;
+		let mut stream = scanner
+			.try_into_stream()
+			.await
+			.map_err(|e| Error::Datastore(format!("seq scan stream: {e}")))?;
+
+		let mut out: Vec<(Key, u64, bool)> = Vec::new();
+		while let Some(batch) = stream
+			.try_next()
+			.await
+			.map_err(|e| Error::Datastore(format!("seq scan next: {e}")))?
+		{
+			let key_col = batch
+				.column_by_name("key")
+				.and_then(|c| c.as_any().downcast_ref::<arrow_array::BinaryArray>())
+				.ok_or_else(|| Error::Datastore("seq scan: key column".into()))?;
+			let seq_col = batch
+				.column_by_name("seq")
+				.and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>())
+				.ok_or_else(|| Error::Datastore("seq scan: seq column".into()))?;
+			let tomb_col = batch
+				.column_by_name("tombstone")
+				.and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>())
+				.ok_or_else(|| Error::Datastore("seq scan: tombstone column".into()))?;
+			for i in 0..batch.num_rows() {
+				out.push((key_col.value(i).to_vec(), seq_col.value(i), tomb_col.value(i)));
+			}
+		}
+		Ok(out)
 	}
 
 	/// Shut down the datastore, flushing any background tasks.
@@ -526,6 +599,11 @@ pub struct Transaction {
 	/// `LanceConfig::disable_background_flusher` is set (mirrors
 	/// the `Datastore` field).
 	flusher: Option<Arc<Flusher>>,
+
+	/// Shared per-commit sequence counter (see the `Datastore` field).
+	/// `commit_lsm` fetches one `seq` from here per transaction and
+	/// stamps every written row with it.
+	commit_seq: Arc<AtomicU64>,
 }
 
 #[async_trait]
@@ -939,6 +1017,10 @@ impl Transaction {
 		deletes: Vec<Key>,
 	) -> Result<()> {
 		let generation = self.memtable.next_generation();
+		// One per-commit seq for this transaction; every row it writes
+		// carries it into Lance's `seq` column. Independent of
+		// `generation` so coalesced commits keep distinct seqs.
+		let seq = self.commit_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
 
 		let mut wal_ops = Vec::with_capacity(writes.len() + deletes.len());
 		for (k, v) in &writes {
@@ -961,10 +1043,10 @@ impl Transaction {
 		// WAL is durable — now apply to memtable. Order matters:
 		// readers should never see a key whose WAL append failed.
 		for (k, v) in writes {
-			self.memtable.insert(k, MemOp::Set(v), generation);
+			self.memtable.insert_with_seq(k, MemOp::Set(v), generation, seq);
 		}
 		for k in deletes {
-			self.memtable.insert(k, MemOp::Delete, generation);
+			self.memtable.insert_with_seq(k, MemOp::Delete, generation, seq);
 		}
 		Ok(())
 	}
@@ -999,6 +1081,7 @@ impl Transaction {
 	pub(super) fn build_write_batch_lance(
 		writes: &[(crate::kvs::Key, crate::kvs::Val)],
 		version: u64,
+		seqs: &[u64],
 	) -> std::result::Result<
 		arrow_array::RecordBatch,
 		arrow_schema::ArrowError,
@@ -1007,11 +1090,18 @@ impl Transaction {
 		use arrow_schema::{DataType, Field, Schema};
 		use std::sync::Arc;
 
+		debug_assert_eq!(
+			writes.len(),
+			seqs.len(),
+			"build_write_batch_lance: seqs must be parallel to writes"
+		);
+
 		let schema = Arc::new(Schema::new(vec![
 			Field::new("key", DataType::Binary, false),
 			Field::new("val", DataType::Binary, false),
 			Field::new("version", DataType::UInt64, false),
 			Field::new("tombstone", DataType::Boolean, false),
+			Field::new("seq", DataType::UInt64, false),
 		]));
 
 		let key_array: BinaryArray =
@@ -1020,6 +1110,7 @@ impl Transaction {
 			writes.iter().map(|(_, v)| Some(v.as_slice())).collect();
 		let version_array = UInt64Array::from(vec![version; writes.len()]);
 		let tombstone_array = BooleanArray::from(vec![false; writes.len()]);
+		let seq_array = UInt64Array::from(seqs.to_vec());
 
 		RecordBatch::try_new(
 			schema,
@@ -1028,6 +1119,7 @@ impl Transaction {
 				Arc::new(val_array),
 				Arc::new(version_array),
 				Arc::new(tombstone_array),
+				Arc::new(seq_array),
 			],
 		)
 	}
@@ -1047,16 +1139,24 @@ impl Transaction {
 	pub(super) fn build_tombstone_batch_lance(
 		deletes: &[crate::kvs::Key],
 		version: u64,
+		seqs: &[u64],
 	) -> std::result::Result<arrow_array::RecordBatch, arrow_schema::ArrowError> {
 		use arrow_array::{BinaryArray, BooleanArray, RecordBatch, UInt64Array};
 		use arrow_schema::{DataType, Field, Schema};
 		use std::sync::Arc;
+
+		debug_assert_eq!(
+			deletes.len(),
+			seqs.len(),
+			"build_tombstone_batch_lance: seqs must be parallel to deletes"
+		);
 
 		let schema = Arc::new(Schema::new(vec![
 			Field::new("key", DataType::Binary, false),
 			Field::new("val", DataType::Binary, false),
 			Field::new("version", DataType::UInt64, false),
 			Field::new("tombstone", DataType::Boolean, false),
+			Field::new("seq", DataType::UInt64, false),
 		]));
 
 		let key_array: BinaryArray = deletes.iter().map(|k| Some(k.as_slice())).collect();
@@ -1066,6 +1166,7 @@ impl Transaction {
 		let val_array: BinaryArray = deletes.iter().map(|_| Some(&b""[..])).collect();
 		let version_array = UInt64Array::from(vec![version; deletes.len()]);
 		let tombstone_array = BooleanArray::from(vec![true; deletes.len()]);
+		let seq_array = UInt64Array::from(seqs.to_vec());
 
 		RecordBatch::try_new(
 			schema,
@@ -1074,6 +1175,7 @@ impl Transaction {
 				Arc::new(val_array),
 				Arc::new(version_array),
 				Arc::new(tombstone_array),
+				Arc::new(seq_array),
 			],
 		)
 	}

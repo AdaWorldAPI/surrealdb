@@ -296,22 +296,32 @@ async fn do_flush(
 		return Ok(0);
 	}
 
-	// 2. Partition into writes and deletes for the Lance commit.
+	// 2. Partition into writes and deletes for the Lance commit, carrying
+	//    each row's per-commit `seq` along in a parallel vec so it lands
+	//    in Lance's `seq` column (decoupled from the flush `version`).
 	let mut writes: Vec<(Key, Val)> = Vec::with_capacity(snapshot.len());
+	let mut write_seqs: Vec<u64> = Vec::with_capacity(snapshot.len());
 	let mut deletes: Vec<Key> = Vec::new();
+	let mut delete_seqs: Vec<u64> = Vec::new();
 	let mut flushed_gens: Vec<(Key, u64)> = Vec::with_capacity(snapshot.len());
 	for (k, entry) in &snapshot {
 		flushed_gens.push((k.clone(), entry.generation));
 		match &entry.op {
-			Op::Set(v) => writes.push((k.clone(), v.clone())),
-			Op::Delete => deletes.push(k.clone()),
+			Op::Set(v) => {
+				writes.push((k.clone(), v.clone()));
+				write_seqs.push(entry.seq);
+			}
+			Op::Delete => {
+				deletes.push(k.clone());
+				delete_seqs.push(entry.seq);
+			}
 		}
 	}
 
 	// 3. Commit to Lance — single MergeInsertBuilder + delete pair.
 	//    The version stamp is the flush's `up_to_gen`, monotonic
-	//    across flushes.
-	single_lance_commit(dataset, writes, deletes, up_to_gen).await?;
+	//    across flushes; per-row `seq`s come from the snapshot entries.
+	single_lance_commit(dataset, writes, write_seqs, deletes, delete_seqs, up_to_gen).await?;
 
 	// 4. After Lance commit succeeds, drop the flushed entries from
 	//    the memtable. Newer-generation writes that raced the flush
@@ -342,7 +352,9 @@ async fn do_flush(
 async fn single_lance_commit(
 	dataset: &Arc<RwLock<DatasetHandle>>,
 	writes: Vec<(Key, Val)>,
+	write_seqs: Vec<u64>,
 	deletes: Vec<Key>,
+	delete_seqs: Vec<u64>,
 	version: u64,
 ) -> Result<()> {
 	use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
@@ -356,13 +368,13 @@ async fn single_lance_commit(
 	let mut batches: Vec<arrow_array::RecordBatch> = Vec::with_capacity(2);
 	if !writes.is_empty() {
 		batches.push(
-			super::Transaction::build_write_batch_lance(&writes, version)
+			super::Transaction::build_write_batch_lance(&writes, version, &write_seqs)
 				.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?,
 		);
 	}
 	if !deletes.is_empty() {
 		batches.push(
-			super::Transaction::build_tombstone_batch_lance(&deletes, version)
+			super::Transaction::build_tombstone_batch_lance(&deletes, version, &delete_seqs)
 				.map_err(|e| Error::Datastore(format!("lance build tombstones: {e}")))?,
 		);
 	}

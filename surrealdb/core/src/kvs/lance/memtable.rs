@@ -93,10 +93,12 @@ impl Memtable {
 
 	/// Insert / overwrite an entry, defaulting `seq` to `generation`.
 	///
-	/// Convenience for call sites (chiefly unit tests) that don't carry
-	/// a separate transaction sequence number; production write paths
-	/// use [`Self::insert_with_seq`]. Using `generation` as the default
-	/// keeps the per-row `seq` monotonic and distinct for these callers.
+	/// Convenience for the memtable's own unit tests, which don't carry
+	/// a separate transaction sequence number; every production write
+	/// path uses [`Self::insert_with_seq`]. Using `generation` as the
+	/// default keeps the per-row `seq` monotonic and distinct. Gated to
+	/// `#[cfg(test)]` so it isn't dead code in the production build.
+	#[cfg(test)]
 	pub(super) fn insert(&self, key: Key, op: Op, generation: u64) {
 		self.insert_with_seq(key, op, generation, generation);
 	}
