@@ -13,13 +13,30 @@
 //!
 //! ## Trigger conditions
 //!
-//! The flusher fires on the earliest of:
+//! The flusher fires on the earliest of (ClickHouse-parity: rows OR
+//! bytes OR time), subject to a `min_flush_interval` rate floor:
 //!
 //! 1. **`tick_interval`** — periodic timer (default 100 ms).
 //! 2. **`max_pending_rows`** — once the memtable holds more than this
-//!    many entries, the flusher is woken via `trigger()`.
-//! 3. **Shutdown** — the [`Self::shutdown`] handle sends a one-shot
+//!    many entries, the flusher is woken via `notify_pending()`.
+//! 3. **`max_pending_bytes`** — once the summed key+val byte size of
+//!    the memtable crosses this, the flusher flushes regardless of
+//!    row count (large values fill a batch with few rows).
+//! 4. **Shutdown** — the [`Self::shutdown`] handle sends a one-shot
 //!    signal and the flusher does one final drain before exiting.
+//!
+//! ## Rate floor ("too many parts" discipline)
+//!
+//! Each trigger-driven flush is gated by `min_flush_interval` since the
+//! last flush. This prevents a burst of small commits from creating
+//! Lance versions faster than the background optimizer can compact them
+//! (the columnar analogue of ClickHouse's "too many parts"). The
+//! `min_flush_interval` floor gates ALL trigger-driven flushes — periodic
+//! ticks included — so flush latency is bounded by `min_flush_interval`,
+//! which the `flusher_config_defaults_are_sensible` invariant keeps <=
+//! `tick_interval` so a later tick always clears the floor (never
+//! indefinite). Shutdown's final drain bypasses the floor — durability
+//! wins over batching at teardown.
 //!
 //! ## Concurrency contract
 //!
@@ -34,6 +51,9 @@ use std::time::Duration;
 
 use tokio::sync::{Notify, RwLock, oneshot};
 use tracing::{trace, warn};
+// `web_time::Instant` (not `std::time::Instant`) per the repo WASM rule
+// enforced by clippy — see CLAUDE.md "Code Quality Rules".
+use web_time::Instant;
 
 use super::DatasetHandle;
 use super::memtable::{Memtable, Op};
@@ -48,6 +68,15 @@ const TARGET: &str = "surrealdb::core::kvs::lance::flusher";
 pub(super) struct FlusherConfig {
 	pub tick_interval: Duration,
 	pub max_pending_rows: usize,
+	/// BYTES trigger: flush once the summed key+val size of the
+	/// memtable crosses this, regardless of row count. Catches the
+	/// few-large-values case that `max_pending_rows` misses.
+	pub max_pending_bytes: usize,
+	/// Rate floor: never start a trigger-driven flush sooner than this
+	/// since the previous flush. Bounds the rate at which we mint Lance
+	/// versions so the background optimizer can keep up ("too many
+	/// parts" discipline). The shutdown final drain ignores this.
+	pub min_flush_interval: Duration,
 }
 
 impl Default for FlusherConfig {
@@ -61,6 +90,14 @@ impl Default for FlusherConfig {
 			// we want to flush regardless of the timer to keep the
 			// memtable bounded.
 			max_pending_rows: 1000,
+			// 8 MiB of pending key+val bytes. Bounds memtable RAM for
+			// large-value workloads where the row count stays low but
+			// each value is big.
+			max_pending_bytes: 8 * 1024 * 1024,
+			// 50 ms floor between trigger-driven flushes — at most ~20
+			// Lance versions/sec from bursts, leaving the optimizer
+			// headroom to compact.
+			min_flush_interval: Duration::from_millis(50),
 		}
 	}
 }
@@ -142,13 +179,25 @@ async fn flusher_loop(
 	interval.set_missed_tick_behavior(
 		tokio::time::MissedTickBehavior::Delay,
 	);
+	// Last time we started a flush, for the `min_flush_interval` rate
+	// floor. Seeded one interval in the past so the first trigger isn't
+	// needlessly delayed at startup.
+	let mut last_flush = Instant::now()
+		.checked_sub(config.min_flush_interval)
+		.unwrap_or_else(Instant::now);
 	loop {
-		// Wait for: shutdown OR tick OR notify.
+		// Wait for: shutdown OR tick OR notify. `periodic` records
+		// whether this wake came from the timer (which flushes any
+		// non-empty memtable) vs a `notify_pending()` nudge (which
+		// flushes only when a row/byte threshold is crossed).
+		let periodic;
 		tokio::select! {
 			biased;
 			_ = &mut shutdown_rx => {
 				trace!(target: TARGET, "flusher received shutdown — final drain");
 				// Final drain: flush everything up to the current gen.
+				// Bypasses the rate floor — durability beats batching
+				// at teardown.
 				let final_gen = memtable.current_generation();
 				if let Err(e) = do_flush(&dataset, &memtable, &wal, final_gen).await {
 					warn!(target: TARGET, "flusher final drain failed: {e}");
@@ -156,27 +205,34 @@ async fn flusher_loop(
 				return;
 			}
 			_ = interval.tick() => {
-				if memtable.is_empty() {
-					continue;
-				}
+				periodic = true;
 			}
 			_ = notify.notified() => {
-				if memtable.is_empty() {
-					continue;
-				}
+				periodic = false;
 			}
 		}
 
-		// Decide whether to flush now: either threshold crossed or
-		// the timer fired and we have something to do.
-		let pending = memtable.len();
-		if pending == 0 {
+		// Decide whether to flush now (rows OR bytes OR periodic-tick),
+		// subject to the rate floor. Cheapest measure first: an empty
+		// memtable never flushes regardless of why we woke.
+		if memtable.is_empty() {
 			continue;
 		}
+		let pending_rows = memtable.len();
+		let pending_bytes = memtable.pending_bytes();
+		if !should_flush(&config, periodic, pending_rows, pending_bytes, last_flush.elapsed()) {
+			// Threshold not crossed, or the rate floor is still in
+			// effect. A notify that arrives during the floor window is
+			// dropped here; the next periodic tick (or a later notify
+			// once the floor has elapsed) will pick the rows up.
+			continue;
+		}
+
 		// Snapshot the current generation as the flush boundary.
 		// Any commits that land AFTER this point will be visible via
 		// the memtable until the next flush picks them up.
 		let snapshot_gen = memtable.current_generation();
+		last_flush = Instant::now();
 		match do_flush(&dataset, &memtable, &wal, snapshot_gen).await {
 			Ok(flushed) => {
 				trace!(
@@ -191,13 +247,42 @@ async fn flusher_loop(
 			}
 		}
 
-		// If the memtable is still over threshold after the flush
-		// (e.g. heavy concurrent ingress), loop right away rather
-		// than waiting for the next tick.
-		if memtable.len() > config.max_pending_rows {
+		// If the memtable is still over a threshold after the flush
+		// (e.g. heavy concurrent ingress), nudge ourselves to loop
+		// again rather than waiting for the next tick. The rate floor
+		// still applies on that next iteration.
+		if memtable.len() >= config.max_pending_rows
+			|| memtable.pending_bytes() >= config.max_pending_bytes
+		{
 			notify.notify_one();
 		}
 	}
+}
+
+/// Pure trigger decision for the flusher loop — broken out so it can be
+/// unit-tested without spinning up Lance.
+///
+/// Returns `true` when a flush should start now:
+/// - a periodic tick fired (timer paces these; the loop only calls this
+///   with a non-empty memtable), OR
+/// - the row threshold is crossed (`>= max_pending_rows`), OR
+/// - the byte threshold is crossed (`>= max_pending_bytes`),
+///
+/// but only if `since_last_flush >= min_flush_interval` (the rate floor)
+/// — i.e. a trigger never starts a flush sooner than the floor allows.
+fn should_flush(
+	config: &FlusherConfig,
+	periodic: bool,
+	pending_rows: usize,
+	pending_bytes: usize,
+	since_last_flush: Duration,
+) -> bool {
+	if since_last_flush < config.min_flush_interval {
+		return false;
+	}
+	periodic
+		|| pending_rows >= config.max_pending_rows
+		|| pending_bytes >= config.max_pending_bytes
 }
 
 /// Drain everything with `generation <= up_to_gen` into Lance and
@@ -214,22 +299,32 @@ async fn do_flush(
 		return Ok(0);
 	}
 
-	// 2. Partition into writes and deletes for the Lance commit.
+	// 2. Partition into writes and deletes for the Lance commit, carrying
+	//    each row's per-commit `seq` along in a parallel vec so it lands
+	//    in Lance's `seq` column (decoupled from the flush `version`).
 	let mut writes: Vec<(Key, Val)> = Vec::with_capacity(snapshot.len());
+	let mut write_seqs: Vec<u64> = Vec::with_capacity(snapshot.len());
 	let mut deletes: Vec<Key> = Vec::new();
+	let mut delete_seqs: Vec<u64> = Vec::new();
 	let mut flushed_gens: Vec<(Key, u64)> = Vec::with_capacity(snapshot.len());
 	for (k, entry) in &snapshot {
 		flushed_gens.push((k.clone(), entry.generation));
 		match &entry.op {
-			Op::Set(v) => writes.push((k.clone(), v.clone())),
-			Op::Delete => deletes.push(k.clone()),
+			Op::Set(v) => {
+				writes.push((k.clone(), v.clone()));
+				write_seqs.push(entry.seq);
+			}
+			Op::Delete => {
+				deletes.push(k.clone());
+				delete_seqs.push(entry.seq);
+			}
 		}
 	}
 
 	// 3. Commit to Lance — single MergeInsertBuilder + delete pair.
 	//    The version stamp is the flush's `up_to_gen`, monotonic
-	//    across flushes.
-	single_lance_commit(dataset, writes, deletes, up_to_gen).await?;
+	//    across flushes; per-row `seq`s come from the snapshot entries.
+	single_lance_commit(dataset, writes, write_seqs, deletes, delete_seqs, up_to_gen).await?;
 
 	// 4. After Lance commit succeeds, drop the flushed entries from
 	//    the memtable. Newer-generation writes that raced the flush
@@ -260,7 +355,9 @@ async fn do_flush(
 async fn single_lance_commit(
 	dataset: &Arc<RwLock<DatasetHandle>>,
 	writes: Vec<(Key, Val)>,
+	write_seqs: Vec<u64>,
 	deletes: Vec<Key>,
+	delete_seqs: Vec<u64>,
 	version: u64,
 ) -> Result<()> {
 	use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
@@ -274,13 +371,13 @@ async fn single_lance_commit(
 	let mut batches: Vec<arrow_array::RecordBatch> = Vec::with_capacity(2);
 	if !writes.is_empty() {
 		batches.push(
-			super::Transaction::build_write_batch_lance(&writes, version)
+			super::Transaction::build_write_batch_lance(&writes, version, &write_seqs)
 				.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?,
 		);
 	}
 	if !deletes.is_empty() {
 		batches.push(
-			super::Transaction::build_tombstone_batch_lance(&deletes, version)
+			super::Transaction::build_tombstone_batch_lance(&deletes, version, &delete_seqs)
 				.map_err(|e| Error::Datastore(format!("lance build tombstones: {e}")))?,
 		);
 	}
@@ -320,5 +417,54 @@ mod tests {
 		let c = FlusherConfig::default();
 		assert!(c.tick_interval >= Duration::from_millis(10));
 		assert!(c.max_pending_rows >= 1);
+		// Adaptive-batching knobs: a non-trivial byte budget and a
+		// sub-tick rate floor that still leaves the optimizer headroom.
+		assert!(c.max_pending_bytes >= 64 * 1024);
+		assert!(c.min_flush_interval >= Duration::from_millis(1));
+		assert!(
+			c.min_flush_interval <= c.tick_interval,
+			"a periodic tick must never be blocked by the rate floor"
+		);
+	}
+
+	#[test]
+	fn should_flush_triggers_on_rows() {
+		let c = FlusherConfig::default();
+		let past = c.min_flush_interval; // floor satisfied
+		// Below the row threshold and not periodic → no flush.
+		assert!(!should_flush(&c, false, c.max_pending_rows - 1, 0, past));
+		// At/above the row threshold → flush.
+		assert!(should_flush(&c, false, c.max_pending_rows, 0, past));
+	}
+
+	#[test]
+	fn should_flush_triggers_on_bytes() {
+		let c = FlusherConfig::default();
+		let past = c.min_flush_interval; // floor satisfied
+		// Few rows but the byte budget is crossed → flush on bytes.
+		assert!(should_flush(&c, false, 1, c.max_pending_bytes, past));
+		assert!(!should_flush(&c, false, 1, c.max_pending_bytes - 1, past));
+	}
+
+	#[test]
+	fn should_flush_periodic_tick_flushes_nonempty() {
+		let c = FlusherConfig::default();
+		let past = c.min_flush_interval;
+		// A periodic tick flushes even below both thresholds…
+		assert!(should_flush(&c, true, 1, 1, past));
+		// …but the loop never calls us with an empty memtable, so the
+		// rows==0 short-circuit lives in the loop, not here.
+	}
+
+	#[test]
+	fn should_flush_respects_rate_floor() {
+		let c = FlusherConfig::default();
+		// Even a periodic tick AND both thresholds crossed must NOT
+		// flush if we flushed too recently (rate floor not yet met).
+		let too_soon = c.min_flush_interval / 2;
+		assert!(!should_flush(&c, true, c.max_pending_rows, c.max_pending_bytes, too_soon));
+		assert!(!should_flush(&c, false, c.max_pending_rows, c.max_pending_bytes, too_soon));
+		// Exactly at the floor → allowed.
+		assert!(should_flush(&c, false, c.max_pending_rows, 0, c.min_flush_interval));
 	}
 }

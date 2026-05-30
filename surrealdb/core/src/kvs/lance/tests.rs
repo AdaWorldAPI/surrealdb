@@ -1505,6 +1505,298 @@ async fn lsm_recovery_preserves_delete_tombstones() {
     ds2.shutdown().await.expect("shutdown");
 }
 
+/// All-or-nothing (atomicity) of a MULTI-OP transaction across a crash.
+///
+/// The two recovery tests above each use one op per transaction. This
+/// one commits a SINGLE transaction that both writes new keys AND
+/// deletes a pre-existing key, so the whole batch lands as ONE
+/// `WalRecord` (multiple `ops`, one generation). After a simulated
+/// crash + replay every effect of that committed batch must be visible
+/// together — the writes present, the delete applied — proving the WAL
+/// record replays as an atomic unit, not op-by-op.
+///
+/// Same crash-simulation idiom as the tests above (`Box::leak` to skip
+/// the graceful `shutdown`/flusher-drain; `disable_background_flusher`
+/// so the WAL is the sole durability source). Serialized via
+/// `LSM_RECOVERY_SERIAL` for the same manifest-race reason.
+#[tokio::test]
+async fn lsm_recovery_atomic_multi_op_batch() {
+    let _serial = LSM_RECOVERY_SERIAL.lock().await;
+    let path = unique_tmp_path();
+    let path_str = path.to_str().expect("utf-8 path");
+
+    {
+        let ds = Datastore::new(
+            path_str,
+            LanceConfig {
+                disable_background_flusher: true,
+                ..LanceConfig::default()
+            },
+        )
+        .await
+        .expect("ds open #1");
+
+        // Seed a key in its own committed transaction so the later
+        // batch has something pre-existing to delete.
+        let tx = ds.transaction(true, false).await.expect("tx-seed");
+        tx.set(b"victim".to_vec(), b"doomed".to_vec()).await.expect("seed set");
+        tx.commit().await.expect("seed commit");
+
+        // The all-or-nothing batch: two inserts + one delete, all in a
+        // SINGLE transaction → one multi-op WAL record.
+        let tx = ds.transaction(true, false).await.expect("tx-batch");
+        tx.set(b"batch_a".to_vec(), b"AAA".to_vec()).await.expect("set a");
+        tx.set(b"batch_b".to_vec(), b"BBB".to_vec()).await.expect("set b");
+        tx.del(b"victim".to_vec()).await.expect("del victim");
+        tx.commit().await.expect("batch commit");
+
+        Box::leak(Box::new(ds));
+    }
+
+    // Re-open: the multi-op WAL record must replay atomically.
+    let ds2 = Datastore::new(
+        path_str,
+        LanceConfig {
+            disable_background_flusher: true,
+            ..LanceConfig::default()
+        },
+    )
+    .await
+    .expect("ds open #2");
+
+    let tx = ds2.transaction(false, false).await.expect("read tx");
+    // Both inserts from the committed batch are present…
+    assert_eq!(
+        tx.get(b"batch_a".to_vec(), None).await.expect("get a").as_deref(),
+        Some(b"AAA".as_ref()),
+        "batch insert 'batch_a' lost across recovery"
+    );
+    assert_eq!(
+        tx.get(b"batch_b".to_vec(), None).await.expect("get b").as_deref(),
+        Some(b"BBB".as_ref()),
+        "batch insert 'batch_b' lost across recovery"
+    );
+    // …and the delete from the SAME batch is applied (not the old value).
+    assert!(
+        tx.get(b"victim".to_vec(), None).await.expect("get victim").is_none(),
+        "batch delete of 'victim' not applied after recovery — \
+         multi-op WAL record did not replay atomically"
+    );
+    tx.cancel().await.expect("cancel");
+    ds2.shutdown().await.expect("shutdown");
+}
+
+// ============================================================================
+//  Per-commit `seq` column (commit-sequence, distinct from `version`)
+// ============================================================================
+
+/// The `seq` column is present in Lance, carries a per-commit
+/// monotonic sequence number, and two commits that coalesce into a
+/// SINGLE Lance version still carry DISTINCT seqs.
+///
+/// Strategy: default LSM path with the flusher ENABLED. Commit two
+/// separate single-key transactions back-to-back (no sleep) so the
+/// background flusher batches both into one `do_flush` → one Lance
+/// version. `shutdown()` drains the flusher so every row is in Lance.
+/// Then scan the raw `seq` column and assert: both keys present, seqs
+/// distinct, and ordered by commit order.
+#[tokio::test]
+async fn seq_column_is_per_commit_monotonic_and_survives_coalescing() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("utf-8 path");
+	// Widen the periodic tick so it never fires during this short test:
+	// each 1-row commit is below the flush threshold, so NOTHING flushes
+	// until shutdown's final drain, which writes BOTH rows in one
+	// `do_flush` => exactly one Lance version. Deterministic regardless of
+	// disk speed (the prior reliance on "no yielding await" flaked on slow
+	// disks where a 100ms tick could flush commit A alone).
+	let ds = Datastore::new(
+		path_str,
+		LanceConfig {
+			flusher_tick_interval: Some(std::time::Duration::from_secs(3600)),
+			..LanceConfig::default()
+		},
+	)
+	.await
+	.expect("create");
+
+	let v_before = ds.timeline().latest_version().await;
+
+	// Two distinct commits. Each is its own transaction → its own seq.
+	let tx = ds.transaction(true, false).await.expect("tx1");
+	tx.set(b"seq_a".to_vec(), b"1".to_vec()).await.expect("set a");
+	tx.commit().await.expect("commit a");
+
+	let tx = ds.transaction(true, false).await.expect("tx2");
+	tx.set(b"seq_b".to_vec(), b"2".to_vec()).await.expect("set b");
+	tx.commit().await.expect("commit b");
+
+	// Drain the flusher so both rows are materialised into Lance. With the
+	// periodic tick widened above, no timer flush fires and each 1-row
+	// commit is below the size threshold, so the shutdown final-drain is the
+	// ONLY flush -- writing BOTH rows in one `do_flush` => exactly ONE new
+	// Lance version (deterministic; not dependent on commit timing).
+	ds.shutdown().await.expect("shutdown");
+
+	let v_after = ds.timeline().latest_version().await;
+	assert_eq!(
+		v_after - v_before,
+		1,
+		"the two commits should coalesce into exactly one Lance version \
+		 (delta was {}), so the distinct-seq assertion below proves seqs \
+		 survive coalescing",
+		v_after - v_before
+	);
+
+	let rows = ds.scan_seqs_for_tests().await.expect("scan seqs");
+	let seq_of = |want: &[u8]| -> u64 {
+		rows.iter()
+			.find(|(k, _, tomb)| k.as_slice() == want && !*tomb)
+			.unwrap_or_else(|| panic!("key {:?} missing from Lance seq scan", want))
+			.1
+	};
+	let sa = seq_of(b"seq_a");
+	let sb = seq_of(b"seq_b");
+
+	// Both commits carry a non-zero, DISTINCT seq…
+	assert!(sa > 0, "first commit seq should be > 0, got {sa}");
+	assert_ne!(sa, sb, "coalesced commits must carry distinct seqs");
+	// …and the second commit's seq is strictly greater (monotonic).
+	assert!(sb > sa, "seq must be monotonic across commits: {sa} then {sb}");
+}
+
+/// A delete carries the seq of the transaction that issued it, distinct
+/// from the seq of the earlier transaction that wrote the key — even
+/// though both rows key on the same SurrealDB key. Proves the tombstone
+/// path threads `seq` per-commit too.
+#[tokio::test]
+async fn seq_column_tombstone_carries_deleting_commit_seq() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("utf-8 path");
+	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("create");
+
+	// Commit 1: write the key.
+	let tx = ds.transaction(true, false).await.expect("tx-set");
+	tx.set(b"k".to_vec(), b"v".to_vec()).await.expect("set");
+	tx.commit().await.expect("commit set");
+	// Commit 2 (a later, higher seq): delete it.
+	let tx = ds.transaction(true, false).await.expect("tx-del");
+	tx.del(b"k".to_vec()).await.expect("del");
+	tx.commit().await.expect("commit del");
+
+	ds.shutdown().await.expect("shutdown");
+
+	// The memtable coalesces the key to its latest op (Delete) before
+	// flushing, so Lance holds one tombstone row for `k` carrying the
+	// DELETING transaction's seq — which must be > 0 (a real per-commit
+	// seq, not a default).
+	let rows = ds.scan_seqs_for_tests().await.expect("scan seqs");
+	let row = rows
+		.iter()
+		.find(|(key, _, _)| key.as_slice() == b"k")
+		.expect("key 'k' present in Lance (as tombstone)");
+	assert!(row.2, "row for 'k' should be a tombstone after delete");
+	assert!(row.1 >= 2, "tombstone seq should be the 2nd commit's seq, got {}", row.1);
+}
+
+/// REGRESSION (savant BLOCKER): the per-commit `seq` must stay monotonic
+/// ACROSS a restart. Before the fix, `commit_seq` reset to 0 on every open
+/// and was never seeded from the max seq already persisted in Lance, so
+/// post-restart commits re-minted seqs that collided with / regressed below
+/// flushed rows — defeating the column's reason to exist. The fix seeds
+/// `commit_seq` from `max_persisted_seq(Lance)` at open.
+#[tokio::test]
+async fn seq_survives_restart_above_persisted_max() {
+	let _serial = LSM_RECOVERY_SERIAL.lock().await;
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("utf-8 path");
+
+	// Session 1: three commits, then a clean shutdown that drains the
+	// flusher into Lance and truncates the WAL — so the seqs are PERSISTED
+	// and reopen has nothing to replay.
+	{
+		let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("open1");
+		for (k, v) in [
+			(b"r1".as_ref(), b"1".as_ref()),
+			(b"r2".as_ref(), b"2".as_ref()),
+			(b"r3".as_ref(), b"3".as_ref()),
+		] {
+			let tx = ds.transaction(true, false).await.expect("tx");
+			tx.set(k.to_vec(), v.to_vec()).await.expect("set");
+			tx.commit().await.expect("commit");
+		}
+		ds.shutdown().await.expect("shutdown1");
+	}
+
+	// Reopen: commit_seq must be seeded from the persisted max, not 0.
+	let max_before: u64;
+	{
+		let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("open2");
+		let rows = ds.scan_seqs_for_tests().await.expect("scan1");
+		max_before = rows.iter().map(|(_, s, _)| *s).max().expect("seeded rows carry seqs");
+		assert!(max_before > 0, "session-1 rows must carry real seqs, got {max_before}");
+
+		// A new commit in this second lifetime must get a seq ABOVE the
+		// persisted max — proving the counter was seeded, not reset to 0.
+		let tx = ds.transaction(true, false).await.expect("tx-new");
+		tx.set(b"r_new".to_vec(), b"new".to_vec()).await.expect("set new");
+		tx.commit().await.expect("commit new");
+		ds.shutdown().await.expect("shutdown2");
+	}
+
+	// Final reopen: r_new's persisted seq must exceed the prior lifetime's max.
+	let ds = Datastore::new(path_str, LanceConfig::default()).await.expect("open3");
+	let rows = ds.scan_seqs_for_tests().await.expect("scan2");
+	let new_seq = rows
+		.iter()
+		.find(|(k, _, t)| k.as_slice() == b"r_new" && !*t)
+		.expect("r_new present")
+		.1;
+	assert!(
+		new_seq > max_before,
+		"post-restart seq ({new_seq}) must exceed the max persisted seq ({max_before}): \
+		 commit_seq must seed from Lance, not reset to 0"
+	);
+	ds.shutdown().await.expect("shutdown3");
+}
+
+/// On the LegacyCommitGate path every row is stamped `seq == version` (the
+/// gate broadcasts the batch's max version; true per-commit seq fidelity is
+/// an LSM-path-only property — see GRIDLAKE.md §5). Pins that documented
+/// behavior so the gate path's seq semantics don't silently drift.
+#[tokio::test]
+async fn seq_column_gate_path_equals_version() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("utf-8 path");
+	let ds = Datastore::new(
+		path_str,
+		LanceConfig {
+			write_path: WritePath::LegacyCommitGate,
+			..LanceConfig::default()
+		},
+	)
+	.await
+	.expect("create");
+
+	// The gate commits straight to Lance (no flusher), so the row is
+	// materialised immediately.
+	let tx = ds.transaction(true, false).await.expect("tx");
+	tx.set(b"g".to_vec(), b"v".to_vec()).await.expect("set");
+	tx.commit().await.expect("commit");
+
+	let seqs = ds.scan_seqs_for_tests().await.expect("scan seqs");
+	let vers = ds.scan_versions_for_tests().await.expect("scan vers");
+	let seq_g = seqs.iter().find(|(k, _, t)| k.as_slice() == b"g" && !*t).expect("g seq").1;
+	let ver_g = vers.iter().find(|(k, _)| k.as_slice() == b"g").expect("g ver").1;
+	assert!(seq_g > 0, "gate path seq must be non-zero, got {seq_g}");
+	assert_eq!(
+		seq_g, ver_g,
+		"gate path must stamp seq == version (seq={seq_g}, version={ver_g})"
+	);
+
+	ds.shutdown().await.expect("shutdown");
+}
+
 // ============================================================================
 //  CommitGate as alternative route
 // ============================================================================

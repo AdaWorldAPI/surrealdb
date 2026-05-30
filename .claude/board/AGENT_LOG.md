@@ -132,3 +132,31 @@ EpisodicWitness64; replace BindSpace; wire deprecated→cognitive-shader-driver.
   files), so hand-formatted to match surrounding `lance/` style.
 
 **Commit(s):** (this commit)
+
+## 2026-05-30 — Step-2 gridlake: orchestrated build + savant review + BLOCKER fix
+**Branch:** claude/sleepy-cori-aRK2x
+**Scope:**
+- `kvs/lance/{mod,flusher,schema}.rs`, `kvs/config.rs`, `kvs/lance/tests.rs`
+- `.claude/lance-backend/GRIDLAKE.md`, `.rustfmt.toml`, board logs
+**Verdict:** PASS
+
+**What was done (max 5 lines):**
+- Orchestrated Opus agents via file-based A2A (tee -a logs): DOC → 800-line
+  GRIDLAKE architecture; CODE → P1 adaptive batching, P2 WAL atomic-recovery
+  test, P3 per-row `seq` column.
+- 3 read-only savants (no cargo; orchestrator sole cargo runner) reviewed the
+  diff: S2/S3 clean, S1 found 1 BLOCKER + 3 MAJOR + 4 MINOR + 1 NIT.
+- Fixed BLOCKER (seq seeded from persisted Lance max), real length checks,
+  `flusher_tick_interval` knob + deterministic coalescing test, NITs; +2
+  regression tests; documented accepted limitations.
+- `.rustfmt.toml` made stable-honest (org 99%-stable policy).
+
+**Tests run (orchestrator):**
+- `cargo check --features kv-lance --tests` → Finished, 0 errors
+- `cargo test --features kv-lance --lib kvs::lance` → 98 passed, 0 failed, 3 ignored
+
+**Open questions / follow-ups:**
+- Schema migration for pre-`seq` datasets; persist seq in WAL for exact replay;
+  per-commit seq on the gate path; max-seq via manifest metadata not a scan.
+
+**Commit(s):** (this commit)

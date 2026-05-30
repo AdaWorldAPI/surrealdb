@@ -55,6 +55,13 @@ pub(super) enum Op {
 pub(super) struct MemtableEntry {
 	pub op: Op,
 	pub generation: u64,
+	/// Per-commit transaction sequence number. Distinct from
+	/// `generation` (which paces flush boundaries / WAL records): `seq`
+	/// is sourced from a `Datastore`-level commit counter and carried
+	/// per-row into Lance's `seq` column so per-commit replay is
+	/// decoupled from physical batching. Every row written by the same
+	/// transaction shares one `seq`.
+	pub seq: u64,
 }
 
 /// Concurrent in-memory write buffer for the kv-lance backend.
@@ -84,19 +91,37 @@ impl Memtable {
 		self.generation.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
 	}
 
-	/// Insert / overwrite an entry. The newer-generation entry wins
-	/// the contended-key race; callers must always pass a generation
-	/// they just minted from [`Self::next_generation`].
+	/// Insert / overwrite an entry, defaulting `seq` to `generation`.
+	///
+	/// Convenience for the memtable's own unit tests, which don't carry
+	/// a separate transaction sequence number; every production write
+	/// path uses [`Self::insert_with_seq`]. Using `generation` as the
+	/// default keeps the per-row `seq` monotonic and distinct. Gated to
+	/// `#[cfg(test)]` so it isn't dead code in the production build.
+	#[cfg(test)]
 	pub(super) fn insert(&self, key: Key, op: Op, generation: u64) {
+		self.insert_with_seq(key, op, generation, generation);
+	}
+
+	/// Insert / overwrite an entry carrying an explicit per-commit
+	/// `seq`. The newer-generation entry wins the contended-key race
+	/// (and brings its `seq` along); callers must always pass a
+	/// generation they just minted from [`Self::next_generation`].
+	pub(super) fn insert_with_seq(&self, key: Key, op: Op, generation: u64, seq: u64) {
 		self.entries
 			.entry(key)
 			.and_modify(|existing| {
 				if generation > existing.generation {
 					existing.op = op.clone();
 					existing.generation = generation;
+					existing.seq = seq;
 				}
 			})
-			.or_insert(MemtableEntry { op, generation });
+			.or_insert(MemtableEntry {
+				op,
+				generation,
+				seq,
+			});
 	}
 
 	/// Look up an entry by key. Returns `None` if no in-memory write
@@ -169,6 +194,25 @@ impl Memtable {
 
 	pub(super) fn is_empty(&self) -> bool {
 		self.entries.is_empty()
+	}
+
+	/// Summed key+value byte size of all pending entries.
+	///
+	/// This is the flusher's BYTES trigger (ClickHouse-parity: flush on
+	/// rows OR bytes OR time). A `Delete` tombstone carries no value, so
+	/// only its key bytes count. Computed by a single lock-free pass over
+	/// the dashmap — O(entries), the same shape as [`Self::len`]'s shard
+	/// walk but summing sizes; cheap relative to a Lance commit and called
+	/// at most once per flusher wake-up.
+	pub(super) fn pending_bytes(&self) -> usize {
+		let mut total = 0usize;
+		for kv in self.entries.iter() {
+			total = total.saturating_add(kv.key().len());
+			if let Op::Set(v) = &kv.value().op {
+				total = total.saturating_add(v.len());
+			}
+		}
+		total
 	}
 
 	/// Highest generation observed by the counter, NOT necessarily
@@ -287,6 +331,51 @@ mod tests {
 		assert!(m.get(b"c").is_some());
 		assert!(m.get(b"a").is_none());
 		assert!(m.get(b"b").is_none());
+	}
+
+	#[test]
+	fn insert_default_seq_equals_generation() {
+		let m = Memtable::new();
+		let g = m.next_generation();
+		m.insert(b"k".to_vec(), Op::Set(b"v".to_vec()), g);
+		assert_eq!(m.get(b"k").expect("present").seq, g);
+	}
+
+	#[test]
+	fn insert_with_seq_carries_seq_and_race_winner_brings_its_seq() {
+		let m = Memtable::new();
+		let g1 = m.next_generation();
+		let g2 = m.next_generation();
+		// First write carries seq=100.
+		m.insert_with_seq(b"k".to_vec(), Op::Set(b"old".to_vec()), g1, 100);
+		assert_eq!(m.get(b"k").expect("present").seq, 100);
+		// Newer generation wins and brings its own seq=200.
+		m.insert_with_seq(b"k".to_vec(), Op::Set(b"new".to_vec()), g2, 200);
+		let e = m.get(b"k").expect("present");
+		assert_eq!(e.seq, 200);
+		assert_eq!(e.generation, g2);
+	}
+
+	#[test]
+	fn pending_bytes_sums_key_and_val() {
+		let m = Memtable::new();
+		// Empty memtable measures zero bytes.
+		assert_eq!(m.pending_bytes(), 0);
+		let g1 = m.next_generation();
+		let g2 = m.next_generation();
+		// key (3) + val (4) = 7; key (2) + val (6) = 8 → 15 total.
+		m.insert(b"aaa".to_vec(), Op::Set(b"vvvv".to_vec()), g1);
+		m.insert(b"bb".to_vec(), Op::Set(b"vvvvvv".to_vec()), g2);
+		assert_eq!(m.pending_bytes(), 3 + 4 + 2 + 6);
+	}
+
+	#[test]
+	fn pending_bytes_counts_tombstone_key_only() {
+		let m = Memtable::new();
+		let g = m.next_generation();
+		// A Delete entry contributes only its key length (no value).
+		m.insert(b"key".to_vec(), Op::Delete, g);
+		assert_eq!(m.pending_bytes(), 3);
 	}
 
 	#[test]
