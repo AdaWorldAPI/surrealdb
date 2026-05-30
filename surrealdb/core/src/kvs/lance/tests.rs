@@ -1505,6 +1505,87 @@ async fn lsm_recovery_preserves_delete_tombstones() {
     ds2.shutdown().await.expect("shutdown");
 }
 
+/// All-or-nothing (atomicity) of a MULTI-OP transaction across a crash.
+///
+/// The two recovery tests above each use one op per transaction. This
+/// one commits a SINGLE transaction that both writes new keys AND
+/// deletes a pre-existing key, so the whole batch lands as ONE
+/// `WalRecord` (multiple `ops`, one generation). After a simulated
+/// crash + replay every effect of that committed batch must be visible
+/// together — the writes present, the delete applied — proving the WAL
+/// record replays as an atomic unit, not op-by-op.
+///
+/// Same crash-simulation idiom as the tests above (`Box::leak` to skip
+/// the graceful `shutdown`/flusher-drain; `disable_background_flusher`
+/// so the WAL is the sole durability source). Serialized via
+/// `LSM_RECOVERY_SERIAL` for the same manifest-race reason.
+#[tokio::test]
+async fn lsm_recovery_atomic_multi_op_batch() {
+    let _serial = LSM_RECOVERY_SERIAL.lock().await;
+    let path = unique_tmp_path();
+    let path_str = path.to_str().expect("utf-8 path");
+
+    {
+        let ds = Datastore::new(
+            path_str,
+            LanceConfig {
+                disable_background_flusher: true,
+                ..LanceConfig::default()
+            },
+        )
+        .await
+        .expect("ds open #1");
+
+        // Seed a key in its own committed transaction so the later
+        // batch has something pre-existing to delete.
+        let tx = ds.transaction(true, false).await.expect("tx-seed");
+        tx.set(b"victim".to_vec(), b"doomed".to_vec()).await.expect("seed set");
+        tx.commit().await.expect("seed commit");
+
+        // The all-or-nothing batch: two inserts + one delete, all in a
+        // SINGLE transaction → one multi-op WAL record.
+        let tx = ds.transaction(true, false).await.expect("tx-batch");
+        tx.set(b"batch_a".to_vec(), b"AAA".to_vec()).await.expect("set a");
+        tx.set(b"batch_b".to_vec(), b"BBB".to_vec()).await.expect("set b");
+        tx.del(b"victim".to_vec()).await.expect("del victim");
+        tx.commit().await.expect("batch commit");
+
+        Box::leak(Box::new(ds));
+    }
+
+    // Re-open: the multi-op WAL record must replay atomically.
+    let ds2 = Datastore::new(
+        path_str,
+        LanceConfig {
+            disable_background_flusher: true,
+            ..LanceConfig::default()
+        },
+    )
+    .await
+    .expect("ds open #2");
+
+    let tx = ds2.transaction(false, false).await.expect("read tx");
+    // Both inserts from the committed batch are present…
+    assert_eq!(
+        tx.get(b"batch_a".to_vec(), None).await.expect("get a").as_deref(),
+        Some(b"AAA".as_ref()),
+        "batch insert 'batch_a' lost across recovery"
+    );
+    assert_eq!(
+        tx.get(b"batch_b".to_vec(), None).await.expect("get b").as_deref(),
+        Some(b"BBB".as_ref()),
+        "batch insert 'batch_b' lost across recovery"
+    );
+    // …and the delete from the SAME batch is applied (not the old value).
+    assert!(
+        tx.get(b"victim".to_vec(), None).await.expect("get victim").is_none(),
+        "batch delete of 'victim' not applied after recovery — \
+         multi-op WAL record did not replay atomically"
+    );
+    tx.cancel().await.expect("cancel");
+    ds2.shutdown().await.expect("shutdown");
+}
+
 // ============================================================================
 //  CommitGate as alternative route
 // ============================================================================
