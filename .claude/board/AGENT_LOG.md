@@ -185,3 +185,31 @@ EpisodicWitness64; replace BindSpace; wire deprecated→cognitive-shader-driver.
   (single up-front-sized Arrow builder pass) + extracted execute_merge; parity test.
 
 **Commit(s):** 00f0e12
+
+## 2026-05-30T14:58 — phase3-step2 (full-auto session)
+**Branch:** claude/sleepy-cori-aRK2x
+**Scope:**
+- surrealdb/core/src/kvs/lance/flusher.rs (columnar flag, do_flush branch,
+  execute_merge extraction, build_columnar_merge_batch)
+- surrealdb/core/src/kvs/lance/mod.rs (spawn columnar flag)
+- surrealdb/core/src/kvs/config.rs (LsmColumnar doc)
+- surrealdb/core/src/kvs/lance/tests.rs (writepath_lsm_columnar_flush_persists)
+**Verdict:** PASS
+
+**What was done (max 5 lines):**
+- LsmColumnar flush now builds the merge source in ONE up-front-sized Arrow
+  columnar pass over the snapshot (build_columnar_merge_batch) — one fused
+  batch (live + tombstone rows), no row-vec partition, no two-batch concat.
+- FlusherConfig.columnar flag (set from write_path at spawn) branches do_flush;
+  MergeInsertBuilder execution extracted into shared execute_merge.
+- Row path unchanged + default. memtable/WAL stay row-oriented (full SoA = future).
+
+**Tests run:**
+- `cargo test -p surrealdb-core --features kv-lance --lib kvs::lance` → 100 passed; 0 failed; 3 ignored
+
+**Open questions / follow-ups:**
+- GRIDLAKE §6.2 native-Arrow memtable+WAL (SoA, CONJECTURE) still open — this
+  step is the flush-side columnar build only, not a natively columnar memtable.
+- Phase 4 (tombstone GC + version backpressure) is the next roadmap item.
+
+**Commit(s):** d9bfca7
