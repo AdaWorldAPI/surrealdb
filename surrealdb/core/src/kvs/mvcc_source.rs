@@ -53,8 +53,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///   previously returned by the same instance.
 /// - Values need not be consecutive; gaps are permitted (for example, an
 ///   HLC-backed source will return wall-clock milliseconds which can jump).
-/// - Implementations must be `Send + Sync` so they can be stored inside
-///   `Arc<dyn MvccSource>` and shared across Tokio tasks.
+/// - Implementations must be `Send + Sync` so a concrete source can be
+///   shared across Tokio tasks (e.g. `Arc<LocalGeneratedMvcc>`). Note the
+///   trait itself is NOT object-safe: `next_version` uses return-position
+///   `impl Trait` (RPITIT) for zero-cost static dispatch, so `dyn MvccSource`
+///   / `Arc<dyn MvccSource>` will not compile. A future consumer that needs
+///   runtime-pluggable sources can add a boxed-future variant at that point.
 ///
 /// [`next_version`]: MvccSource::next_version
 pub trait MvccSource: Send + Sync {
