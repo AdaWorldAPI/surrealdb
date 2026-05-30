@@ -192,6 +192,46 @@ pub(crate) struct DatasetHandle {
 }
 
 impl Datastore {
+	/// Scan the dataset for the maximum persisted `seq`, so a reopened
+	/// `Datastore` seeds its commit-sequence counter ABOVE every seq
+	/// already written to Lance — keeping `seq` globally monotonic +
+	/// unique across restarts (the per-commit replay axis the column
+	/// exists to provide). Returns 0 for an empty dataset, or a legacy
+	/// dataset created before the `seq` column existed (a documented
+	/// pre-release on-disk migration gap). A future optimization can
+	/// read this from manifest metadata instead of a full scan.
+	async fn max_persisted_seq(ds: &LanceDataset) -> Result<u64> {
+		use futures::TryStreamExt;
+		let mut scanner = ds.scan();
+		// Tolerate a legacy dataset with no `seq` column.
+		if scanner.project(&["seq"]).is_err() {
+			return Ok(0);
+		}
+		let mut stream = scanner
+			.try_into_stream()
+			.await
+			.map_err(|e| Error::Datastore(format!("seq seed scan: {e}")))?;
+		let mut max_seq: u64 = 0;
+		while let Some(batch) = stream
+			.try_next()
+			.await
+			.map_err(|e| Error::Datastore(format!("seq seed next: {e}")))?
+		{
+			if let Some(col) = batch
+				.column_by_name("seq")
+				.and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>())
+			{
+				for i in 0..col.len() {
+					let v = col.value(i);
+					if v > max_seq {
+						max_seq = v;
+					}
+				}
+			}
+		}
+		Ok(max_seq)
+	}
+
 	/// Open or create a Lance-backed datastore at `path`.
 	///
 	/// If a Lance dataset exists at `path`, it is opened. Otherwise, an
@@ -269,6 +309,11 @@ impl Datastore {
 			}
 		}
 
+		// Seed point for the per-commit `seq` counter: the max seq already
+		// persisted to Lance. Computed while we still own `lance_ds`, before
+		// any flusher/txn can write. Empty or legacy (pre-`seq`) dataset → 0.
+		let seq_floor = Self::max_persisted_seq(&lance_ds).await?;
+
 		let dataset_handle = DatasetHandle {
 			path: path.to_string(),
 			inner: lance_ds,
@@ -310,15 +355,19 @@ impl Datastore {
 		let wal = Wal::open(wal_dir).await?;
 		let replayed = wal.replay().await?;
 
-		// Per-commit sequence counter. Replayed WAL records do not carry
-		// a persisted seq (the WAL is keyed on `generation`), so each
-		// replayed record — one per original commit — is assigned a
-		// fresh monotonic seq here, in WAL order, before any live
-		// transaction can fetch one. Live commits then continue past
-		// this point. This keeps the `seq` column monotonic and
-		// per-commit-distinct across a restart even though the exact
-		// pre-crash seq values are not recovered.
-		let commit_seq = Arc::new(AtomicU64::new(0));
+		// Per-commit sequence counter, seeded ABOVE the maximum `seq`
+		// already persisted in Lance (`seq_floor`) so the column stays
+		// globally monotonic + unique across restarts (the per-commit
+		// replay axis it exists to provide). Asymmetry with `generation`
+		// below: `generation` is memtable-local bookkeeping, NOT persisted,
+		// so it need only clear the replayed-WAL tail; `seq` IS a Lance
+		// column, so re-minting from 0 here would collide with / regress
+		// below rows flushed in a prior lifetime (the savant BLOCKER).
+		// Replayed WAL records carry no persisted seq (the WAL is keyed on
+		// `generation`), so each gets a fresh monotonic seq ABOVE the floor,
+		// in WAL order; exact pre-crash seq values are not recovered, but
+		// monotonicity + uniqueness are.
+		let commit_seq = Arc::new(AtomicU64::new(seq_floor));
 
 		// Build the memtable. Pre-populate from the replayed WAL so
 		// that the first read after restart returns the same answers
@@ -382,7 +431,13 @@ impl Datastore {
 				Arc::clone(&dataset_arc),
 				Arc::clone(&memtable),
 				Arc::clone(&wal),
-				FlusherConfig::default(),
+				FlusherConfig {
+					// Tests/ops may widen the periodic tick (None = default).
+					tick_interval: config
+						.flusher_tick_interval
+						.unwrap_or_else(|| FlusherConfig::default().tick_interval),
+					..FlusherConfig::default()
+				},
 			))
 		};
 
@@ -455,6 +510,43 @@ impl Datastore {
 	#[cfg(test)]
 	pub(super) fn dataset_for_tests(&self) -> &Arc<RwLock<DatasetHandle>> {
 		&self.dataset
+	}
+
+	/// Test-only: scan the Lance dataset @ latest for every row's
+	/// `(key, version)`. Companion to [`Self::scan_seqs_for_tests`], used to
+	/// cross-check the `seq` column against the `version` column.
+	#[cfg(test)]
+	pub(super) async fn scan_versions_for_tests(&self) -> Result<Vec<(Key, u64)>> {
+		use futures::TryStreamExt;
+		let ds = self.dataset.read().await;
+		let snapshot = ds.inner.clone();
+		let mut scanner = snapshot.scan();
+		scanner
+			.project(&["key", "version"])
+			.map_err(|e| Error::Datastore(format!("ver scan project: {e}")))?;
+		let mut stream = scanner
+			.try_into_stream()
+			.await
+			.map_err(|e| Error::Datastore(format!("ver scan stream: {e}")))?;
+		let mut out: Vec<(Key, u64)> = Vec::new();
+		while let Some(batch) = stream
+			.try_next()
+			.await
+			.map_err(|e| Error::Datastore(format!("ver scan next: {e}")))?
+		{
+			let key_col = batch
+				.column_by_name("key")
+				.and_then(|c| c.as_any().downcast_ref::<arrow_array::BinaryArray>())
+				.ok_or_else(|| Error::Datastore("ver scan: key column".into()))?;
+			let ver_col = batch
+				.column_by_name("version")
+				.and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>())
+				.ok_or_else(|| Error::Datastore("ver scan: version column".into()))?;
+			for i in 0..batch.num_rows() {
+				out.push((key_col.value(i).to_vec(), ver_col.value(i)));
+			}
+		}
+		Ok(out)
 	}
 
 	/// Test-only: scan the Lance dataset @ latest and return every
@@ -1090,11 +1182,15 @@ impl Transaction {
 		use arrow_schema::{DataType, Field, Schema};
 		use std::sync::Arc;
 
-		debug_assert_eq!(
-			writes.len(),
-			seqs.len(),
-			"build_write_batch_lance: seqs must be parallel to writes"
-		);
+		// Enforced in ALL builds (not just debug): a mismatch would otherwise
+		// surface only as an opaque Arrow "unequal column length" error.
+		if writes.len() != seqs.len() {
+			return Err(arrow_schema::ArrowError::InvalidArgumentError(format!(
+				"build_write_batch_lance: seqs ({}) must be parallel to writes ({})",
+				seqs.len(),
+				writes.len()
+			)));
+		}
 
 		let schema = Arc::new(Schema::new(vec![
 			Field::new("key", DataType::Binary, false),
@@ -1145,11 +1241,13 @@ impl Transaction {
 		use arrow_schema::{DataType, Field, Schema};
 		use std::sync::Arc;
 
-		debug_assert_eq!(
-			deletes.len(),
-			seqs.len(),
-			"build_tombstone_batch_lance: seqs must be parallel to deletes"
-		);
+		if deletes.len() != seqs.len() {
+			return Err(arrow_schema::ArrowError::InvalidArgumentError(format!(
+				"build_tombstone_batch_lance: seqs ({}) must be parallel to deletes ({})",
+				seqs.len(),
+				deletes.len()
+			)));
+		}
 
 		let schema = Arc::new(Schema::new(vec![
 			Field::new("key", DataType::Binary, false),

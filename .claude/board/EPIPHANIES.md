@@ -139,3 +139,35 @@ avoid mixing mass reformat churn into feature commits).
 
 **Cross-ref:** PR #29 check status (0 runs); ci.yml on-block; this commit's
 `.rustfmt.toml` change; GRIDLAKE_BUILD.md.
+
+## 2026-05-30 — Per-commit `seq` reset to 0 on every open → broke cross-restart monotonicity (savant BLOCKER, fixed)
+**Status:** FINDING
+**Scope:** `kvs/lance/mod.rs` (Datastore::new seeding), step-2 P3 seq column
+
+A 3-savant read-only review (Opus: concurrency/ACID, Lance data-model,
+idiom/tests) of step-2 passed 96/0 tests yet caught a BLOCKER tests
+structurally can't see: `commit_seq` was re-initialised to `AtomicU64::new(0)`
+on every `Datastore::new`, seeded only from the replayed (un-flushed) WAL
+record count, and NEVER advanced past the max `seq` already persisted in
+Lance — whereas the sibling `generation` counter IS advanced past the
+replayed-WAL max. After any restart where the WAL was truncated (data already
+flushed), new commits re-minted seq=1,2,3… colliding with / regressing below
+seqs already written to Lance, defeating the column's sole purpose (a globally
+monotonic, per-commit replay axis). Root distinction: `generation` is
+memtable-local and NOT persisted (need only clear the WAL tail); `seq` IS a
+Lance column, so it must seed from the persisted max. FIX:
+`Datastore::max_persisted_seq` (tolerant scan of the `seq` column; 0 for
+empty/legacy) seeds `commit_seq = AtomicU64::new(max_persisted_seq)` at open;
+replayed WAL records mint ABOVE that floor. Regression
+`seq_survives_restart_above_persisted_max` fails on the old code, passes on the
+fix. Verified: 98 kvs::lance tests pass, 0 fail.
+
+Documented (accepted, pre-release) limitations the savants surfaced:
+- No schema migration for a pre-`seq` (4-col) on-disk dataset (fresh only today).
+- WAL carries no persisted seq → replay renumbers seqs above the persisted max
+  (monotonic+unique), not to exact pre-crash values.
+- LegacyCommitGate stamps `seq = version` (per-commit fidelity is LSM-only).
+- `seq`/`generation` mint from two atomics → under concurrency seq order can
+  disagree with commit order (harmless today; reads never consult seq).
+
+**Cross-ref:** `.claude/board/GRIDLAKE_REVIEW.md` (S1/S2/S3); fix in this commit.

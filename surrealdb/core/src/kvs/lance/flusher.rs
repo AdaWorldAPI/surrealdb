@@ -31,9 +31,12 @@
 //! last flush. This prevents a burst of small commits from creating
 //! Lance versions faster than the background optimizer can compact them
 //! (the columnar analogue of ClickHouse's "too many parts"). The
-//! periodic `tick_interval` already paces timer flushes; the rate floor
-//! additionally caps row/byte-triggered flushes. Shutdown's final drain
-//! bypasses the floor — durability wins over batching at teardown.
+//! `min_flush_interval` floor gates ALL trigger-driven flushes — periodic
+//! ticks included — so flush latency is bounded by `min_flush_interval`,
+//! which the `flusher_config_defaults_are_sensible` invariant keeps <=
+//! `tick_interval` so a later tick always clears the floor (never
+//! indefinite). Shutdown's final drain bypasses the floor — durability
+//! wins over batching at teardown.
 //!
 //! ## Concurrency contract
 //!
@@ -248,8 +251,8 @@ async fn flusher_loop(
 		// (e.g. heavy concurrent ingress), nudge ourselves to loop
 		// again rather than waiting for the next tick. The rate floor
 		// still applies on that next iteration.
-		if memtable.len() > config.max_pending_rows
-			|| memtable.pending_bytes() > config.max_pending_bytes
+		if memtable.len() >= config.max_pending_rows
+			|| memtable.pending_bytes() >= config.max_pending_bytes
 		{
 			notify.notify_one();
 		}

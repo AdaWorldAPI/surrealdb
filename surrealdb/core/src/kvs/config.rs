@@ -356,6 +356,13 @@ pub struct LanceConfig {
 	/// Ignored when `write_path == LegacyCommitGate` (the gate path
 	/// has no flusher).
 	pub disable_background_flusher: bool,
+
+	/// Override the background flusher's periodic tick interval. `None`
+	/// uses the default (100 ms). Widening it (e.g. to disable periodic
+	/// flushing in a test so only the size threshold / shutdown drain
+	/// flushes) makes flush boundaries — and thus Lance version
+	/// granularity — deterministic. Ignored on the LegacyCommitGate path.
+	pub flusher_tick_interval: Option<Duration>,
 }
 
 #[cfg(feature = "kv-lance")]
@@ -365,6 +372,7 @@ impl Default for LanceConfig {
 			versioned: true,
 			write_path: WritePath::default(),
 			disable_background_flusher: false,
+			flusher_tick_interval: None,
 		}
 	}
 }

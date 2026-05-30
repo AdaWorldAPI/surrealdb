@@ -71,8 +71,10 @@ impl KvSchema {
 	/// Build a `RecordBatch` from a list of `(key, val)` pairs at a
 	/// given version. All rows have `tombstone = false`.
 	///
-	/// Used by `Transaction::commit` to materialise pending writes
-	/// into a single Lance append-batch.
+	/// Schema/test helper. The live commit path uses
+	/// [`super::Transaction::build_write_batch_lance`] (via
+	/// `single_lance_commit`); this `KvSchema` variant is exercised only
+	/// by `schema.rs`'s own unit tests.
 	pub fn build_write_batch(
 		writes: &[(Key, Val)],
 		version: u64,
