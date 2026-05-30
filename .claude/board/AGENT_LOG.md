@@ -314,3 +314,20 @@ surrealkv-on-lance" (Rubicon kanban explicitly targets surrealdb kv-lance = #31)
 NEXT: code-map Explore agent running; will pick the real GAP (not re-build unified
 SoA), implement via the PR loop, subscribe, drive CI. Awaiting map before writing code.
 **Cross-ref:** lance-graph @1186dfd; INTEGRATION_PLANS.md §5(7).
+
+## 2026-05-30 — Architecture lock-ins for the planner⟷ractor⟷surreal meta-DTO (apply at implementation)
+**Status:** CONSTRAINTS (user, 2026-05-30) — feed into the in-flight lance-graph design map.
+- SoA physically lives in **cognitive-shader-driver** (BindSpace / MailboxSoA) — confirmed.
+- **BindSpace Singleton is RETIRED → becomes the little-endian contract** = the Baton /
+  `CollapseGateEmission` `(u16 target, CausalEdge64)`. NO materialized singleton BindSpace.
+- **"One SoA never transformed":** the per-mailbox SoA is **never serialized**, lives from
+  **mailbox spawn → tombstone**, and is mutated **only by cognitive operations** (in place).
+  Old model (cognitive-shader-driver materializing SoA into a "mushy singleton" BindSpace) is gone.
+- ⇒ the meta-DTO must NOT copy/serialize the SoA: planner/ractor/surreal reference it by
+  **handle / transparent view**; cross-boundary state = the **little-endian Baton**, not the SoA.
+- **Planner strategy set** the DTO must model: `{ lance-graph-planner (native) | JIT | SurrealQL | elixir }`
+  (the JIT-adjacent / template execution paths). Extend the existing planner strategy enum
+  (16 strategies incl. JitCompile), don't duplicate.
+- NOTE: cannot inject into the running design sub-agent (no SendMessage-to-in-flight here);
+  folding these in on its return + during implementation (+ same-commit lance-graph board hygiene).
+**Cross-ref:** lance-graph CLAUDE.md "Baton scoping" / E-BATON-1; convergence handover (commit 7c28967).
