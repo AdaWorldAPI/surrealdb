@@ -55,6 +55,16 @@ pointer table:
 - **Rubicon phases:** **ractor owns the phase transitions in Rubicon**
   ("ractor übernimmt die Phasen"). A work item advances through phases; each
   phase transition lands as a commit on the Rubicon timeline (= a kanban move).
+- **Hot path (perf) — keep the kanban OFF ractor's Tokio message path:** ractor
+  delivers messages over Tokio (per-message heap box + mpsc send + task wake),
+  too expensive for the per-update hot path. Because the {mailbox, SoA, kanban}
+  triple is co-owned, the actor mutates the **SoA and the kanban together in one
+  in-process hot-path pass** (reached O(1) via the pointer table / a shared
+  lock-free snapshot) — **no extra ractor message per card-move**. Reserve
+  ractor/Tokio messages for control-plane + cross-mailbox coordination; batch the
+  **durable** Rubicon commit at the phase boundary. Net: the kanban has two faces
+  — a **hot** in-memory projection (no Tokio cost) and a **durable** Rubicon-
+  timeline projection (one batched version per phase transition).
 - **Planning model (pre-planning → JIT):**
   - The actor model needs an explicit **pre-planning phase** with **wide
     expansion potential** (branch / elaborate the plan up front).
@@ -117,7 +127,7 @@ pointer table:
 ```
    POINTER TABLE (O(1)) ──── indexes ───┐
                                         ▼
-   ractor mailbox ⟷ BindSpace SoA ⟷ kanban        [per mailbox; CE64 + EW64 rows in the SoA]
+   ractor mailbox ⟷ BindSpace SoA ⟷ kanban        [per mailbox; HOT PATH — no Tokio msg between them; CE64 + EW64 rows in the SoA]
         │ owns                ▲ holds                ▲ reconnects
         │ phase transitions   │                      │
         ▼                     │                      │
@@ -142,3 +152,4 @@ Actor/mailbox primitive: **ractor**. Planner: **lance-graph-planner → DTO**.
 5. **EW64 schema + attachment** — how an EpisodicWitness64 row attaches to a Rubicon version (one layer up, per N1) and joins hot mailbox witnesses with cold SPO/AriGraph facts.
 6. **AriGraph shipped-status** — verify directly in the lance-graph repo (prior "shipped" claim was retracted).
 7. **Version-pin skew** — surrealdb on lance 6.0.0/arrow 58 vs lance-graph specs on lance 6.0.1/lancedb 0.29/datafusion 53.
+8. **Hot-path kanban mechanism** — exact ractor mechanism to keep kanban updates off the per-message Tokio path: same-actor in-handler mutation vs a shared `Arc`/arc-swap/lock-free snapshot resolved via the pointer table; and where the durable-commit batching boundary sits (one Rubicon version per phase transition, not per message).

@@ -296,3 +296,17 @@ A/B/C still hold, but the backbone below is the corrected model).
   templates" layer + the `>` meaning; pointer-table location; pre-plan→JIT
   collapse boundary. Full model + open decisions in INTEGRATION_PLANS.md (rev 2026-05-30).
 **Cross-ref:** INTEGRATION_PLANS.md (rev); supersedes framing of the two prior 2026-05-30 findings.
+
+## 2026-05-30 — REFINEMENT: keep the kanban on ractor's HOT path, off the Tokio message path
+**Status:** DESIGN refinement (user nudge, 2026-05-30).
+ractor delivers messages over Tokio (per-message heap box + mpsc send + task
+wake) — too expensive for the per-update hot path. Wire the kanban onto the
+**hot path** alongside the SoA: since {mailbox, SoA, kanban} is one co-owned
+per-mailbox triple, the actor mutates SoA + kanban together in-process (O(1) via
+the pointer table / a shared lock-free snapshot), with **no extra ractor message
+per card-move**. ractor/Tokio messages are reserved for control-plane +
+cross-mailbox coordination; the durable Rubicon commit is batched at the phase
+boundary (one version per phase transition, not per message). Kanban thus has two
+faces: a hot in-memory projection (no Tokio cost) + a durable Rubicon-timeline
+projection. Recorded in INTEGRATION_PLANS.md §1 (Hot path bullet) + §5(8).
+**Cross-ref:** INTEGRATION_PLANS.md (rev 2026-05-30).
