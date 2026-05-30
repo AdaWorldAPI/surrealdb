@@ -291,3 +291,26 @@ commit_gate module) — they need agent 2/3 / orchestrator follow-up. Did NOT ru
 - STRIP all `// ///REVIEW:` sentinels.
 **GATE COMMAND (Savant C — critical):** `cargo clippy -p surrealdb-core --features kv-lance --tests -- -D warnings`
   (stock `cargo make ci-clippy` omits kv-lance and would cfg-strip the rewrite = false green).
+
+## 2026-05-30 — Entering AUTONOMOUS BUILD mode (target: lance-graph)
+**Status:** IN PROGRESS
+Full authorization granted for autonomous decisions + the loop:
+`///`-code → `/code-review` → fix → strip `///` → PR → `subscribe_pr_activity` → fix CI.
+First build target = **lance-graph** (NOT surrealdb: invariant N1 keeps the
+SoA/CE64/EW64 tissue out of kv-lance; #31 already shipped the substrate). All 16
+repos are cloned locally; lance-graph branch `claude/sleepy-cori-aRK2x` exists,
+tree clean, remote = same local git proxy (push OK; PR via GitHub MCP).
+
+RECONCILE BEFORE CODING — lance-graph is ahead of this board's model. Recent
+commits (@1186dfd): "unified-SoA / ONE-SoA-end-to-end convergence"; mailbox spec
+§11.3 4-phase kanban + §11.4 AriGraph episodic chain + §11.6 nine-consumer SoA
+convergence; "one SoA never transformed"; "Libet −550ms Rubicon kanban in
+surrealkv-on-lance" (Rubicon kanban explicitly targets surrealdb kv-lance = #31);
+"SPO-W = pointer via belief-state arc". Workspace Cargo pins lance **=6.0.0**
+(RESOLVED(A) 2026-05-28) — SAME as surrealdb, so §5(7) version-skew is likely STALE
+(plan said 6.0.1). A `causal-edge` crate + `pr-ce64-mb-2-causaledge64-v2` spec exist
+(CausalEdge64 likely already coded).
+
+NEXT: code-map Explore agent running; will pick the real GAP (not re-build unified
+SoA), implement via the PR loop, subscribe, drive CI. Awaiting map before writing code.
+**Cross-ref:** lance-graph @1186dfd; INTEGRATION_PLANS.md §5(7).
