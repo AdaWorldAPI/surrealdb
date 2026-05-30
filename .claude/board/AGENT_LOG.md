@@ -269,3 +269,13 @@ commit_gate module) — they need agent 2/3 / orchestrator follow-up. Did NOT ru
 - Deleted all LSM/reinvention tests: writepath_*, lsm_recovery_*, seq_column_*, commit_gate_*, shutdown_drains_pending_commits, bench_lsm_*; dropped `WritePath` import + `scan_seqs/scan_versions/dataset_for_tests` usage.
 - LanceConfig field set ASSUMED = `{ versioned: bool }` only (matches the already-rewritten config.rs); every literal now sets only `versioned`.
 - 4 `// ///REVIEW:` anchors (all about "one commit = one lance version"): get_at_specific_version (checkout sees old-or-None), timeline versions_grow (≥2 lower-bound vs compaction), timeline view historical (v_after>v_before), timeline write+delete single-version (==before+1).
+
+## 2026-05-30T16:55 — agents 1+3 landed; orphans + integration_tests removed
+**Branch:** claude/sleepy-cori-aRK2x
+**Scope:** kvs/lance/{mod.rs(native),tests.rs(57 contract tests)}; deleted
+  memtable/wal/flusher/commit_gate/integration_tests.rs + WritePath.
+**Verdict:** IN PROGRESS (native source coherent; 8 // ///REVIEW anchors open)
+**Open:** REVIEW anchors — version stamp (read_version+1 vs latest+1),
+  lance OCC conflict -> Error::TransactionRetryable, get@version deletion-vector
+  semantics, timeline version-count assertions. Next: savant testers -> fix ->
+  strip /// -> clippy -> PR -> subscribe.
