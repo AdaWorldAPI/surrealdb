@@ -46,6 +46,14 @@ pointer table:
         (one commit = one version = one kanban move; #31)
 ```
 
+- **Wire inside AND outside equally (then explore synergies):** treat the
+  **inside** path (in-actor: direct meta-reach, hot, zero-copy SoA, O(1) pointer
+  table) and the **outside** path (inter-actor: ractor/Tokio messages, detached,
+  supervised, distributable) as **two co-equal, first-class transports for the
+  same coordination semantics** — not a fast path with the other demoted to
+  overhead. (The per-update hot path still avoids Tokio — see *Hot path* below —
+  but that is path *selection* by locality, not subordination of the message
+  path.) Wire both symmetrically first, then explore the synergies (deliberately left open).
 - **Per mailbox (1:1:1):** each ractor mailbox owns one **BindSpace SoA** and one
   **kanban**.
 - **Meta-coordination (ractor as meta, direct reach — not detached actors):** a
@@ -167,3 +175,4 @@ Actor/mailbox primitive: **ractor**. Planner: **lance-graph-planner → DTO**.
 8. **Hot-path kanban mechanism** — exact ractor mechanism to keep kanban updates off the per-message Tokio path: same-actor in-handler mutation vs a shared `Arc`/arc-swap/lock-free snapshot resolved via the pointer table; and where the durable-commit batching boundary sits (one Rubicon version per phase transition, not per message).
 9. **Meta ownership/reach model** — how ractor-as-meta owns & reaches the triples *without* detaching each mailbox as a separate message-driven Tokio task: one meta task owning all triples vs shared `Arc`/lock-free handles resolved via the pointer table — and what still legitimately needs an async message boundary.
 10. **Zero-copy SoA contract** — buffer ownership + lifetime/visibility between lance-graph `apply()` (writer, on phase transition) and the cognitive-shader-driver (reader): which buffers are shared, and how to reconcile Arrow's immutable-buffer convention with a mutable per-mailbox SoA (e.g. double-buffer / arena / mutable column read each pass) so `apply` doesn't reallocate the columns the driver holds.
+11. **Inside ⟷ outside synergy exploration** — wire both paths equally first, then determine which synergies are load-bearing vs incidental, and whether the inside path should be a strict *specialization* of the outside's semantics or a genuinely distinct transport. (Synergies deliberately not pre-enumerated.)

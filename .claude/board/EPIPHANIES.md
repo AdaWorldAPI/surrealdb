@@ -329,3 +329,16 @@ projection. Recorded in INTEGRATION_PLANS.md §1 (Hot path bullet) + §5(8).
   / arena / mutable column) so `apply` doesn't reallocate columns the driver holds.
 Recorded in INTEGRATION_PLANS.md §1 (Meta-coordination + Zero-copy bullets) + §5(9,10).
 **Cross-ref:** INTEGRATION_PLANS.md (rev 2026-05-30); extends the hot-path refinement entry.
+
+## 2026-05-30 — STANCE: wire inside & outside actor paths EQUALLY, then explore synergies
+**Status:** DESIGN stance (user, 2026-05-30; rebalances the prior hot-path / meta-reach entries).
+Treat the **inside** path (in-actor: direct meta-reach, hot, zero-copy, O(1) pointer
+table) and the **outside** path (inter-actor: ractor/Tokio messages, detached,
+supervised, distributable) as **co-equal, first-class transports** for the same
+coordination semantics. Do NOT subordinate the message path to the hot path —
+Tokio cost is routed-around by locality, not a reason to demote it. Wire both
+**equally first**, *then* explore the synergies. NB: the synergies are deliberately
+**left open / not pre-enumerated** (per user steer this session — an earlier draft
+that listed candidate synergies was rejected; keep the exploration genuinely open).
+Recorded in INTEGRATION_PLANS.md §1 (stance bullet) + §5(11).
+**Cross-ref:** INTEGRATION_PLANS.md (rev 2026-05-30).
