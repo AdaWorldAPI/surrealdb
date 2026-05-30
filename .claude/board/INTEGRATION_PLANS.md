@@ -53,7 +53,7 @@ pointer table:
   same coordination semantics** — not a fast path with the other demoted to
   overhead. (The per-update hot path still avoids Tokio — see *Hot path* below —
   but that is path *selection* by locality, not subordination of the message
-  path.) Wire both symmetrically first, then explore the synergies (deliberately left open).
+  path.) Wire both symmetrically first, then explore the synergies (§1.1).
 - **Per mailbox (1:1:1):** each ractor mailbox owns one **BindSpace SoA** and one
   **kanban**.
 - **Meta-coordination (ractor as meta, direct reach — not detached actors):** a
@@ -96,6 +96,20 @@ pointer table:
     wired to **ractor** and the **surrealdb kanban** — its output becomes the
     transferable plan object flowing mailbox → kanban → Rubicon timeline.
 
+### §1.1 Synergies to explore (inside ⟷ outside)
+The same inside/outside duality already recurs three times; wiring both **equally**
+is what lets them compose (→ exploration, not settled):
+- **Coordination:** direct meta-reach (inside) ⟷ ractor message (outside).
+- **Kanban:** hot in-memory projection (inside) ⟷ durable Rubicon timeline (outside).
+- **EpisodicWitness64:** live mailbox witnesses (inside/hot) ⟷ cold SPO/AriGraph facts (outside).
+
+Candidate synergies: **location-transparency** (the inside path is the local
+zero-copy *specialization* of the outside's general, distributable semantics —
+same op, two transports); **supervision** (outside) guarding the SoA that is
+hot-read (inside); the **outside** path supplying backpressure + batching at the
+phase boundary while the **inside** serves per-update mutations. §2.1 (NARS) is a
+concrete instance.
+
 ---
 
 ## 2. SoA row types: CausalEdge64 + EpisodicWitness64
@@ -105,6 +119,27 @@ pointer table:
   bridge that reconnects AriGraph (see §3.B).
 - **EW64 + CE64 synergies:** episodic ("what was witnessed") + causal ("which
   edges cause what") composed in the same per-mailbox SoA.
+- **Storage — fixed-capacity CAM-vector arena:** each per-mailbox SoA is a
+  **fixed-size, content-addressable (CAM) vector arena** — assume **16k / 64k /
+  256k** slots. Fixed capacity ⇒ stable slot addresses ⇒ `apply()` mutates **in
+  place** ⇒ the cognitive-shader-driver reads the **same** buffer **zero-copy**,
+  no reallocation. CAM(BLAKE) (invariant N1) is the addressing function
+  content → slot. A shared fixed address space is also what makes `SoA1:SoA2`
+  superposition (§2.1) well-defined. *(Resolves the §5(10) buffer contract.)*
+- **Plasticity is a first-class / primary citizen:** the arena's primary ops are
+  **plastic** — bind / rebind / reweight / decay / prune of the CE64 + EW64 rows
+  — not just static read/write. Brain-plasticity-style adaptation of the causal
+  edges + episodic traces is the point; design the arena API around it.
+
+### §2.1 NARS reasoning — inside ⟷ outside (concrete example)
+A mailbox that wants **NARS reasoning** has both transports (the §1 equal-wiring
+stance, made concrete):
+- **Inside (hot, zero-copy):** a **direct `SoA1 : SoA2` superposition inside the
+  cognitive-shader-driver** — superpose the two CAM-vector arenas in-shader, no message.
+- **Outside (message):** **send a message to the other mailbox to recall a NARS
+  review based on new findings** — the ractor/Tokio path, detached.
+
+Same capability, two transports — chosen by locality/need.
 
 ---
 
@@ -174,5 +209,5 @@ Actor/mailbox primitive: **ractor**. Planner: **lance-graph-planner → DTO**.
 7. **Version-pin skew** — surrealdb on lance 6.0.0/arrow 58 vs lance-graph specs on lance 6.0.1/lancedb 0.29/datafusion 53.
 8. **Hot-path kanban mechanism** — exact ractor mechanism to keep kanban updates off the per-message Tokio path: same-actor in-handler mutation vs a shared `Arc`/arc-swap/lock-free snapshot resolved via the pointer table; and where the durable-commit batching boundary sits (one Rubicon version per phase transition, not per message).
 9. **Meta ownership/reach model** — how ractor-as-meta owns & reaches the triples *without* detaching each mailbox as a separate message-driven Tokio task: one meta task owning all triples vs shared `Arc`/lock-free handles resolved via the pointer table — and what still legitimately needs an async message boundary.
-10. **Zero-copy SoA contract** — buffer ownership + lifetime/visibility between lance-graph `apply()` (writer, on phase transition) and the cognitive-shader-driver (reader): which buffers are shared, and how to reconcile Arrow's immutable-buffer convention with a mutable per-mailbox SoA (e.g. double-buffer / arena / mutable column read each pass) so `apply` doesn't reallocate the columns the driver holds.
-11. **Inside ⟷ outside synergy exploration** — wire both paths equally first, then determine which synergies are load-bearing vs incidental, and whether the inside path should be a strict *specialization* of the outside's semantics or a genuinely distinct transport. (Synergies deliberately not pre-enumerated.)
+10. **Zero-copy SoA contract** — **DIRECTION (2026-05-30):** each per-mailbox SoA is a **fixed-capacity CAM-vector arena (16k / 64k / 256k slots)** (see §2) — fixed size gives stable addresses, so `apply()` mutates in place and the driver reads zero-copy with no reallocation. *Remaining:* pick the capacity tier (and whether it is per-mailbox or a shared global vector), define CAM collision handling, and confirm plain-Arrow vs a custom mutable buffer read each pass.
+11. **Inside ⟷ outside synergy exploration** (§1.1, §2.1) — wire both paths equally first, then determine which synergies are load-bearing (e.g. location-transparency) vs incidental, and whether the inside path should be a strict *specialization* of the outside's semantics or a genuinely distinct transport.
