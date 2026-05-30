@@ -2117,6 +2117,64 @@ async fn writepath_legacy_commit_gate_smoke() {
     ds.shutdown().await.expect("shutdown");
 }
 
+/// `WritePath::LsmColumnar` (Phase 3 opt-in) currently aliases the
+/// `LsmWithWal` hot path: WAL fsync → memtable → async flush. This
+/// smoke pins that the variant SELECTS and round-trips the full public
+/// Transactable surface — set / get-across-tx / overwrite / delete —
+/// identically to the default LSM path, so the columnar flush builder
+/// can be wired in behind it without changing observable behaviour.
+#[tokio::test]
+async fn writepath_lsm_columnar_smoke() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().expect("utf-8 path");
+    let ds = Datastore::new(
+        path_str,
+        LanceConfig {
+            write_path: WritePath::LsmColumnar,
+            ..LanceConfig::default()
+        },
+    )
+    .await
+    .expect("ds open");
+
+    let tx = ds.transaction(true, false).await.expect("tx1");
+    tx.set(b"col_k".to_vec(), b"col_v1".to_vec()).await.expect("set");
+    tx.commit().await.expect("commit 1");
+
+    let tx = ds.transaction(false, false).await.expect("tx2");
+    assert_eq!(
+        tx.get(b"col_k".to_vec(), None).await.expect("get").as_deref(),
+        Some(b"col_v1".as_ref()),
+        "LsmColumnar path failed to make set visible across transactions"
+    );
+    tx.cancel().await.expect("cancel");
+
+    let tx = ds.transaction(true, false).await.expect("tx3");
+    tx.set(b"col_k".to_vec(), b"col_v2".to_vec()).await.expect("overwrite");
+    tx.commit().await.expect("commit 2");
+
+    let tx = ds.transaction(false, false).await.expect("tx4");
+    assert_eq!(
+        tx.get(b"col_k".to_vec(), None).await.expect("get").as_deref(),
+        Some(b"col_v2".as_ref()),
+        "LsmColumnar path failed to overwrite a previously committed value"
+    );
+    tx.cancel().await.expect("cancel");
+
+    let tx = ds.transaction(true, false).await.expect("tx5");
+    tx.del(b"col_k".to_vec()).await.expect("del");
+    tx.commit().await.expect("commit 3");
+
+    let tx = ds.transaction(false, false).await.expect("tx6");
+    assert!(
+        tx.get(b"col_k".to_vec(), None).await.expect("get").is_none(),
+        "LsmColumnar path failed to delete a previously committed key"
+    );
+    tx.cancel().await.expect("cancel");
+
+    ds.shutdown().await.expect("shutdown");
+}
+
 /// `LegacyCommitGate` does NOT spawn a flusher: the gate's own
 /// synchronous commit cycle handles every write. Proven by a clean
 /// `Datastore::shutdown` (no flusher to drain → no hangs).

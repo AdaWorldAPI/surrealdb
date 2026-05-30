@@ -326,6 +326,16 @@ pub enum WritePath {
 	///
 	/// **Throughput:** Lance-commit-latency bounded.
 	LegacyCommitGate,
+	/// **Phase 3 (opt-in, experimental).** Identical durability,
+	/// isolation, and recovery contract to [`WritePath::LsmWithWal`]
+	/// (WAL fsync → memtable → async flush); selecting it lets the
+	/// columnar flush optimisation — a single up-front-sized Arrow
+	/// builder pass replacing the per-row `collect()`s of the §6.1
+	/// "transpose tax" — be wired in behind a stable seam without
+	/// disturbing the default row path. Until that builder lands it
+	/// routes through the same hot path as `LsmWithWal`; it stays
+	/// non-default until benchmarked at parity.
+	LsmColumnar,
 }
 
 /// layer needs to know about.

@@ -755,7 +755,9 @@ impl Transactable for Transaction {
 		}
 
 		match self.write_path {
-			WritePath::LsmWithWal => self.commit_lsm(writes, deletes).await?,
+			WritePath::LsmWithWal | WritePath::LsmColumnar => {
+				self.commit_lsm(writes, deletes).await?
+			}
 			WritePath::LegacyCommitGate => {
 				self.commit_legacy_gate(writes, deletes).await?
 			}
@@ -831,7 +833,9 @@ impl Transactable for Transaction {
 		// either path — the memtable only holds the latest write per
 		// key, not historical versions, so a `get(k, Some(v))` for a
 		// past `v` has no business consulting it.
-		if version.is_none() && self.write_path == WritePath::LsmWithWal {
+		if version.is_none()
+			&& matches!(self.write_path, WritePath::LsmWithWal | WritePath::LsmColumnar)
+		{
 			if let Some(entry) = self.memtable.get(&key) {
 				return Ok(match entry.op {
 					MemOp::Set(v) => Some(v),
@@ -866,7 +870,7 @@ impl Transactable for Transaction {
 				Ok(s) => s,
 				Err(_) => return Ok(None),
 			},
-			(WritePath::LsmWithWal, None) => ds.inner.clone(),
+			(WritePath::LsmWithWal | WritePath::LsmColumnar, None) => ds.inner.clone(),
 			(WritePath::LegacyCommitGate, None) => {
 				match ds.inner.checkout_version(self.read_version).await {
 					Ok(s) => s,
@@ -1322,7 +1326,9 @@ impl Transaction {
 						Ok(s) => Some(s),
 						Err(_) => None,
 					},
-					(WritePath::LsmWithWal, None) => Some(ds.inner.clone()),
+					(WritePath::LsmWithWal | WritePath::LsmColumnar, None) => {
+						Some(ds.inner.clone())
+					}
 					(WritePath::LegacyCommitGate, None) => {
 						match ds.inner.checkout_version(self.read_version).await
 						{
@@ -1418,7 +1424,9 @@ impl Transaction {
 			// the LSM path. The LegacyCommitGate path never writes to
 			// the memtable, so overlaying it would be a no-op anyway,
 			// and skipping the iteration saves time on large memtables.
-			if version.is_none() && self.write_path == WritePath::LsmWithWal {
+			if version.is_none()
+			&& matches!(self.write_path, WritePath::LsmWithWal | WritePath::LsmColumnar)
+		{
 				for (k, entry) in self.memtable.scan_range(&rng) {
 					match entry.op {
 						MemOp::Set(v) => {
