@@ -2175,6 +2175,75 @@ async fn writepath_lsm_columnar_smoke() {
     ds.shutdown().await.expect("shutdown");
 }
 
+/// `WritePath::LsmColumnar` flush path: writes plus a delete that survive a
+/// memtable→Lance flush (forced by `shutdown`'s final drain) and a reopen.
+/// Proves the single-pass `build_columnar_merge_batch` persists the same
+/// Lance state as the row path — live rows readable, the tombstoned key
+/// gone — when reads are served from Lance (memtable empty, WAL truncated).
+#[tokio::test]
+async fn writepath_lsm_columnar_flush_persists() {
+    let path = unique_tmp_path();
+    let path_str = path.to_str().expect("utf-8 path");
+
+    {
+        let ds = Datastore::new(
+            path_str,
+            LanceConfig {
+                write_path: WritePath::LsmColumnar,
+                ..LanceConfig::default()
+            },
+        )
+        .await
+        .expect("ds open");
+
+        // Seed three keys, then delete one — two commits into WAL+memtable.
+        let tx = ds.transaction(true, false).await.expect("tx seed");
+        tx.set(b"ca".to_vec(), b"va".to_vec()).await.expect("set ca");
+        tx.set(b"cb".to_vec(), b"vb".to_vec()).await.expect("set cb");
+        tx.set(b"cc".to_vec(), b"vc".to_vec()).await.expect("set cc");
+        tx.commit().await.expect("commit seed");
+
+        let tx = ds.transaction(true, false).await.expect("tx del");
+        tx.del(b"cb".to_vec()).await.expect("del cb");
+        tx.commit().await.expect("commit del");
+
+        // Shutdown's final drain flushes the memtable into Lance via the
+        // columnar builder and truncates the WAL.
+        ds.shutdown().await.expect("shutdown drains to Lance");
+    }
+
+    // Reopen: memtable is empty and the WAL truncated, so every read is
+    // served from the Lance dataset the columnar flush produced.
+    let ds = Datastore::new(
+        path_str,
+        LanceConfig {
+            write_path: WritePath::LsmColumnar,
+            ..LanceConfig::default()
+        },
+    )
+    .await
+    .expect("ds reopen");
+
+    let tx = ds.transaction(false, false).await.expect("tx read");
+    assert_eq!(
+        tx.get(b"ca".to_vec(), None).await.expect("get ca").as_deref(),
+        Some(b"va".as_ref()),
+        "columnar flush lost a live row (ca)"
+    );
+    assert_eq!(
+        tx.get(b"cc".to_vec(), None).await.expect("get cc").as_deref(),
+        Some(b"vc".as_ref()),
+        "columnar flush lost a live row (cc)"
+    );
+    assert!(
+        tx.get(b"cb".to_vec(), None).await.expect("get cb").is_none(),
+        "columnar flush failed to persist the tombstone (deleted key cb still visible)"
+    );
+    tx.cancel().await.expect("cancel");
+
+    ds.shutdown().await.expect("shutdown");
+}
+
 /// `LegacyCommitGate` does NOT spawn a flusher: the gate's own
 /// synchronous commit cycle handles every write. Proven by a clean
 /// `Datastore::shutdown` (no flusher to drain → no hangs).

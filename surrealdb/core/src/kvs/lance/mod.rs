@@ -443,6 +443,10 @@ impl Datastore {
 					tick_interval: config
 						.flusher_tick_interval
 						.unwrap_or_else(|| FlusherConfig::default().tick_interval),
+					// Phase 3: the LsmColumnar path flushes via the
+					// single-pass columnar builder; every other path
+					// uses the row builders.
+					columnar: config.write_path == WritePath::LsmColumnar,
 					..FlusherConfig::default()
 				},
 			))

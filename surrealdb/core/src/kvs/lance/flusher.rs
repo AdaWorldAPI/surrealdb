@@ -56,7 +56,7 @@ use tracing::{trace, warn};
 use web_time::Instant;
 
 use super::DatasetHandle;
-use super::memtable::{Memtable, Op};
+use super::memtable::{Memtable, MemtableEntry, Op};
 use super::wal::Wal;
 use crate::kvs::err::{Error, Result};
 use crate::kvs::{Key, Val};
@@ -77,6 +77,13 @@ pub(super) struct FlusherConfig {
 	/// versions so the background optimizer can keep up ("too many
 	/// parts" discipline). The shutdown final drain ignores this.
 	pub min_flush_interval: Duration,
+	/// Phase 3: when `true` (selected by `WritePath::LsmColumnar`), the
+	/// flush builds the Lance merge-insert source in a single
+	/// up-front-sized columnar pass over the memtable snapshot instead
+	/// of partitioning into row vecs + two batches. The emitted rows and
+	/// schema are identical, so the resulting Lance state is the same;
+	/// it only trims the §6.1 transpose tax. Default `false` (row path).
+	pub columnar: bool,
 }
 
 impl Default for FlusherConfig {
@@ -98,6 +105,8 @@ impl Default for FlusherConfig {
 			// Lance versions/sec from bursts, leaving the optimizer
 			// headroom to compact.
 			min_flush_interval: Duration::from_millis(50),
+			// Default to the proven row path; LsmColumnar flips this on.
+			columnar: false,
 		}
 	}
 }
@@ -199,7 +208,9 @@ async fn flusher_loop(
 				// Bypasses the rate floor — durability beats batching
 				// at teardown.
 				let final_gen = memtable.current_generation();
-				if let Err(e) = do_flush(&dataset, &memtable, &wal, final_gen).await {
+				if let Err(e) =
+					do_flush(&dataset, &memtable, &wal, final_gen, config.columnar).await
+				{
 					warn!(target: TARGET, "flusher final drain failed: {e}");
 				}
 				return;
@@ -233,7 +244,7 @@ async fn flusher_loop(
 		// the memtable until the next flush picks them up.
 		let snapshot_gen = memtable.current_generation();
 		last_flush = Instant::now();
-		match do_flush(&dataset, &memtable, &wal, snapshot_gen).await {
+		match do_flush(&dataset, &memtable, &wal, snapshot_gen, config.columnar).await {
 			Ok(flushed) => {
 				trace!(
 					target: TARGET,
@@ -292,6 +303,7 @@ async fn do_flush(
 	memtable: &Arc<Memtable>,
 	wal: &Arc<Wal>,
 	up_to_gen: u64,
+	columnar: bool,
 ) -> Result<usize> {
 	// 1. Snapshot the entries (clone — does NOT remove from memtable).
 	let snapshot = memtable.snapshot_up_to(up_to_gen);
@@ -299,32 +311,44 @@ async fn do_flush(
 		return Ok(0);
 	}
 
-	// 2. Partition into writes and deletes for the Lance commit, carrying
-	//    each row's per-commit `seq` along in a parallel vec so it lands
-	//    in Lance's `seq` column (decoupled from the flush `version`).
-	let mut writes: Vec<(Key, Val)> = Vec::with_capacity(snapshot.len());
-	let mut write_seqs: Vec<u64> = Vec::with_capacity(snapshot.len());
-	let mut deletes: Vec<Key> = Vec::new();
-	let mut delete_seqs: Vec<u64> = Vec::new();
-	let mut flushed_gens: Vec<(Key, u64)> = Vec::with_capacity(snapshot.len());
-	for (k, entry) in &snapshot {
-		flushed_gens.push((k.clone(), entry.generation));
-		match &entry.op {
-			Op::Set(v) => {
-				writes.push((k.clone(), v.clone()));
-				write_seqs.push(entry.seq);
-			}
-			Op::Delete => {
-				deletes.push(k.clone());
-				delete_seqs.push(entry.seq);
+	// 2. Record the per-key flush generation for the post-commit
+	//    `drop_committed` (needed identically on both write paths).
+	let flushed_gens: Vec<(Key, u64)> =
+		snapshot.iter().map(|(k, e)| (k.clone(), e.generation)).collect();
+
+	// 3. Commit to Lance as exactly ONE merge_insert. The version stamp
+	//    is the flush's `up_to_gen` (monotonic across flushes); per-row
+	//    `seq`s come from the snapshot entries.
+	if columnar {
+		// Phase 3 (LsmColumnar): build the merge source in a single
+		// up-front-sized columnar pass over the snapshot — no row-vec
+		// partition, no two-batch concat. The rows and schema are
+		// identical to the row path, so the Lance state is the same.
+		let batch = build_columnar_merge_batch(&snapshot, up_to_gen)
+			.map_err(|e| Error::Datastore(format!("lance build columnar batch: {e}")))?;
+		execute_merge(dataset, vec![batch]).await?;
+	} else {
+		// Default row path: partition into writes + deletes, carrying
+		// each row's per-commit `seq` along in a parallel vec.
+		let mut writes: Vec<(Key, Val)> = Vec::with_capacity(snapshot.len());
+		let mut write_seqs: Vec<u64> = Vec::with_capacity(snapshot.len());
+		let mut deletes: Vec<Key> = Vec::new();
+		let mut delete_seqs: Vec<u64> = Vec::new();
+		for (k, entry) in &snapshot {
+			match &entry.op {
+				Op::Set(v) => {
+					writes.push((k.clone(), v.clone()));
+					write_seqs.push(entry.seq);
+				}
+				Op::Delete => {
+					deletes.push(k.clone());
+					delete_seqs.push(entry.seq);
+				}
 			}
 		}
+		single_lance_commit(dataset, writes, write_seqs, deletes, delete_seqs, up_to_gen)
+			.await?;
 	}
-
-	// 3. Commit to Lance — single MergeInsertBuilder + delete pair.
-	//    The version stamp is the flush's `up_to_gen`, monotonic
-	//    across flushes; per-row `seq`s come from the snapshot entries.
-	single_lance_commit(dataset, writes, write_seqs, deletes, delete_seqs, up_to_gen).await?;
 
 	// 4. After Lance commit succeeds, drop the flushed entries from
 	//    the memtable. Newer-generation writes that raced the flush
@@ -360,8 +384,6 @@ async fn single_lance_commit(
 	delete_seqs: Vec<u64>,
 	version: u64,
 ) -> Result<()> {
-	use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
-
 	if writes.is_empty() && deletes.is_empty() {
 		return Ok(());
 	}
@@ -380,6 +402,27 @@ async fn single_lance_commit(
 			super::Transaction::build_tombstone_batch_lance(&deletes, version, &delete_seqs)
 				.map_err(|e| Error::Datastore(format!("lance build tombstones: {e}")))?,
 		);
+	}
+
+	execute_merge(dataset, batches).await
+}
+
+/// Apply pre-built merge-source batches to the dataset as a SINGLE
+/// `MergeInsertBuilder::execute_reader` keyed on `key`
+/// (`WhenMatched::UpdateAll` / `WhenNotMatched::InsertAll`). Every batch
+/// must carry the shared KV schema. A memtable snapshot holds exactly one
+/// op per key, so the merge source has unique keys and the upsert produces
+/// exactly ONE dataset version per flush. Shared by the row path
+/// (`single_lance_commit`, writes + tombstones as two batches) and the
+/// columnar path (`build_columnar_merge_batch`, one fused batch).
+async fn execute_merge(
+	dataset: &Arc<RwLock<DatasetHandle>>,
+	batches: Vec<arrow_array::RecordBatch>,
+) -> Result<()> {
+	use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+
+	if batches.is_empty() {
+		return Ok(());
 	}
 
 	let schema_ref = batches[0].schema();
@@ -403,6 +446,73 @@ async fn single_lance_commit(
 	ds.inner = Arc::try_unwrap(new_ds).unwrap_or_else(|arc| (*arc).clone());
 
 	Ok(())
+}
+
+/// Phase 3 columnar flush: build the entire merge-insert source for a
+/// flush in a SINGLE up-front-sized pass over the memtable snapshot.
+///
+/// Emits one `RecordBatch` carrying both live rows (`tombstone = false`)
+/// and tombstone rows (`tombstone = true`, empty `val`) in the shared KV
+/// schema `[key, val, version, tombstone, seq]`. Equivalent to the row
+/// path's `build_write_batch_lance` + `build_tombstone_batch_lance` pair,
+/// but without partitioning into row vecs or concatenating two batches:
+/// the Arrow column builders are pre-sized to the row count and filled in
+/// one pass, trimming the §6.1 transpose tax. Each row's `version` is the
+/// flush stamp; its `seq` is carried from the snapshot entry.
+fn build_columnar_merge_batch(
+	snapshot: &[(Key, MemtableEntry)],
+	version: u64,
+) -> std::result::Result<arrow_array::RecordBatch, arrow_schema::ArrowError> {
+	use arrow_array::RecordBatch;
+	use arrow_array::builder::{BinaryBuilder, BooleanBuilder, UInt64Builder};
+	use arrow_schema::{DataType, Field, Schema};
+
+	let n = snapshot.len();
+	// Pre-size every builder to the row count up front (the point of the
+	// columnar path); the binary builders also reserve a rough byte budget.
+	let mut key_b = BinaryBuilder::with_capacity(n, n.saturating_mul(16));
+	let mut val_b = BinaryBuilder::with_capacity(n, n.saturating_mul(32));
+	let mut version_b = UInt64Builder::with_capacity(n);
+	let mut tombstone_b = BooleanBuilder::with_capacity(n);
+	let mut seq_b = UInt64Builder::with_capacity(n);
+
+	for (k, entry) in snapshot {
+		key_b.append_value(k);
+		match &entry.op {
+			Op::Set(v) => {
+				val_b.append_value(v);
+				tombstone_b.append_value(false);
+			}
+			Op::Delete => {
+				// Tombstone carries no payload; `val` is non-nullable, so
+				// store an empty byte string. Never read back — the read
+				// predicates filter `tombstone = false` before projecting.
+				val_b.append_value(b"");
+				tombstone_b.append_value(true);
+			}
+		}
+		version_b.append_value(version);
+		seq_b.append_value(entry.seq);
+	}
+
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("key", DataType::Binary, false),
+		Field::new("val", DataType::Binary, false),
+		Field::new("version", DataType::UInt64, false),
+		Field::new("tombstone", DataType::Boolean, false),
+		Field::new("seq", DataType::UInt64, false),
+	]));
+
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(key_b.finish()),
+			Arc::new(val_b.finish()),
+			Arc::new(version_b.finish()),
+			Arc::new(tombstone_b.finish()),
+			Arc::new(seq_b.finish()),
+		],
+	)
 }
 
 // End-to-end coverage of the flusher lives in `tests.rs::lsm_*`
