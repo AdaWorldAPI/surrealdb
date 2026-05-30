@@ -171,3 +171,36 @@ Documented (accepted, pre-release) limitations the savants surfaced:
   disagree with commit order (harmless today; reads never consult seq).
 
 **Cross-ref:** `.claude/board/GRIDLAKE_REVIEW.md` (S1/S2/S3); fix in this commit.
+
+## 2026-05-30 — kv-lance substrate maps onto Cognitive-RISC invariants; do NOT add class_id to it
+**Status:** FINDING
+**Scope:** `kvs/lance/*` vs `lance-graph/.claude/specs/{cognitive-risc-core,cognitive-risc-classes,wikidata-hhtl-load,faiss-homology-cam-pq}.md`
+
+The kv-lance backend IS the "Substrate" layer (row 1) of the Cognitive-RISC
+five-layer stack ("SoA, LE byte contract, surrealkv WAL/ACID, policy-free
+state"). Concrete mapping: CommitGate/single_lance_commit = the sole cold-path
+writer (invariant #4); WAL+memtable ↔ flusher→Lance two-clock decoupling +
+the adaptive-batching rate-floor = the shock absorber (#7); WAL carries KV
+rows only, never compiled candidates (#11); the schema is opaque (key,val) +
+MVCC bookkeeping version/tombstone/seq with ZERO domain meaning (#1, and #6
+permits generation/tombstone counters). The step-2 `seq_survives_restart`
+test is exactly the spec's "smallest first slice" (WAL round-trip + read back
+after a simulated restart).
+
+TRAP recorded so a future session does not weld the inversion shut: freeze-
+time move **N1 ("add class_id/shape_id to the SoA")** must NOT be applied to
+the kv-lance schema — that violates invariant #1. class_id, HHTL nibble-path,
+facet bitmasks, and the CAM (BLAKE) hash live ONE LAYER UP (inside the `val`
+payload or lance-graph's own Lance datasets), never as kv-lance columns. The
+minimal key/val/version/tombstone/seq schema is correct precisely because it
+is policy-free.
+
+Live fork for this work — **F2**: spec default-leans "federate via DataFusion
+catalog (Arrow TableProviders)", not "read Lance directly (heavy/fragile)".
+kv-lance is the direct path; the step-1 Timeline ("SurrealDB-as-view-over-
+Lance", Rubicon) is the federation-shaped read surface. Decide: SurrealDB as
+writer-of-record into Lance (kv-lance) vs DataFusion-federated view (F2); they
+can coexist but the version-coupling risk is real. Version pin skew: repo on
+lance =6.0.0/arrow 58; spec pins lance 6.0.1/lancedb 0.29/datafusion 53.
+
+**Cross-ref:** PR #29/#30; lance-graph .claude/specs/ (sha d1635db).

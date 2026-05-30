@@ -203,9 +203,16 @@ impl Datastore {
 	async fn max_persisted_seq(ds: &LanceDataset) -> Result<u64> {
 		use futures::TryStreamExt;
 		let mut scanner = ds.scan();
-		// Tolerate a legacy dataset with no `seq` column.
+		// A dataset whose schema lacks `seq` predates this column (a pre-release
+		// on-disk format change). Fail fast with a clear migration error rather
+		// than letting the first 5-column merge hit an opaque schema mismatch
+		// (codex P2 on #30). A fresh dataset created by this code always carries
+		// the 5-column schema, so this only fires for genuinely legacy data.
 		if scanner.project(&["seq"]).is_err() {
-			return Ok(0);
+			return Err(Error::Datastore(
+				"Lance dataset predates the `seq` column (pre-release on-disk format change); a backfill/migration is required before writes (see .claude/board/EPIPHANIES.md, 2026-05-30 seq column)."
+					.to_string(),
+			));
 		}
 		let mut stream = scanner
 			.try_into_stream()
