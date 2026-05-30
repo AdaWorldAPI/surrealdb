@@ -368,6 +368,7 @@ impl Datastore {
 	/// Transaction methods would use, without exposing the field through
 	/// any public API. Not reachable from outside the `lance` module tree.
 	#[cfg(test)]
+	#[allow(dead_code)]
 	pub(super) fn dataset_for_tests(&self) -> &Arc<RwLock<DatasetHandle>> {
 		&self.dataset
 	}
@@ -376,6 +377,7 @@ impl Datastore {
 	/// `(key, version)`. Companion to [`Self::scan_seqs_for_tests`], used to
 	/// cross-check the `seq` column against the `version` column.
 	#[cfg(test)]
+	#[allow(dead_code)]
 	pub(super) async fn scan_versions_for_tests(&self) -> Result<Vec<(Key, u64)>> {
 		use futures::TryStreamExt;
 		let ds = self.dataset.read().await;
@@ -417,6 +419,7 @@ impl Datastore {
 	/// project/stream idiom of [`Transaction::scan_impl`] but projects
 	/// the `key`, `seq`, and `tombstone` columns.
 	#[cfg(test)]
+	#[allow(dead_code)]
 	pub(super) async fn scan_seqs_for_tests(&self) -> Result<Vec<(Key, u64, bool)>> {
 		use futures::TryStreamExt;
 

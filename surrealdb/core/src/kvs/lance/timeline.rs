@@ -144,11 +144,13 @@ impl Timeline {
 /// Holds a checked-out Lance dataset (`checkout_version` yields an owned,
 /// read-pinned `Dataset`). All methods are read-only; there is deliberately
 /// no `set`/`del`/`commit` here.
+#[allow(dead_code)] // unwired read surface for a future kanban/replay consumer
 pub struct TimelineView {
 	version: u64,
 	snapshot: lance::Dataset,
 }
 
+#[allow(dead_code)]
 impl TimelineView {
 	/// The version this view is pinned to.
 	pub fn version(&self) -> u64 {
