@@ -66,8 +66,16 @@ mod commit_gate;
 mod flusher;
 mod memtable;
 mod schema;
+mod timeline;
 mod tx_buffer;
 mod wal;
+
+// `Timeline` is consumed now (the `Datastore::timeline()` return type);
+// `TimelineView` + `VersionInfo` are the read-side surface a kanban/replay
+// consumer reaches for next. Re-exported crate-wide so that wiring lands
+// without churn; `allow(unused_imports)` until the first in-tree consumer.
+#[allow(unused_imports)]
+pub(crate) use timeline::{Timeline, TimelineView, VersionInfo};
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -398,6 +406,17 @@ impl Datastore {
 	/// Used to seed `read_version` for new transactions.
 	async fn current_version(&self) -> u64 {
 		self.dataset.read().await.inner.version().version
+	}
+
+	/// Open a read-only [`Timeline`] over this datastore's version history.
+	///
+	/// This is the "SurrealDB-as-view-over-Lance" surface (the Rubicon
+	/// ruling): the timeline enumerates Lance's native dataset versions and
+	/// hands out immutable [`TimelineView`]s. It shares the same dataset
+	/// handle as live transactions — no second open — and exposes reads
+	/// only, so it cannot mutate the leading store.
+	pub(crate) fn timeline(&self) -> Timeline {
+		Timeline::new(Arc::clone(&self.dataset))
 	}
 
 	/// Test-only accessor for the underlying dataset Arc.
@@ -1001,6 +1020,52 @@ impl Transaction {
 			writes.iter().map(|(_, v)| Some(v.as_slice())).collect();
 		let version_array = UInt64Array::from(vec![version; writes.len()]);
 		let tombstone_array = BooleanArray::from(vec![false; writes.len()]);
+
+		RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(key_array),
+				Arc::new(val_array),
+				Arc::new(version_array),
+				Arc::new(tombstone_array),
+			],
+		)
+	}
+
+	/// Build a `RecordBatch` of **tombstone** rows (`tombstone = true`,
+	/// empty `val`) for the given keys, stamped at `version`.
+	///
+	/// Identical Arrow schema to [`Self::build_write_batch_lance`] so a
+	/// write batch and a tombstone batch can be streamed into the **same**
+	/// `MergeInsertBuilder::execute_reader`. Folding deletions in as
+	/// tombstone rows lets a commit that both writes and deletes land as
+	/// ONE Lance version instead of a `merge_insert` + `Dataset::delete`
+	/// pair, so the version history never exposes a write-before-delete
+	/// intermediate that was never an atomic SurrealDB commit. The read
+	/// path already hides tombstones (`tombstone = false` in
+	/// [`KvSchema::build_get_predicate`] / [`KvSchema::build_range_predicate`]).
+	pub(super) fn build_tombstone_batch_lance(
+		deletes: &[crate::kvs::Key],
+		version: u64,
+	) -> std::result::Result<arrow_array::RecordBatch, arrow_schema::ArrowError> {
+		use arrow_array::{BinaryArray, BooleanArray, RecordBatch, UInt64Array};
+		use arrow_schema::{DataType, Field, Schema};
+		use std::sync::Arc;
+
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("key", DataType::Binary, false),
+			Field::new("val", DataType::Binary, false),
+			Field::new("version", DataType::UInt64, false),
+			Field::new("tombstone", DataType::Boolean, false),
+		]));
+
+		let key_array: BinaryArray = deletes.iter().map(|k| Some(k.as_slice())).collect();
+		// Tombstones carry no payload, but `val` is non-nullable, so store an
+		// empty byte string. It is never read back: a tombstone row is filtered
+		// out by `tombstone = false` before `val` is ever projected.
+		let val_array: BinaryArray = deletes.iter().map(|_| Some(&b""[..])).collect();
+		let version_array = UInt64Array::from(vec![version; deletes.len()]);
+		let tombstone_array = BooleanArray::from(vec![true; deletes.len()]);
 
 		RecordBatch::try_new(
 			schema,

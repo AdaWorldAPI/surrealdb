@@ -57,7 +57,6 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use tracing::{trace, warn};
 
 use super::DatasetHandle;
-use super::schema::KvSchema;
 use crate::kvs::err::{Error, Result};
 use crate::kvs::{Key, Val};
 
@@ -342,9 +341,23 @@ async fn execute_batch(dataset: &Arc<RwLock<DatasetHandle>>, batch: Vec<Submissi
 	}
 }
 
-/// Issue a single Lance `MergeInsertBuilder::execute_reader` (for writes)
-/// followed by a `Dataset::delete` (for deletes). One dataset version is
-/// produced per call — concurrent submitters in the same batch share it.
+/// Apply a batch's writes **and** deletes as a SINGLE Lance commit.
+///
+/// Writes become live rows (`tombstone = false`); deletes become
+/// tombstone rows (`tombstone = true`). Both are streamed into one
+/// `MergeInsertBuilder::execute_reader` keyed on `key`. `execute_batch`
+/// coalesces every key to exactly one of write/delete, so the merge
+/// source has unique keys and the upsert is well-defined - producing
+/// exactly ONE dataset version per call, which concurrent submitters in
+/// the same batch share.
+///
+/// Folding deletes in as tombstone rows (rather than a separate
+/// `Dataset::delete`) is what keeps the Lance version history aligned
+/// with SurrealDB commit boundaries. The old `merge_insert` +
+/// `Dataset::delete` pair produced *two* versions for a write+delete
+/// batch; the intermediate write-applied/delete-pending version, though
+/// hidden from live readers by the write lock, leaked through
+/// `Timeline::versions()` as a snapshot that was never an atomic commit.
 async fn single_lance_commit(
 	dataset: &Arc<RwLock<DatasetHandle>>,
 	writes: Vec<(Key, Val)>,
@@ -357,37 +370,41 @@ async fn single_lance_commit(
 		return Ok(());
 	}
 
-	let mut ds = dataset.write().await;
-
-	// ── writes ─────────────────────────────────────────────────────────
+	// Build the merge source: live rows for writes, tombstone rows for
+	// deletes. Identical schema, so both stream through one reader.
+	let mut batches: Vec<arrow_array::RecordBatch> = Vec::with_capacity(2);
 	if !writes.is_empty() {
-		let batch = super::Transaction::build_write_batch_lance(&writes, version)
-			.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?;
-		let schema_ref = batch.schema();
-		let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema_ref);
-
-		let arc_ds = Arc::new(ds.inner.clone());
-		let (new_ds, _stats) = MergeInsertBuilder::try_new(arc_ds, vec!["key".into()])
-			.map_err(|e| Error::Datastore(format!("lance merge builder: {e}")))?
-			.when_matched(WhenMatched::UpdateAll)
-			.when_not_matched(WhenNotMatched::InsertAll)
-			.try_build()
-			.map_err(|e| Error::Datastore(format!("lance merge build: {e}")))?
-			.execute_reader(reader)
-			.await
-			.map_err(|e| Error::Datastore(format!("lance merge_insert: {e}")))?;
-
-		ds.inner = Arc::try_unwrap(new_ds).unwrap_or_else(|arc| (*arc).clone());
+		batches.push(
+			super::Transaction::build_write_batch_lance(&writes, version)
+				.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?,
+		);
 	}
-
-	// ── deletes ────────────────────────────────────────────────────────
 	if !deletes.is_empty() {
-		let predicate = KvSchema::build_delete_predicate(&deletes);
-		ds.inner
-			.delete(&predicate)
-			.await
-			.map_err(|e| Error::Datastore(format!("lance delete: {e}")))?;
+		batches.push(
+			super::Transaction::build_tombstone_batch_lance(&deletes, version)
+				.map_err(|e| Error::Datastore(format!("lance build tombstones: {e}")))?,
+		);
 	}
+
+	let schema_ref = batches[0].schema();
+	let reader = arrow_array::RecordBatchIterator::new(
+		batches.into_iter().map(Ok::<_, arrow_schema::ArrowError>).collect::<Vec<_>>(),
+		schema_ref,
+	);
+
+	let mut ds = dataset.write().await;
+	let arc_ds = Arc::new(ds.inner.clone());
+	let (new_ds, _stats) = MergeInsertBuilder::try_new(arc_ds, vec!["key".into()])
+		.map_err(|e| Error::Datastore(format!("lance merge builder: {e}")))?
+		.when_matched(WhenMatched::UpdateAll)
+		.when_not_matched(WhenNotMatched::InsertAll)
+		.try_build()
+		.map_err(|e| Error::Datastore(format!("lance merge build: {e}")))?
+		.execute_reader(reader)
+		.await
+		.map_err(|e| Error::Datastore(format!("lance merge_insert: {e}")))?;
+
+	ds.inner = Arc::try_unwrap(new_ds).unwrap_or_else(|arc| (*arc).clone());
 
 	Ok(())
 }

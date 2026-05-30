@@ -57,3 +57,60 @@ guard invariant 1; invariant 2 needs new range-scan tests once
 
 **Cross-ref:** `lance/mod.rs:362-417` (get path), `lance/mod.rs:607-642`
 (scan_impl), `lance-backend/README.md` § "Transaction Model".
+
+## 2026-05-29 — kvs-lance Timeline: Lance-native versioning IS the time-series view
+**Status:** FINDING
+**Scope:** surrealdb/core/src/kvs/lance/{timeline.rs,mod.rs}
+
+The "SurrealDB-as-view-over-Lance" (Rubicon) surface needs no new storage:
+Lance 6.0.0 already exposes the full timeline. `Dataset::versions() ->
+Vec<Version{version:u64, timestamp:DateTime<Utc>, metadata}>` enumerates the
+history; `checkout_version(u64)` pins an immutable snapshot. Confirmed against
+fetched lance-6.0.0 source (dataset.rs:202 Version struct; dataset.rs:2000
+versions()) AND against in-org usage in lance-graph
+crates/lance-graph/src/graph/versioned.rs:432. The new `Timeline` /
+`TimelineView` types are read-only BY CONSTRUCTION (they own a checked-out
+snapshot, expose no set/del/commit), so "SurrealDB never mutates the leading
+store" is a type-system guarantee, not a convention. Per-key time-travel
+(`checkout_version` + tombstone-as-data) was already wired in get()/scan_impl();
+this only adds the timeline *enumeration* + a read-only view handle. Compiles
+clean under `cargo check -p surrealdb-core --features kv-lance` (Finished, 0
+errors; the only warnings are never-used on the not-yet-wired consumer side).
+
+## 2026-05-30 — kvs-lance timeline granularity = write-path-dependent (corrects 2026-05-29)
+**Status:** FINDING
+**Scope:** surrealdb/core/src/kvs/lance/{timeline.rs,tests.rs}
+
+The 2026-05-29 timeline tests wrongly assumed "1 commit = 1 Lance version".
+On the DEFAULT `WritePath::LsmWithWal`, commits land in WAL+memtable and the
+background flusher batches them into Lance asynchronously — so the timeline
+reflects FLUSH BOUNDARIES, not individual commits (observed: 2 commits → 1
+version; a single commit left latest_version unchanged). For per-commit
+timeline granularity (which the Rubicon kanban needs — each commit/plan/prune
+a distinct entry) the datastore must use `WritePath::LegacyCommitGate`, where
+`Transaction::commit` returns only after its own Lance commit lands. Tests
+fixed to construct LegacyCommitGate configs; both pass (2/2). The timeline CODE
+was correct; the test HARNESS used the wrong write-path. Design consequence:
+the ractor/kanban consumer that publishes onto the timeline must run on the
+gate path (or call an explicit flush) to get one timeline entry per Rubicon
+commit. Cross-ref: config.rs WritePath docs; writepath_legacy_commit_gate_smoke.
+
+## 2026-05-30 — A SurrealDB commit with writes+deletes was TWO Lance versions, not one
+**Status:** FINDING
+**Scope:** `kvs/lance/commit_gate.rs`, `kvs/lance/flusher.rs`, `kvs/lance/mod.rs`
+
+`single_lance_commit` applied writes via `MergeInsertBuilder::execute_reader`
+and deletes via a SEPARATE `Dataset::delete` — each its own native Lance
+commit. So any batch carrying both produced two versions: an intermediate
+(writes applied, deletes pending) and the final. The datastore write lock hid
+the intermediate from live readers, but `Timeline::versions()` enumerates raw
+`Dataset::versions()` and surfaced it, letting a replayer `view_at()` a torn
+state that never atomically existed. The schema was already built for the fix
+(a `tombstone` Boolean column + read predicates filtering `tombstone = false`):
+folding deletes as tombstone rows into the same `merge_insert` makes
+1 commit = 1 version *structurally*, not by convention. Trade-off accepted:
+tombstone rows accumulate until a compaction/GC pass (physical `Dataset::delete`
+previously reclaimed that space immediately).
+
+**Cross-ref:** codex P1 on PR #29 (discussion_r3328296248); fix in this
+commit; regression `test_timeline_write_delete_commit_is_single_atomic_version`.

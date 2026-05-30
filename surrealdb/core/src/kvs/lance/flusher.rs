@@ -37,7 +37,6 @@ use tracing::{trace, warn};
 
 use super::DatasetHandle;
 use super::memtable::{Memtable, Op};
-use super::schema::KvSchema;
 use super::wal::Wal;
 use crate::kvs::err::{Error, Result};
 use crate::kvs::{Key, Val};
@@ -244,13 +243,20 @@ async fn do_flush(
 	Ok(snapshot.len())
 }
 
-/// Issue a single Lance `MergeInsertBuilder::execute_reader` for the
-/// writes, followed by `Dataset::delete` for the deletes. One
-/// dataset version is produced per call.
+/// Apply a flush's writes **and** deletes as a SINGLE Lance commit.
 ///
-/// Extracted from the prior `commit_gate::single_lance_commit` —
-/// same shape, no longer routed through the gate because the flusher
-/// is the only writer to Lance now.
+/// Writes become live rows (`tombstone = false`); deletes become
+/// tombstone rows (`tombstone = true`). Both stream into one
+/// `MergeInsertBuilder::execute_reader` keyed on `key`. A memtable
+/// snapshot holds exactly one op per key, so the merge source has unique
+/// keys and the upsert produces exactly ONE dataset version per flush.
+///
+/// Folding deletes in as tombstone rows (rather than a separate
+/// `Dataset::delete`) keeps the Lance version history aligned with flush
+/// boundaries: the old `merge_insert` + `Dataset::delete` pair produced
+/// *two* versions for a write+delete flush, and the intermediate
+/// write-applied/delete-pending version leaked through
+/// `Timeline::versions()` as a snapshot that never atomically existed.
 async fn single_lance_commit(
 	dataset: &Arc<RwLock<DatasetHandle>>,
 	writes: Vec<(Key, Val)>,
@@ -263,35 +269,41 @@ async fn single_lance_commit(
 		return Ok(());
 	}
 
-	let mut ds = dataset.write().await;
-
+	// Build the merge source: live rows for writes, tombstone rows for
+	// deletes. Identical schema, so both stream through one reader.
+	let mut batches: Vec<arrow_array::RecordBatch> = Vec::with_capacity(2);
 	if !writes.is_empty() {
-		let batch = super::Transaction::build_write_batch_lance(&writes, version)
-			.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?;
-		let schema_ref = batch.schema();
-		let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema_ref);
-
-		let arc_ds = Arc::new(ds.inner.clone());
-		let (new_ds, _stats) = MergeInsertBuilder::try_new(arc_ds, vec!["key".into()])
-			.map_err(|e| Error::Datastore(format!("lance merge builder: {e}")))?
-			.when_matched(WhenMatched::UpdateAll)
-			.when_not_matched(WhenNotMatched::InsertAll)
-			.try_build()
-			.map_err(|e| Error::Datastore(format!("lance merge build: {e}")))?
-			.execute_reader(reader)
-			.await
-			.map_err(|e| Error::Datastore(format!("lance merge_insert: {e}")))?;
-
-		ds.inner = Arc::try_unwrap(new_ds).unwrap_or_else(|arc| (*arc).clone());
+		batches.push(
+			super::Transaction::build_write_batch_lance(&writes, version)
+				.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?,
+		);
 	}
-
 	if !deletes.is_empty() {
-		let predicate = KvSchema::build_delete_predicate(&deletes);
-		ds.inner
-			.delete(&predicate)
-			.await
-			.map_err(|e| Error::Datastore(format!("lance delete: {e}")))?;
+		batches.push(
+			super::Transaction::build_tombstone_batch_lance(&deletes, version)
+				.map_err(|e| Error::Datastore(format!("lance build tombstones: {e}")))?,
+		);
 	}
+
+	let schema_ref = batches[0].schema();
+	let reader = arrow_array::RecordBatchIterator::new(
+		batches.into_iter().map(Ok::<_, arrow_schema::ArrowError>).collect::<Vec<_>>(),
+		schema_ref,
+	);
+
+	let mut ds = dataset.write().await;
+	let arc_ds = Arc::new(ds.inner.clone());
+	let (new_ds, _stats) = MergeInsertBuilder::try_new(arc_ds, vec!["key".into()])
+		.map_err(|e| Error::Datastore(format!("lance merge builder: {e}")))?
+		.when_matched(WhenMatched::UpdateAll)
+		.when_not_matched(WhenNotMatched::InsertAll)
+		.try_build()
+		.map_err(|e| Error::Datastore(format!("lance merge build: {e}")))?
+		.execute_reader(reader)
+		.await
+		.map_err(|e| Error::Datastore(format!("lance merge_insert: {e}")))?;
+
+	ds.inner = Arc::try_unwrap(new_ds).unwrap_or_else(|arc| (*arc).clone());
 
 	Ok(())
 }

@@ -336,10 +336,6 @@ pub struct LanceConfig {
 	/// `Dataset::checkout(version)`).
 	pub versioned: bool,
 
-	/// Whether to write deletions as explicit tombstone rows
-	/// (in addition to using Lance's native deletion vectors).
-	pub delete_via_tombstone_row: bool,
-
 	/// Which write-path to use. See [`WritePath`] for the two
 	/// options and their semantics. Defaults to
 	/// [`WritePath::LsmWithWal`] — the Sprint AA hot path.
@@ -367,7 +363,6 @@ impl Default for LanceConfig {
 	fn default() -> Self {
 		Self {
 			versioned: true,
-			delete_via_tombstone_row: false,
 			write_path: WritePath::default(),
 			disable_background_flusher: false,
 		}

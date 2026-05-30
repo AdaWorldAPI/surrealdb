@@ -1900,3 +1900,199 @@ async fn writepath_legacy_commit_gate_provides_snapshot_iso() {
 
     ds.shutdown().await.expect("shutdown");
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Timeline — read-only time-series view (the Rubicon "SurrealDB-as-view")
+// ──────────────────────────────────────────────────────────────────────────
+
+/// The timeline enumerates Lance's native version history and that history
+/// grows by one entry per committed transaction.
+///
+/// Uses `WritePath::LegacyCommitGate`: only the gate path makes every commit
+/// land synchronously as its own Lance dataset version. On the default
+/// `LsmWithWal` path, commits batch through the WAL+memtable and the
+/// background flusher migrates them into Lance asynchronously, so the
+/// timeline reflects *flush boundaries*, not individual commits — the
+/// correct granularity for a per-commit Rubicon kanban is the gate path.
+#[tokio::test]
+async fn test_timeline_versions_grow_with_commits() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("path is valid UTF-8");
+	let ds = Datastore::new(
+		path_str,
+		LanceConfig {
+			write_path: WritePath::LegacyCommitGate,
+			..LanceConfig::default()
+		},
+	)
+	.await
+	.expect("create");
+
+	let timeline = ds.timeline();
+	let v_start = timeline.versions().await.expect("versions @ start").len();
+
+	// Two committed write transactions → at least two new Lance versions.
+	for (k, v) in [(b"a".as_ref(), b"1".as_ref()), (b"b".as_ref(), b"2".as_ref())] {
+		let tx = ds.transaction(true, false).await.expect("tx");
+		tx.set(k.to_vec(), v.to_vec()).await.expect("set");
+		tx.commit().await.expect("commit");
+	}
+
+	let versions = timeline.versions().await.expect("versions @ end");
+	assert!(
+		versions.len() >= v_start + 2,
+		"expected ≥{} versions after 2 commits, got {}",
+		v_start + 2,
+		versions.len()
+	);
+	// Version numbers are monotone non-decreasing along the timeline.
+	for w in versions.windows(2) {
+		assert!(w[0].version <= w[1].version, "timeline not monotone: {:?}", versions);
+	}
+	// The latest entry matches the datastore's current version.
+	let latest = timeline.latest_version().await;
+	assert_eq!(
+		versions.last().map(|vi| vi.version),
+		Some(latest),
+		"timeline tail must equal current_version"
+	);
+
+	ds.shutdown().await.expect("shutdown");
+}
+
+/// A historical [`TimelineView`] reads the SoA as it stood at that version:
+/// a key written at version N is absent from a view pinned before N and
+/// present from the view at/after N.
+#[tokio::test]
+async fn test_timeline_view_reads_historical_soa() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("path is valid UTF-8");
+	// LegacyCommitGate: each commit lands synchronously as its own Lance
+	// version, so `v_before < v_after` holds per-commit (see the companion
+	// test's note on the LSM flush-boundary semantics).
+	let ds = Datastore::new(
+		path_str,
+		LanceConfig {
+			write_path: WritePath::LegacyCommitGate,
+			..LanceConfig::default()
+		},
+	)
+	.await
+	.expect("create");
+
+	let timeline = ds.timeline();
+	let v_before = timeline.latest_version().await;
+
+	// Commit a single key.
+	{
+		let tx = ds.transaction(true, false).await.expect("tx");
+		tx.set(b"hist".to_vec(), b"present".to_vec()).await.expect("set");
+		tx.commit().await.expect("commit");
+	}
+	let v_after = timeline.latest_version().await;
+	assert!(v_after > v_before, "commit did not advance the dataset version");
+
+	// View at the latest version sees the value.
+	let view_after = timeline.view_at(v_after).await.expect("view @ after");
+	assert_eq!(view_after.version(), v_after);
+	assert_eq!(
+		view_after.get(&b"hist".to_vec()).await.expect("get @ after").as_deref(),
+		Some(b"present".as_ref()),
+		"view at the write version must see the key"
+	);
+
+	// View at the pre-write version must NOT see the value.
+	let view_before = timeline.view_at(v_before).await.expect("view @ before");
+	assert!(
+		view_before.get(&b"hist".to_vec()).await.expect("get @ before").is_none(),
+		"view before the write must not see the key (time-travel violated)"
+	);
+
+	// scan() at the latest version surfaces the live row.
+	let rows = view_after.scan().await.expect("scan @ after");
+	assert!(
+		rows.iter().any(|(k, v)| k == b"hist" && v == b"present"),
+		"timeline scan must surface the committed row; got {rows:?}"
+	);
+
+	ds.shutdown().await.expect("shutdown");
+}
+
+/// REGRESSION (codex P1 on PR #29): a single transaction carrying BOTH
+/// writes and deletes must land as exactly ONE Lance version, not two.
+///
+/// Before the fix the commit/flush path applied writes via
+/// `MergeInsertBuilder::execute_reader` and deletes via a *separate*
+/// `Dataset::delete`, producing two native versions per commit. The
+/// intermediate (writes-applied, delete-pending) version was hidden from
+/// live readers by the datastore write lock, but `Timeline::versions()`
+/// surfaced it, so a replayer's `view_at()` could materialize a torn state
+/// that was never an atomic SurrealDB commit. Folding deletes into tombstone
+/// rows of the same merge collapses the pair into a single version.
+#[tokio::test]
+async fn test_timeline_write_delete_commit_is_single_atomic_version() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("path is valid UTF-8");
+	// Gate path: 1 commit = 1 Lance version, so the version delta this test
+	// asserts on is exact.
+	let ds = Datastore::new(
+		path_str,
+		LanceConfig {
+			write_path: WritePath::LegacyCommitGate,
+			..LanceConfig::default()
+		},
+	)
+	.await
+	.expect("create");
+
+	// Seed two committed keys so the later delete has a live row to remove.
+	{
+		let tx = ds.transaction(true, false).await.expect("tx seed");
+		tx.set(b"keep".to_vec(), b"old".to_vec()).await.expect("set keep");
+		tx.set(b"victim".to_vec(), b"doomed".to_vec()).await.expect("set victim");
+		tx.commit().await.expect("commit seed");
+	}
+
+	let timeline = ds.timeline();
+	let versions_before = timeline.versions().await.expect("versions before").len();
+
+	// ONE transaction that BOTH writes (`fresh`, overwrite `keep`) and deletes
+	// (`victim`). Pre-fix this produced TWO Lance versions.
+	{
+		let tx = ds.transaction(true, false).await.expect("tx mixed");
+		tx.set(b"fresh".to_vec(), b"new".to_vec()).await.expect("set fresh");
+		tx.set(b"keep".to_vec(), b"new".to_vec()).await.expect("overwrite keep");
+		tx.del(b"victim".to_vec()).await.expect("del victim");
+		tx.commit().await.expect("commit mixed");
+	}
+
+	let versions_after = timeline.versions().await.expect("versions after").len();
+	assert_eq!(
+		versions_after,
+		versions_before + 1,
+		"a write+delete commit must add EXACTLY ONE Lance version (atomic); \
+		 got {} new, a torn write-before-delete intermediate leaked",
+		versions_after - versions_before
+	);
+
+	// The single new version is a coherent atomic snapshot: the new write is
+	// present, the overwrite is reflected, and the delete is applied all at
+	// once, with no intermediate state observable.
+	let view = timeline.view_latest().await.expect("view latest");
+	assert_eq!(
+		view.get(&b"fresh".to_vec()).await.expect("get fresh").as_deref(),
+		Some(b"new".as_ref()),
+		"atomic snapshot must include the new write"
+	);
+	assert_eq!(
+		view.get(&b"keep".to_vec()).await.expect("get keep").as_deref(),
+		Some(b"new".as_ref()),
+		"atomic snapshot must reflect the overwrite"
+	);
+	assert!(
+		view.get(&b"victim".to_vec()).await.expect("get victim").is_none(),
+		"atomic snapshot must reflect the delete (tombstone hides the row)"
+	);
+
+	ds.shutdown().await.expect("shutdown");
+}
