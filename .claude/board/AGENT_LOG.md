@@ -213,3 +213,26 @@ EpisodicWitness64; replace BindSpace; wire deprecated→cognitive-shader-driver.
 - Phase 4 (tombstone GC + version backpressure) is the next roadmap item.
 
 **Commit(s):** d9bfca7
+
+## 2026-05-30T15:30 — phase3 clippy hygiene (full-auto session)
+**Branch:** claude/sleepy-cori-aRK2x
+**Scope:** surrealdb/core/src/kvs/lance/mod.rs (get, scan_impl)
+**Verdict:** PASS
+
+**What was done (max 5 lines):**
+- Ran clippy on the kv-lance surface (9m34s); exit 0. My Phase 3 changes
+  introduced ZERO new lints — the 3 it cited are pre-existing (verified vs
+  348bb4d), just inside the read-path fns I edited for LsmColumnar.
+- Cleared them with clippy's verbatim fixes: get() nested if-let → let-chain;
+  scan_impl() two `match {Ok=>Some,Err=>None}` → `.ok()`. Behaviour-identical.
+
+**Tests run:**
+- `cargo test -p surrealdb-core --features kv-lance --lib kvs::lance` → 100 passed; 0 failed; 3 ignored
+
+**Open questions / follow-ups:**
+- 6 clippy warnings remain: unwired TimelineView dead-code (prior session,
+  intentional). `-D warnings` can't pass until that consumer lands — out of scope.
+- Integration suite (SURREAL_TEST_KV=lance) NOT run: full-workspace build risks
+  ENOSPC (13G free); needs more reclaim or a scoped run.
+
+**Commit(s):** (this commit)
