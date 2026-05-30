@@ -358,6 +358,7 @@ impl Datastore {
 	/// hands out immutable [`TimelineView`]s. It shares the same dataset
 	/// handle as live transactions — no second open — and exposes reads
 	/// only, so it cannot mutate the leading store.
+	#[allow(dead_code)]
 	pub(crate) fn timeline(&self) -> Timeline {
 		Timeline::new(Arc::clone(&self.dataset))
 	}

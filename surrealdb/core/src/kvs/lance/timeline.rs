@@ -1,4 +1,5 @@
 #![cfg(feature = "kv-lance")]
+#![allow(dead_code)] // unwired, test-covered read surface (future kanban/replay consumer)
 
 //! # Timeline — read-only time-series view into the Lance-backed SoA
 //!
