@@ -114,3 +114,28 @@ previously reclaimed that space immediately).
 
 **Cross-ref:** codex P1 on PR #29 (discussion_r3328296248); fix in this
 commit; regression `test_timeline_write_delete_commit_is_single_atomic_version`.
+
+## 2026-05-30 — No CI runs on this fork; .rustfmt.toml is split-brain (stable build, nightly-only fmt opts)
+**Status:** FINDING
+**Scope:** repo CI/tooling — `.github/workflows/ci.yml`, `.rustfmt.toml`, `rust-toolchain*`
+
+PR #29 head (5997eea) has ZERO check runs; the only commit status is the
+CodeRabbit review bot (pending). `ci.yml` triggers on every `pull_request`
+(no branch filter), so the absence is environmental: GitHub Actions is not
+enabled/approved on the AdaWorldAPI fork. Net: the only merge gate is the
+review bots + the human owner — there is no test/clippy/fmt enforcement.
+Separately, `.rustfmt.toml` enables nightly-only options (wrap_comments,
+imports_granularity=Module, group_imports=StdExternalCrate, comment_width)
+while the build toolchain is pinned stable 1.95 (`rust-toolchain.toml`); the
+fmt-only nightly (`rust-toolchain.nightly` = nightly-2025-08-07) is never run
+here. Running fmt under either stable or that nightly reformats the WHOLE
+crate (~1900 lines, 22+ files) => HEAD is not fmt-clean under its own config.
+Consequence: "future-proof" config that no gate enforces is pure drift. Per
+the org's 99%-stable policy (nightly only for Miri in ndarray), the resolution
+is to make the config stable-honest (comment out the unstable opts) and lean
+on stable tools (cargo-machete et al.). A one-time stable `cargo fmt`
+normalization is a separate, deliberate follow-up (not triggered here, to
+avoid mixing mass reformat churn into feature commits).
+
+**Cross-ref:** PR #29 check status (0 runs); ci.yml on-block; this commit's
+`.rustfmt.toml` change; GRIDLAKE_BUILD.md.
