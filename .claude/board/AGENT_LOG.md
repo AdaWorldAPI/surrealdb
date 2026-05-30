@@ -247,3 +247,25 @@ reads, lance optimize) — same path lance-graph uses. Pipeline: 1 Opus agent/fi
 (mod.rs, config.rs, tests.rs) → savant testers → fix → strip `// ///REVIEW:` →
 clippy (sole gate) → PR → subscribe+fix. tee-only, no compiles until clippy.
 - 2026-05-30 AGENT 2 (config.rs): LanceConfig flusher cleanup. Found WritePath enum + write_path/flusher_tick_interval/disable_background_flusher already absent from current config.rs; LanceConfig already carried only `versioned`. Verified no WritePath refs/uses remain anywhere. Updated LanceConfig doc-comment to record the native rewrite drops those knobs (lance optimize owns compaction/GC). Left a // ///REVIEW: noting spec KEEP list mentions retention_ns but the struct never had it (env-var/background_optimizer owns retention) — did not invent a field. Touched ONLY the kv-lance LanceConfig region via tee; Memory/SurrealKv/RocksDb configs untouched.
+
+## 2026-05-30 — AGENT 1: native-only kvs/lance/mod.rs
+Rewrote `surrealdb/core/src/kvs/lance/mod.rs` to lance's NATIVE read/write path.
+commit() now builds one Arrow batch (writes + tombstone rows) and applies it with a
+single `MergeInsertBuilder::execute_reader` (moved `execute_merge` in from flusher.rs)
+= one commit / one lance version. Deleted commit_lsm/commit_legacy_gate and the
+memtable branch in get()/scan_impl(); reads are pending → lance (checkout_version via
+.ok() | latest) → filter/project/merge. Datastore now keeps {dataset, versioned,
+background_optimizer, commit_seq}; Transaction keeps {done, write, versioned, pending,
+save_points, read_version, dataset, background_optimizer, commit_seq}. Removed
+mod {commit_gate,flusher,memtable,wal} + their imports + WritePath. Kept proven helpers
+build_write_batch_lance/build_tombstone_batch_lance/max_persisted_seq/DatasetHandle and
+the test-only scan helpers. NOTE: tests.rs + integration_tests still reference removed
+items (WritePath, LanceConfig::{write_path,disable_background_flusher,flusher_tick_interval},
+commit_gate module) — they need agent 2/3 / orchestrator follow-up. Did NOT run cargo.
+
+## 2026-05-30T17:05 — AGENT 3: rewrote kvs/lance/tests.rs (Transactable contract only)
+**Scope:** surrealdb/core/src/kvs/lance/tests.rs (tee-only; no cargo run)
+- Kept 57 `#[tokio::test]` contract tests: lifecycle (kind/closed sticky/writeable/readonly+finished guards), get/exists (RYW, pending tombstone, committed, versioned-on-false errors), set/commit/cancel/overwrite/del round-trips, put/putc/delc CAS (match/mismatch/None-None/None-on-existing), scan/scanr/keys/keysr (order, half-open range, skip+limit, pending merge incl. override+delete-hide), ScanLimit Bytes/BytesOrCount, savepoints (rollback incl. tombstone restore, release, nested, empty-stack errors for both), versioning time-travel, concurrency (disjoint + same-key OCC), differential-vs-HashMap, optimizer-alive + shutdown-timeout, 3 timeline read-view tests.
+- Deleted all LSM/reinvention tests: writepath_*, lsm_recovery_*, seq_column_*, commit_gate_*, shutdown_drains_pending_commits, bench_lsm_*; dropped `WritePath` import + `scan_seqs/scan_versions/dataset_for_tests` usage.
+- LanceConfig field set ASSUMED = `{ versioned: bool }` only (matches the already-rewritten config.rs); every literal now sets only `versioned`.
+- 4 `// ///REVIEW:` anchors (all about "one commit = one lance version"): get_at_specific_version (checkout sees old-or-None), timeline versions_grow (≥2 lower-bound vs compaction), timeline view historical (v_after>v_before), timeline write+delete single-version (==before+1).
