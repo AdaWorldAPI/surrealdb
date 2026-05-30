@@ -229,3 +229,24 @@ IMPLEMENTED for Phases 1-2. Per the append-only discipline the GRIDLAKE doc
 body was NOT mutated; this entry is the canonical re-tag record.
 
 **Cross-ref:** commits 7266acf, e329a7a, 55fc45c; GRIDLAKE.md §8; this session's grep/check audit.
+
+## 2026-05-30 — Next-arc integration plans located + consolidated (BindSpace→SoA / AriGraph witness / ractor mailbox)
+**Status:** FINDING
+**Scope:** cross-repo; recorded in .claude/board/INTEGRATION_PLANS.md
+
+The three next items already have concrete plans, as a PR series in
+**lance-graph/.claude/specs/ (the `pr-ce64-mb-*` CausalEdge64-MailBox series)**:
+mb-3 BindSpace-EFGH (A), mb-4 AriGraph-SPO-G + sprint-13 witness-CAM-PQ (B),
+mb-5 mailbox-SoA-attentionmask + pr-f-1/g2 ractor-supervisor (C). SoA carrier
+math is ndarray's 3DGS-4x4-cognitive-shader-SoA plan (`BindSpace4` lanes);
+AriGraph is SHIPPED (lance-graph graph/arigraph, ~4.7k LOC); witness ingestion
+is `witness→splat→RowDelta→apply` (lance-graph pattern.md:236). Substrate is
+the just-merged kv-lance + Rubicon Timeline (#31). KEY: #31's "one commit = one
+version" retires the old "kanban consumer must run on the gate path" caveat —
+per-card-move timeline granularity is now free. INVARIANT preserved: AriGraph
+witness/class metadata go ONE LAYER UP (val payload / lance-graph datasets),
+never into kv-lance columns (N1). Open forks: replace-vs-migrate BindSpace;
+EpisodicWitness64-onto-timeline design; writer-of-record vs DataFusion view (F2);
+lance 6.0.0 vs 6.0.1 pin skew. Full matrix + cross-repo diagram in INTEGRATION_PLANS.md.
+
+**Cross-ref:** PR #31; lance-graph/.claude/specs/pr-ce64-mb-{3,4,5}; ndarray 3DGS-4x4-SoA plan; AGENT_LOG.md:96-97.
