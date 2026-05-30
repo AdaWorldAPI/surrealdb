@@ -279,3 +279,15 @@ commit_gate module) — they need agent 2/3 / orchestrator follow-up. Did NOT ru
   lance OCC conflict -> Error::TransactionRetryable, get@version deletion-vector
   semantics, timeline version-count assertions. Next: savant testers -> fix ->
   strip /// -> clippy -> PR -> subscribe.
+
+## 2026-05-30T17:40 — 3 savants complete; consolidated fix plan
+**Verdict:** native rewrite compile+clippy-ready; 1 correctness BLOCKER + minors.
+**Fixes to apply (orchestrator):**
+- [BLOCKER] mod.rs execute_merge: `.map_err(|e| Error::Datastore(...))?` -> `.map_err(Error::from)?`
+  (reuse err.rs From<lance::Error> -> Error::TransactionConflict, the retryable variant).
+- [BLOCKER-2] err.rs From<lance::Error>: add arm for lance write-contention-exhaustion -> TransactionConflict.
+- [M1] reads @ latest for version=None = native lance-graph read-committed (INTENTIONAL) — document; reorder closed() before versioned check.
+- [doc] fix stale "arrow 57 / lance 4.0 / 1.0.4" -> "arrow 58 / lance 6.0.0"; fix read_version "dead_code" clause; drop stale mod.rs:1267 banner; soften schema "= Lance version" comment.
+- STRIP all `// ///REVIEW:` sentinels.
+**GATE COMMAND (Savant C — critical):** `cargo clippy -p surrealdb-core --features kv-lance --tests -- -D warnings`
+  (stock `cargo make ci-clippy` omits kv-lance and would cfg-strip the rewrite = false green).
