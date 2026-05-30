@@ -2017,3 +2017,82 @@ async fn test_timeline_view_reads_historical_soa() {
 
 	ds.shutdown().await.expect("shutdown");
 }
+
+/// REGRESSION (codex P1 on PR #29): a single transaction carrying BOTH
+/// writes and deletes must land as exactly ONE Lance version, not two.
+///
+/// Before the fix the commit/flush path applied writes via
+/// `MergeInsertBuilder::execute_reader` and deletes via a *separate*
+/// `Dataset::delete`, producing two native versions per commit. The
+/// intermediate (writes-applied, delete-pending) version was hidden from
+/// live readers by the datastore write lock, but `Timeline::versions()`
+/// surfaced it, so a replayer's `view_at()` could materialize a torn state
+/// that was never an atomic SurrealDB commit. Folding deletes into tombstone
+/// rows of the same merge collapses the pair into a single version.
+#[tokio::test]
+async fn test_timeline_write_delete_commit_is_single_atomic_version() {
+	let path = unique_tmp_path();
+	let path_str = path.to_str().expect("path is valid UTF-8");
+	// Gate path: 1 commit = 1 Lance version, so the version delta this test
+	// asserts on is exact.
+	let ds = Datastore::new(
+		path_str,
+		LanceConfig {
+			write_path: WritePath::LegacyCommitGate,
+			..LanceConfig::default()
+		},
+	)
+	.await
+	.expect("create");
+
+	// Seed two committed keys so the later delete has a live row to remove.
+	{
+		let tx = ds.transaction(true, false).await.expect("tx seed");
+		tx.set(b"keep".to_vec(), b"old".to_vec()).await.expect("set keep");
+		tx.set(b"victim".to_vec(), b"doomed".to_vec()).await.expect("set victim");
+		tx.commit().await.expect("commit seed");
+	}
+
+	let timeline = ds.timeline();
+	let versions_before = timeline.versions().await.expect("versions before").len();
+
+	// ONE transaction that BOTH writes (`fresh`, overwrite `keep`) and deletes
+	// (`victim`). Pre-fix this produced TWO Lance versions.
+	{
+		let tx = ds.transaction(true, false).await.expect("tx mixed");
+		tx.set(b"fresh".to_vec(), b"new".to_vec()).await.expect("set fresh");
+		tx.set(b"keep".to_vec(), b"new".to_vec()).await.expect("overwrite keep");
+		tx.del(b"victim".to_vec()).await.expect("del victim");
+		tx.commit().await.expect("commit mixed");
+	}
+
+	let versions_after = timeline.versions().await.expect("versions after").len();
+	assert_eq!(
+		versions_after,
+		versions_before + 1,
+		"a write+delete commit must add EXACTLY ONE Lance version (atomic); \
+		 got {} new, a torn write-before-delete intermediate leaked",
+		versions_after - versions_before
+	);
+
+	// The single new version is a coherent atomic snapshot: the new write is
+	// present, the overwrite is reflected, and the delete is applied all at
+	// once, with no intermediate state observable.
+	let view = timeline.view_latest().await.expect("view latest");
+	assert_eq!(
+		view.get(&b"fresh".to_vec()).await.expect("get fresh").as_deref(),
+		Some(b"new".as_ref()),
+		"atomic snapshot must include the new write"
+	);
+	assert_eq!(
+		view.get(&b"keep".to_vec()).await.expect("get keep").as_deref(),
+		Some(b"new".as_ref()),
+		"atomic snapshot must reflect the overwrite"
+	);
+	assert!(
+		view.get(&b"victim".to_vec()).await.expect("get victim").is_none(),
+		"atomic snapshot must reflect the delete (tombstone hides the row)"
+	);
+
+	ds.shutdown().await.expect("shutdown");
+}
