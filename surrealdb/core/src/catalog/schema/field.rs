@@ -149,3 +149,183 @@ impl ToSql for FieldDefinition {
 		self.to_sql_definition().fmt_sql(f, fmt)
 	}
 }
+
+/// DDL-friendly constructor and chainable setters for [`FieldDefinition`].
+///
+/// External codegen tools build typed field definitions to render via
+/// [`ToSql`] without an actual in-DB allocation. See the table-level
+/// equivalent in `catalog::TableDefinition::new_for_ddl` and
+/// `.claude/op-codegen-bridge/README.md` for the initiative context.
+///
+/// Not exposed: setters for `default` (uses `pub(crate) DefineDefault`),
+/// the three `Permission` slots, `auth_limit`, and `computed_deps` — those
+/// types are `pub(crate)` and follow in dedicated sprints (auth, computed
+/// fields). For DDL emission of typical Rails-mapped schemas the slots
+/// covered here (kind, assert, value, computed, comment, reference,
+/// flexible, readonly) are sufficient.
+//
+// `dead_code` allowed: see the equivalent comment on the
+// `TableDefinition` DDL-builder impl in `catalog/table.rs`.
+#[allow(dead_code)]
+impl FieldDefinition {
+	/// Construct a [`FieldDefinition`] for **DDL emission only**.
+	///
+	/// All optional slots default to `None`; permissions default to
+	/// `Permission::default()` (= `Full`); booleans default to `false`.
+	/// Combine with the `with_*` builders below to fill DDL slots fluently.
+	pub fn new_for_ddl(name: Idiom, table: TableName) -> Self {
+		Self {
+			name,
+			table,
+			..Default::default()
+		}
+	}
+
+	/// Set `field_kind`. Returns `self` for chaining.
+	#[must_use]
+	pub fn with_kind(mut self, v: Option<Kind>) -> Self {
+		self.field_kind = v;
+		self
+	}
+
+	/// Set `flexible`. Returns `self` for chaining.
+	#[must_use]
+	pub fn with_flexible(mut self, v: bool) -> Self {
+		self.flexible = v;
+		self
+	}
+
+	/// Set `readonly`. Returns `self` for chaining.
+	#[must_use]
+	pub fn with_readonly(mut self, v: bool) -> Self {
+		self.readonly = v;
+		self
+	}
+
+	/// Set `value` (computed default expression). Returns `self` for
+	/// chaining.
+	#[must_use]
+	pub fn with_value(mut self, v: Option<Expr>) -> Self {
+		self.value = v;
+		self
+	}
+
+	/// Set `assert` (validation expression). Returns `self` for chaining.
+	#[must_use]
+	pub fn with_assert(mut self, v: Option<Expr>) -> Self {
+		self.assert = v;
+		self
+	}
+
+	/// Set `computed` (virtual field expression). Returns `self` for
+	/// chaining.
+	#[must_use]
+	pub fn with_computed(mut self, v: Option<Expr>) -> Self {
+		self.computed = v;
+		self
+	}
+
+	/// Set `comment`. Returns `self` for chaining.
+	#[must_use]
+	pub fn with_comment(mut self, v: Option<String>) -> Self {
+		self.comment = v;
+		self
+	}
+
+	/// Set `reference` (graph reference metadata). Returns `self` for
+	/// chaining.
+	#[must_use]
+	pub fn with_reference(mut self, v: Option<Reference>) -> Self {
+		self.reference = v;
+		self
+	}
+}
+
+#[cfg(test)]
+mod ddl_builder_tests {
+	//! C16b — DDL-friendly constructor + setters for FieldDefinition.
+	//! See `.claude/op-codegen-bridge/README.md` for context.
+
+	use std::str::FromStr;
+
+	use surrealdb_types::ToSql;
+
+	use super::*;
+	use crate::expr::Idiom;
+	use crate::val::TableName;
+
+	fn idiom(s: &str) -> Idiom {
+		Idiom::from_str(s).expect("test idiom literal must parse")
+	}
+
+	#[test]
+	fn new_for_ddl_defaults_to_no_kind_and_no_constraints() {
+		let f = FieldDefinition::new_for_ddl(idiom("name"), TableName::from("widget"));
+		assert!(f.field_kind.is_none());
+		assert!(f.value.is_none());
+		assert!(f.assert.is_none());
+		assert!(f.computed.is_none());
+		assert!(!f.flexible);
+		assert!(!f.readonly);
+		assert!(f.comment.is_none());
+		assert!(f.reference.is_none());
+	}
+
+	#[test]
+	fn new_for_ddl_carries_name_and_table_through_to_sql() {
+		let f = FieldDefinition::new_for_ddl(idiom("subject"), TableName::from("WorkPackage"));
+		let sql = f.to_sql();
+		assert!(sql.contains("subject"), "field name missing: {sql}");
+		assert!(sql.contains("WorkPackage"), "table missing: {sql}");
+	}
+
+	#[test]
+	fn with_kind_round_trips() {
+		let f = FieldDefinition::new_for_ddl(idiom("count"), TableName::from("t"))
+			.with_kind(Some(Kind::Int));
+		assert!(matches!(f.field_kind, Some(Kind::Int)));
+	}
+
+	#[test]
+	fn with_flexible_and_readonly_round_trip() {
+		let f = FieldDefinition::new_for_ddl(idiom("c"), TableName::from("t"))
+			.with_flexible(true)
+			.with_readonly(true);
+		assert!(f.flexible);
+		assert!(f.readonly);
+	}
+
+	#[test]
+	fn with_comment_round_trips() {
+		let f = FieldDefinition::new_for_ddl(idiom("c"), TableName::from("t"))
+			.with_comment(Some("hi".to_string()));
+		assert_eq!(f.comment.as_deref(), Some("hi"));
+	}
+
+	#[test]
+	fn builder_output_equals_struct_literal_output() {
+		let raw = FieldDefinition {
+			name: idiom("subject"),
+			table: TableName::from("WorkPackage"),
+			field_kind: Some(Kind::Int),
+			flexible: true,
+			readonly: false,
+			value: None,
+			assert: None,
+			computed: None,
+			default: DefineDefault::None,
+			select_permission: Permission::default(),
+			create_permission: Permission::default(),
+			update_permission: Permission::default(),
+			comment: Some("the subject".to_string()),
+			reference: None,
+			auth_limit: AuthLimit::new_no_limit(),
+			computed_deps: None,
+		};
+		let built = FieldDefinition::new_for_ddl(idiom("subject"), TableName::from("WorkPackage"))
+			.with_kind(Some(Kind::Int))
+			.with_flexible(true)
+			.with_comment(Some("the subject".to_string()));
+		assert_eq!(raw.to_sql(), built.to_sql());
+	}
+}

@@ -129,6 +129,89 @@ impl ToSql for TableDefinition {
 	}
 }
 
+/// DDL-friendly constructors and chainable setters for [`TableDefinition`].
+///
+/// External codegen tools build typed table definitions to render via
+/// [`ToSql`] without an actual in-DB allocation. These methods supply dummy
+/// runtime IDs and a chainable setter API so the `pub(crate)` fields stay
+/// encapsulated. See `.claude/op-codegen-bridge/README.md` for the
+/// initiative context.
+//
+// `dead_code` is allowed because these `pub` items have no in-crate
+// callers — they exist solely as the public ergonomic surface for
+// external `surrealdb_core` consumers. The `#[cfg(test)]
+// ddl_builder_tests` module below exercises every method, but the
+// `dead_code` lint runs on the non-test build target where no caller
+// is visible.
+#[allow(dead_code)]
+impl TableDefinition {
+	/// Construct a [`TableDefinition`] for **DDL emission only**.
+	///
+	/// All runtime IDs are set to dummy zero values
+	/// (`NamespaceId(0)`, `DatabaseId(0)`, `TableId(0)`); cache timestamps
+	/// are `Uuid::now_v7()`. The dummy IDs do not appear in DDL output —
+	/// the rendered `DefineTableStatement` only emits `id` when explicitly
+	/// set elsewhere in the codegen path. Verified by the
+	/// [`ddl_builder_tests::new_for_ddl_does_not_leak_table_id_into_render`]
+	/// test below.
+	///
+	/// Suitable for callers that want to build a typed table definition
+	/// purely to render it to SurrealQL via [`ToSql::to_sql`]. Combine with
+	/// the `with_*` builders below to fill DDL slots fluently.
+	pub fn new_for_ddl(name: impl Into<TableName>) -> Self {
+		Self::new(NamespaceId(0), DatabaseId(0), TableId(0), name.into())
+	}
+
+	/// Set `schemafull`. Returns `self` for chaining.
+	#[must_use]
+	pub fn with_schemafull(mut self, v: bool) -> Self {
+		self.schemafull = v;
+		self
+	}
+
+	/// Set `drop`. Returns `self` for chaining.
+	#[must_use]
+	pub fn with_drop(mut self, v: bool) -> Self {
+		self.drop = v;
+		self
+	}
+
+	/// Set `comment`. Returns `self` for chaining.
+	#[must_use]
+	pub fn with_comment(mut self, v: Option<String>) -> Self {
+		self.comment = v;
+		self
+	}
+
+	/// Set `table_type`. Returns `self` for chaining.
+	#[must_use]
+	pub fn with_table_type(mut self, v: TableType) -> Self {
+		self.table_type = v;
+		self
+	}
+
+	/// Set `view`. Returns `self` for chaining.
+	#[must_use]
+	pub fn with_view(mut self, v: Option<ViewDefinition>) -> Self {
+		self.view = v;
+		self
+	}
+
+	/// Set `permissions`. Returns `self` for chaining.
+	#[must_use]
+	pub fn with_permissions(mut self, v: Permissions) -> Self {
+		self.permissions = v;
+		self
+	}
+
+	// Note: `with_changefeed` deliberately omitted — `ChangeFeed` is
+	// `pub(crate)` in surrealdb-core, so exposing it as a parameter
+	// triggers a private-in-public warning. Changefeed configuration is
+	// a runtime concern, not a DDL one; codegen tools that need it can
+	// modify the field directly inside the crate, or wait until upstream
+	// promotes the type.
+}
+
 impl InfoStructure for TableDefinition {
 	fn structure(self) -> Value {
 		Value::from(map! {
@@ -251,5 +334,126 @@ impl Relation {
 			self.to = x.into_iter().map(|x| x.into_string()).collect()
 		}
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod ddl_builder_tests {
+	//! C16b — DDL-friendly constructors and setters.
+	//!
+	//! Each test exercises the path an external codegen tool takes:
+	//! build via `new_for_ddl(...).with_*(...)`, then render via
+	//! `ToSql::to_sql()`. The DDL output must match what an in-crate
+	//! struct-literal construction with the same DDL slots produces.
+	//!
+	//! See `.claude/op-codegen-bridge/README.md` for the initiative
+	//! context.
+
+	use surrealdb_types::ToSql;
+	use uuid::Uuid;
+
+	use super::*;
+	use crate::val::TableName;
+
+	/// The dummy IDs supplied by `new_for_ddl` must not leak into the
+	/// rendered SurrealQL. This is the invariant that makes the
+	/// "build-for-render-only" pattern safe: an external caller never
+	/// has to think about `namespace_id`/`database_id`/`table_id`.
+	#[test]
+	fn new_for_ddl_does_not_leak_table_id_into_render() {
+		let t = TableDefinition::new_for_ddl("widget").with_schemafull(true);
+		let sql = t.to_sql();
+		// id appears in DefineTableStatement only when explicitly set
+		// via the codegen path; new_for_ddl() leaves it at the default
+		// (None), so neither "0" (the dummy TableId) nor "table_id"
+		// shows up.
+		assert!(!sql.contains(" 0 "), "raw 0 leaked into render: {sql}");
+		assert!(sql.contains("widget"), "table name missing: {sql}");
+		assert!(sql.contains("SCHEMAFULL"), "schemafull missing: {sql}");
+	}
+
+	/// Builder output equals struct-literal output (with cache UUIDs
+	/// matched). This is the strongest invariant: the builder is a
+	/// pure ergonomic wrapper, semantically identical to a raw
+	/// struct construction.
+	#[test]
+	fn builder_output_equals_struct_literal_output() {
+		let now = Uuid::now_v7();
+		let raw = TableDefinition {
+			namespace_id: NamespaceId(0),
+			database_id: DatabaseId(0),
+			table_id: TableId(0),
+			name: TableName::from("widget"),
+			drop: false,
+			schemafull: true,
+			view: None,
+			permissions: Permissions::none(),
+			changefeed: None,
+			comment: Some("a widget".to_string()),
+			table_type: TableType::Normal,
+			cache_fields_ts: now,
+			cache_events_ts: now,
+			cache_tables_ts: now,
+			cache_indexes_ts: now,
+		};
+		let built = TableDefinition::new_for_ddl("widget")
+			.with_schemafull(true)
+			.with_comment(Some("a widget".to_string()))
+			.with_table_type(TableType::Normal)
+			.with_permissions(Permissions::none());
+		// Cache UUIDs differ (built uses now_v7 at construction), but
+		// DDL output is independent of them — the `to_sql_definition`
+		// path doesn't include cache_*_ts. So the rendered strings
+		// must match exactly.
+		assert_eq!(raw.to_sql(), built.to_sql());
+	}
+
+	#[test]
+	fn with_schemafull_round_trips() {
+		assert!(TableDefinition::new_for_ddl("t").with_schemafull(true).schemafull);
+		assert!(!TableDefinition::new_for_ddl("t").with_schemafull(false).schemafull);
+	}
+
+	#[test]
+	fn with_drop_round_trips() {
+		assert!(TableDefinition::new_for_ddl("t").with_drop(true).drop);
+	}
+
+	#[test]
+	fn with_comment_round_trips() {
+		let t = TableDefinition::new_for_ddl("t").with_comment(Some("hi".to_string()));
+		assert_eq!(t.comment.as_deref(), Some("hi"));
+	}
+
+	#[test]
+	fn with_table_type_round_trips() {
+		let t = TableDefinition::new_for_ddl("t").with_table_type(TableType::Normal);
+		assert!(matches!(t.table_type, TableType::Normal));
+	}
+
+	#[test]
+	fn new_for_ddl_supplies_dummy_ids_and_now_caches() {
+		let t = TableDefinition::new_for_ddl("t");
+		assert_eq!(t.namespace_id.0, 0);
+		assert_eq!(t.database_id.0, 0);
+		assert_eq!(t.table_id.0, 0);
+		// cache UUIDs must be non-nil (now_v7), proving the constructor
+		// didn't leave them at default (which would be the all-zeros
+		// nil UUID and could break invariants elsewhere).
+		assert_ne!(t.cache_fields_ts, Uuid::nil());
+	}
+
+	#[test]
+	fn chained_builders_preserve_all_set_values() {
+		let t = TableDefinition::new_for_ddl("multi")
+			.with_schemafull(true)
+			.with_drop(false)
+			.with_comment(Some("c".to_string()))
+			.with_table_type(TableType::Normal);
+		assert_eq!(t.name.clone().into_string(), "multi");
+		assert!(t.schemafull);
+		assert!(!t.drop);
+		assert_eq!(t.comment.as_deref(), Some("c"));
+		assert!(matches!(t.table_type, TableType::Normal));
 	}
 }

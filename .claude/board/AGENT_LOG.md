@@ -291,3 +291,30 @@ commit_gate module) — they need agent 2/3 / orchestrator follow-up. Did NOT ru
 - STRIP all `// ///REVIEW:` sentinels.
 **GATE COMMAND (Savant C — critical):** `cargo clippy -p surrealdb-core --features kv-lance --tests -- -D warnings`
   (stock `cargo make ci-clippy` omits kv-lance and would cfg-strip the rewrite = false green).
+
+## 2026-06-02T22:50 — c16b-op-codegen-bridge
+**Branch:** `claude/beautiful-gates-dJo0u`
+**Scope:**
+- `.claude/op-codegen-bridge/README.md` (new — initiative context)
+- `surrealdb/core/src/catalog/table.rs` (+ DDL-builder impl block)
+- `surrealdb/core/src/catalog/schema/field.rs` (+ DDL-builder impl block)
+- `surrealdb/core/src/catalog/schema/index.rs` (+ DDL-builder impl block)
+**Verdict:** PASS
+
+**What was done:**
+- Added `new_for_ddl(...)` constructors + chainable `with_*(...)` setters to `catalog::TableDefinition`, `catalog::schema::FieldDefinition`, and `catalog::schema::IndexDefinition`. External codegen tools (first consumer: AdaWorldAPI/openproject-nexgen-rs `op-surreal-ast` C16a) can now build typed canonical forms purely for DDL emission via `ToSql`.
+- Constructors supply dummy zero IDs (`NamespaceId(0)` etc.) + `Uuid::now_v7()` cache timestamps. Test `new_for_ddl_does_not_leak_table_id_into_render` pins that the dummy IDs do not appear in rendered SurrealQL.
+- Skipped setters whose parameter types are `pub(crate)` (Permission, DefineDefault, Index variants beyond Idx, ChangeFeed) — those require a public-API decision and follow in dedicated sprints.
+- Added 18 inline tests in `#[cfg(test)] mod ddl_builder_tests` modules (TableDefinition 8, FieldDefinition 6, IndexDefinition 4). All pass.
+- `#[allow(dead_code)]` on the three DDL-builder impl blocks with rationale comment: pub items have no in-crate caller (they exist for external consumers); the test module exercises them but `dead_code` lints the non-test build target.
+
+**Tests run:**
+- `cargo check -p surrealdb-core --no-default-features` → exit 0, 25 warnings (all pre-existing, none on my files)
+- `cargo test -p surrealdb-core --lib ddl_builder_tests` → 18 passed; 0 failed (1825 other tests filtered out)
+
+**Open questions / follow-ups:**
+- Avoided `cargo fmt` on the whole tree (stable rustfmt reformats 20+ files due to upstream's nightly-only rustfmt.toml options — known issue, see ndarray fork's AGENTS.md for the same warning). My 3 files are hand-formatted in the upstream tab style.
+- `cargo make ci-clippy` / `cargo make fmt` requires `cargo-make` which is not installed in this container; ran `cargo check` as the proxy. Recommend running the full canonical battery (`cargo clippy -- -D warnings`, `cargo audit`, `cargo deny check`) on CI before merge.
+- Permission / DefineDefault / Index variant setters deferred to a follow-up sprint when downstream actually needs to set non-defaults. Nexgen's C16c (the consumer side) will only need the slots covered by C16b.
+
+**Commit(s):** _filled in by the committing session_
