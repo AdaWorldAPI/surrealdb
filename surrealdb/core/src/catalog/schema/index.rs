@@ -124,6 +124,50 @@ impl ToSql for IndexDefinition {
 	}
 }
 
+/// DDL-friendly constructor and chainable setters for [`IndexDefinition`].
+///
+/// External codegen tools build typed index definitions to render via
+/// [`ToSql`] without an actual in-DB allocation. See the table-level
+/// equivalent in `catalog::TableDefinition::new_for_ddl` and
+/// `.claude/op-codegen-bridge/README.md` for the initiative context.
+///
+/// The default index kind is non-unique ([`Index::Idx`]). Convenience
+/// constructors for unique / full-text / vector indexes follow in
+/// dedicated sprints — those variants carry `pub(crate)` parameter types
+/// that need a public-API decision first.
+//
+// `dead_code` allowed: see the equivalent comment on the
+// `TableDefinition` DDL-builder impl in `catalog/table.rs`.
+#[allow(dead_code)]
+impl IndexDefinition {
+	/// Construct an [`IndexDefinition`] for **DDL emission only**.
+	///
+	/// Defaults to a non-unique index (`Index::Idx`), no comment, not
+	/// marked for removal. Combine with `with_*` below to fill DDL slots.
+	pub fn new_for_ddl(
+		name: impl Into<String>,
+		table_name: impl Into<TableName>,
+		cols: Vec<Idiom>,
+	) -> Self {
+		Self {
+			index_id: IndexId(0),
+			name: name.into(),
+			table_name: table_name.into(),
+			cols,
+			index: Index::Idx,
+			comment: None,
+			prepare_remove: false,
+		}
+	}
+
+	/// Set `comment`. Returns `self` for chaining.
+	#[must_use]
+	pub fn with_comment(mut self, v: Option<String>) -> Self {
+		self.comment = v;
+		self
+	}
+}
+
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub(crate) enum Index {
@@ -371,4 +415,63 @@ pub(crate) struct HnswParams {
 	/// Whether to use vector hash for vector retrieval.
 	#[revision(start = 2)]
 	pub use_hashed_vector: bool,
+}
+
+#[cfg(test)]
+mod ddl_builder_tests {
+	//! C16b — DDL-friendly constructor + setters for IndexDefinition.
+	//! See `.claude/op-codegen-bridge/README.md` for context.
+
+	use std::str::FromStr;
+
+	use surrealdb_types::ToSql;
+
+	use super::*;
+	use crate::expr::Idiom;
+	use crate::val::TableName;
+
+	fn idiom(s: &str) -> Idiom {
+		Idiom::from_str(s).expect("test idiom literal must parse")
+	}
+
+	#[test]
+	fn new_for_ddl_defaults_to_non_unique_idx() {
+		let i = IndexDefinition::new_for_ddl("idx_t_a", TableName::from("t"), vec![idiom("a")]);
+		assert!(matches!(i.index, Index::Idx));
+		assert!(i.comment.is_none());
+		assert!(!i.prepare_remove);
+		assert_eq!(i.index_id.0, 0);
+	}
+
+	#[test]
+	fn new_for_ddl_carries_name_table_and_cols_to_sql() {
+		let i = IndexDefinition::new_for_ddl(
+			"idx_widget_count",
+			TableName::from("widget"),
+			vec![idiom("count")],
+		);
+		let sql = i.to_sql();
+		assert!(sql.contains("idx_widget_count"), "name missing: {sql}");
+		assert!(sql.contains("widget"), "table missing: {sql}");
+		assert!(sql.contains("count"), "col missing: {sql}");
+	}
+
+	#[test]
+	fn multi_column_index_renders_all_columns() {
+		let i = IndexDefinition::new_for_ddl(
+			"idx_t_a_b",
+			TableName::from("t"),
+			vec![idiom("a"), idiom("b")],
+		);
+		let sql = i.to_sql();
+		assert!(sql.contains("a"), "first col missing: {sql}");
+		assert!(sql.contains("b"), "second col missing: {sql}");
+	}
+
+	#[test]
+	fn with_comment_round_trips() {
+		let i = IndexDefinition::new_for_ddl("idx_t_a", TableName::from("t"), vec![idiom("a")])
+			.with_comment(Some("hi".to_string()));
+		assert_eq!(i.comment.as_deref(), Some("hi"));
+	}
 }
