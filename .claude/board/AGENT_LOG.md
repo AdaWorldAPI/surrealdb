@@ -318,3 +318,24 @@ commit_gate module) — they need agent 2/3 / orchestrator follow-up. Did NOT ru
 - Permission / DefineDefault / Index variant setters deferred to a follow-up sprint when downstream actually needs to set non-defaults. Nexgen's C16c (the consumer side) will only need the slots covered by C16b.
 
 **Commit(s):** _filled in by the committing session_
+
+## 2026-06-02T23:00 — c16b-followup-ndarray-rev-pin
+**Branch:** `claude/beautiful-gates-dJo0u`
+**Scope:**
+- `Cargo.toml` (ndarray git dep: add `rev = "0129b5c80cee..."`)
+- `.claude/board/AGENT_LOG.md` (this entry)
+**Verdict:** PASS
+
+**What was done:**
+- Pinned the workspace `ndarray` git dep to revision `0129b5c80cee8d88fdae97be813524328e4d025a` — the AdaWorldAPI/ndarray fork's current `main` HEAD as of 2026-06-02. Prevents `cargo update` from drifting the dep to a newer HEAD between sessions.
+- Concrete realisation of the AdaWorldAPI ecosystem pinning rule documented in `.claude/knowledge/adaworldapi-pinning.md`.
+- The pre-existing `[patch] ndarray = { git = ... }` block at line ~488 is intentionally NOT pinned to a rev — it's a fallback `[patch.crates-io]` route that the comment explains is only there for ergonomics; the workspace dep is what's actually consumed.
+
+**Tests run:**
+- `cargo check -p surrealdb-core --no-default-features` → exit 0 (build still green; rev pin matches the already-resolved sha in Cargo.lock, so no actual fetch needed)
+
+**Open questions / follow-ups:**
+- Arrow pins (`arrow-array = "58"`, `arrow-schema = "58"`) are semver-range, not exact. Currently resolve to `58.3.0`. Tightening to `=58.3.0` would mirror the lance/lancedb exact-pin style — proposed but deferred (the user spec says "arrow 58", not "arrow exact patch").
+- Datafusion is transitive via lance. Adding a direct `datafusion = "=53.1.0"` dep would manifest the pin explicitly but reaches outside the C16b scope. Deferred unless explicitly requested.
+
+**Commit(s):** _filled in by the committing session_
