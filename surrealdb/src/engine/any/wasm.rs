@@ -92,6 +92,23 @@ impl conn::Sealed for Any {
 			return Err(Error::internal("Cannot connect to the `rocksdb` storage engine as it is not enabled in this build of SurrealDB".to_owned()));
 				}
 
+				EndpointKind::Lance => {
+					#[cfg(feature = "kv-lance")]
+					{
+						features.insert(ExtraFeatures::LiveQueries);
+						spawn_local(engine::local::wasm::run_router(
+							address,
+							conn_tx,
+							route_rx,
+							session_clone.receiver.clone(),
+						));
+						conn_rx.recv().await.map_err(crate::std_error_to_types_error)??;
+					}
+
+					#[cfg(not(feature = "kv-lance"))]
+			return Err(Error::internal("Cannot connect to the `lance` storage engine as it is not enabled in this build of SurrealDB".to_owned()));
+				}
+
 				EndpointKind::SurrealKv => {
 					#[cfg(feature = "kv-surrealkv")]
 					{

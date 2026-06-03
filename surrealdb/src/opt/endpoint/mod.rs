@@ -9,12 +9,14 @@ mod indxdb;
 mod mem;
 #[cfg(feature = "kv-rocksdb")]
 mod rocksdb;
+#[cfg(feature = "kv-lance")]
+mod lance;
 #[cfg(feature = "kv-surrealkv")]
 mod surrealkv;
 #[cfg(feature = "kv-tikv")]
 mod tikv;
 
-#[cfg(any(feature = "kv-mem", feature = "kv-surrealkv", feature = "kv-rocksdb"))]
+#[cfg(any(feature = "kv-mem", feature = "kv-surrealkv", feature = "kv-rocksdb", feature = "kv-lance"))]
 mod local;
 
 use url::Url;
@@ -54,7 +56,7 @@ impl Endpoint {
 	/// Append a query parameter to the endpoint path string.
 	/// Only used when a local engine (e.g. `kv-mem`, `kv-rocksdb`) is enabled.
 	#[cfg_attr(
-		not(any(feature = "kv-mem", feature = "kv-surrealkv", feature = "kv-rocksdb")),
+		not(any(feature = "kv-mem", feature = "kv-surrealkv", feature = "kv-rocksdb", feature = "kv-lance")),
 		allow(dead_code)
 	)]
 	pub(crate) fn append_query_param(&mut self, key: &str, value: &str) {
@@ -151,6 +153,7 @@ pub enum EndpointKind {
 	IndxDb,
 	Memory,
 	RocksDb,
+	Lance,
 	TiKv,
 	Unsupported(String),
 	SurrealKv,
@@ -167,6 +170,7 @@ impl From<&str> for EndpointKind {
 			"indxdb" => Self::IndxDb,
 			"mem" => Self::Memory,
 			"rocksdb" => Self::RocksDb,
+			"lance" => Self::Lance,
 			"tikv" => Self::TiKv,
 			"surrealkv" => Self::SurrealKv,
 			_ => Self::Unsupported(s.to_owned()),
