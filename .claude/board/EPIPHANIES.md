@@ -229,3 +229,13 @@ IMPLEMENTED for Phases 1-2. Per the append-only discipline the GRIDLAKE doc
 body was NOT mutated; this entry is the canonical re-tag record.
 
 **Cross-ref:** commits 7266acf, e329a7a, 55fc45c; GRIDLAKE.md §8; this session's grep/check audit.
+
+## 2026-06-02 — AdaWorldAPI ecosystem-wide pin matrix verified
+**Status:** FINDING
+**Scope:** `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `surrealdb/core/Cargo.toml`, `surrealdb/core/src/idx/trees/vector.rs`
+
+The fork is already on-spec for the AdaWorldAPI ecosystem pinning rule (rust 1.95, lance =7.0.0, lance-index =7.0.0, lancedb =0.30.0, datafusion 53 transitive, arrow 58, ndarray git-fork with `std + hpc-extras`). The `crate::simd::*` polyfill (specifically `F64x8`) is consumed in `idx/trees/vector.rs` at L421/L450/L475/L496 for L2/L1/L∞/Pearson SIMD distance kernels, gated by `vector-hpc`. Datafusion is pulled in transitively via lance and resolves to `53.1.0` in Cargo.lock — don't add a direct dep with a different pin.
+
+No code changes needed at this point. Authoritative reference doc added at `.claude/knowledge/adaworldapi-pinning.md` so future sessions don't re-derive the matrix.
+
+**Cross-ref:** PR #33 (C16b) verifies the pins in its preflight table; knowledge doc captures the spec long-term.
