@@ -12,6 +12,8 @@ mod auth;
 mod database;
 mod module;
 mod namespace;
+#[cfg(feature = "op-bridge")]
+pub mod op_bridge;
 pub(crate) mod providers;
 mod record;
 mod schema;

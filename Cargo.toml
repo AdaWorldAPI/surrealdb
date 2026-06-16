@@ -160,6 +160,14 @@ ndarray = { version = "0.17", git = "https://github.com/AdaWorldAPI/ndarray.git"
 # lance-graph-planner, blasgraph, bgz-tensor) are deferred until the
 # synergy sprints (HHTL bridge, GraphBLAS, etc.) land.
 lance-graph-contract = { git = "https://github.com/AdaWorldAPI/lance-graph.git" }
+# OpenProject AR-shape codegen AST — `op_surreal_ast::{TableDefinition,
+# FieldDefinition, IndexDefinition, Kind, Schema}` are the upstream input
+# types for the C16c bridge (the `From<op_surreal_ast::*> for catalog::*`
+# impls in surrealdb-core::catalog::op_bridge, gated by `op-bridge` feature).
+# Pinned to PR Z's branch until that PR merges; switch to `branch = "main"`
+# after merge. The crate is zero-async-deps (depends on lance-graph-contract
+# only), so pulling it in is cheap.
+op-surreal-ast = { git = "https://github.com/AdaWorldAPI/openproject-nexgen-rs", branch = "claude/op-surreal-ast-from-triples" }
 nix = { version = "0.30.1", default-features = false }
 num-traits = "0.2.19"
 num_cpus = "1.17.0"
