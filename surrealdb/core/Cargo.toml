@@ -70,6 +70,14 @@ vector-hpc = []
 # yet. Default off so a plain build doesn't grow.
 lance-graph = ["dep:lance-graph-contract"]
 
+# OpenProject codegen bridge — surfaces `From<op_surreal_ast::*> for
+# catalog::*` impls so the AR-shape codegen pipeline can hand off a
+# typed DDL AST (produced by `op-codegen-projection` from ruff-extracted
+# SPO triples) to the real surrealdb-core catalog types via the C16b
+# `new_for_ddl` + `with_*` builders. Default off; pulls in
+# `op-surreal-ast` (a small zero-async-deps crate) when enabled.
+op-bridge = ["dep:op-surreal-ast"]
+
 # GraphQL support
 graphql = ["dep:async-graphql"]
 
@@ -148,6 +156,7 @@ ipnet.workspace = true
 md-5.workspace = true
 ndarray.workspace = true
 lance-graph-contract = { workspace = true, optional = true }
+op-surreal-ast = { workspace = true, optional = true }
 num_cpus.workspace = true
 num-traits.workspace = true
 object_store.workspace = true
