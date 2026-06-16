@@ -69,6 +69,17 @@ impl From<ast::Kind> for CatalogKind {
         match k {
             ast::Kind::Any => CatalogKind::Any,
             ast::Kind::Int => CatalogKind::Int,
+            // D-AR-6.2: 7 scalar variants added in PR #29 (ast crate's
+            // D-AR-5.2). All map 1:1 to surrealdb-core's catalog Kind
+            // variants — these were the Rails-AR types the AST didn't
+            // surface until the `field_type` predicate landed.
+            ast::Kind::String => CatalogKind::String,
+            ast::Kind::Bool => CatalogKind::Bool,
+            ast::Kind::Float => CatalogKind::Float,
+            ast::Kind::Decimal => CatalogKind::Decimal,
+            ast::Kind::Datetime => CatalogKind::Datetime,
+            ast::Kind::Bytes => CatalogKind::Bytes,
+            ast::Kind::Uuid => CatalogKind::Uuid,
             ast::Kind::Record(targets) => {
                 let tables = targets.into_iter().map(TableName::from).collect();
                 CatalogKind::Record(tables)
@@ -249,6 +260,46 @@ mod tests {
         assert_eq!(targets.len(), 1);
         // TableName roundtrips via Display.
         assert_eq!(format!("{}", targets[0]), "Project");
+    }
+
+    /// **D-AR-6.2** — the 7 scalar variants added in PR #29 map 1:1
+    /// to surrealdb-core's catalog Kind variants.
+    #[test]
+    fn d_ar_6_2_scalar_variants_map_one_to_one() {
+        let cases: Vec<(ast::Kind, CatalogKind)> = vec![
+            (ast::Kind::String, CatalogKind::String),
+            (ast::Kind::Bool, CatalogKind::Bool),
+            (ast::Kind::Float, CatalogKind::Float),
+            (ast::Kind::Decimal, CatalogKind::Decimal),
+            (ast::Kind::Datetime, CatalogKind::Datetime),
+            (ast::Kind::Bytes, CatalogKind::Bytes),
+            (ast::Kind::Uuid, CatalogKind::Uuid),
+        ];
+        for (ast_kind, expected) in cases {
+            let bridged: CatalogKind = ast_kind.clone().into();
+            assert_eq!(
+                bridged, expected,
+                "ast::Kind::{ast_kind:?} did not map to {expected:?}",
+            );
+        }
+    }
+
+    /// **D-AR-6.2** — the option-wrapped form (Rails-nullable, per
+    /// codex P1 PR #29 fix) bridges through correctly: an AST
+    /// `Option<String>` becomes catalog `Either(None, String)`.
+    #[test]
+    fn d_ar_6_2_option_wrapped_scalar_bridges_via_either() {
+        let ast_optional_string = ast::Kind::String.optional();
+        let bridged: CatalogKind = ast_optional_string.into();
+        let CatalogKind::Either(arms) = bridged else {
+            panic!("expected Either(None, String); got non-Either");
+        };
+        assert_eq!(arms.len(), 2);
+        // One arm is None, the other String.
+        let has_none = arms.iter().any(|k| matches!(k, CatalogKind::None));
+        let has_string = arms.iter().any(|k| matches!(k, CatalogKind::String));
+        assert!(has_none, "Option<T> must include None arm");
+        assert!(has_string, "Option<String> must include String arm");
     }
 
     #[test]
