@@ -55,7 +55,9 @@ use op_surreal_ast as ast;
 
 use crate::catalog::TableType as CatalogTableType;
 use crate::catalog::{IndexDefinition as CatalogIndexDefinition, TableDefinition};
-use crate::expr::{Idiom, Kind as CatalogKind};
+use crate::expr::operator::BinaryOperator;
+use crate::expr::param::Param;
+use crate::expr::{Expr, Idiom, Kind as CatalogKind, Literal};
 use crate::val::TableName;
 
 use super::FieldDefinition as CatalogFieldDefinition;
@@ -144,7 +146,70 @@ impl From<ast::FieldDefinition> for CatalogFieldDefinition {
         let idiom = Idiom::field(f.name);
         let table = TableName::from(f.table);
         let kind: CatalogKind = f.kind.into();
-        CatalogFieldDefinition::new_for_ddl(idiom, table).with_kind(Some(kind))
+        // D-AR-6.3 (codex P2 PR #38): lower `ast::FieldDefinition.assert`
+        // (a SurrealQL expression string) to a real `catalog::Expr` so the
+        // bridged catalog field carries the same `ASSERT` clause the AST
+        // renders. Without this, validations land in the rendered SQL but
+        // the in-memory catalog accepts values the rendered schema would
+        // reject.
+        let assert = f.assert.as_deref().and_then(rails_assert_to_expr);
+        CatalogFieldDefinition::new_for_ddl(idiom, table)
+            .with_kind(Some(kind))
+            .with_assert(assert)
+    }
+}
+
+/// Lower a SurrealQL assertion-expression string emitted by
+/// `op_surreal_ast::from_triples` into a structural [`Expr`] the
+/// catalog can store.
+///
+/// The OpenProject AR-shape extractor today emits exactly one
+/// expression — `$value != NONE` — as the schema-level marker for a
+/// `validates_constraint` triple (codex P2 PR #38 → D-AR-6.3). We
+/// construct that case structurally rather than going through the
+/// surrealdb-core SurrealQL parser, which is `async` + heavy.
+///
+/// Returns `None` for any expression the lowering doesn't recognise.
+/// Returning `None` is the safe fallback: the catalog field accepts
+/// any value, which matches the previous (pre-D-AR-6.3) behaviour of
+/// silently dropping the assert. A future PR can swap this in for a
+/// real parser when the AR-shape needs richer expressions
+/// (`validates :len, length: {minimum: 3}` → `string::len($value) >= 3`).
+///
+/// **Stripping whitespace + `/* ... */` comments** is intentional —
+/// `normalizes_attribute` (PR #28 fix) layers a structured marker on
+/// top of the same `$value != NONE` core, e.g.
+/// `$value != NONE /* normalized */`. The marker is metadata only;
+/// the assertion semantic is unchanged.
+fn rails_assert_to_expr(s: &str) -> Option<Expr> {
+    // Strip `/* ... */` block comments anywhere in the string.
+    let mut cleaned = String::with_capacity(s.len());
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            // Skip until `*/`.
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        cleaned.push(bytes[i] as char);
+        i += 1;
+    }
+    // Canonicalise whitespace.
+    let canonical: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    match canonical.as_str() {
+        "$value != NONE" => Some(Expr::Binary {
+            left: Box::new(Expr::Param(Param::new("value".to_string()))),
+            op: BinaryOperator::NotEqual,
+            right: Box::new(Expr::Literal(Literal::None)),
+        }),
+        // Future Rails-mapped expressions land here (one explicit arm
+        // each; no parser glob until the AR-shape vocab demands it).
+        _ => None,
     }
 }
 
@@ -300,6 +365,95 @@ mod tests {
         let has_string = arms.iter().any(|k| matches!(k, CatalogKind::String));
         assert!(has_none, "Option<T> must include None arm");
         assert!(has_string, "Option<String> must include String arm");
+    }
+
+    /// **D-AR-6.3 (codex P2 PR #38)** — the bridge now lowers
+    /// `ast::FieldDefinition.assert` (a string the AST renders as
+    /// `ASSERT $value != NONE`) to a structural [`Expr`] so the
+    /// catalog field carries the same constraint the rendered SQL
+    /// announces.
+    #[test]
+    fn d_ar_6_3_field_definition_bridges_assert_clause() {
+        let ast_field = ast::FieldDefinition::new(
+            "subject",
+            "WorkPackage",
+            ast::Kind::String,
+        )
+        .with_assert(Some("$value != NONE".to_string()));
+        let cat: CatalogFieldDefinition = ast_field.into();
+        let assert = cat
+            .assert
+            .as_ref()
+            .expect("assert must be set on bridged field");
+        // Verify it's the expected Binary(Param "value", NotEqual, Literal::None).
+        match assert {
+            Expr::Binary { left, op, right } => {
+                assert!(
+                    matches!(left.as_ref(), Expr::Param(p) if &**p == "value"),
+                    "expected $value param on the left arm",
+                );
+                assert!(matches!(op, BinaryOperator::NotEqual));
+                assert!(matches!(right.as_ref(), Expr::Literal(Literal::None)));
+            }
+            other => panic!("expected Binary(...) assert; got {other:?}"),
+        }
+    }
+
+    /// **D-AR-6.3** — the `normalize:` marker from PR #28 (which
+    /// renders as `ASSERT $value != NONE /* normalized */`) lowers
+    /// to the SAME `$value != NONE` Expr — the comment is metadata
+    /// only and doesn't change the semantic.
+    #[test]
+    fn d_ar_6_3_assert_normalized_comment_is_stripped() {
+        let ast_field = ast::FieldDefinition::new(
+            "email",
+            "User",
+            ast::Kind::String.optional(),
+        )
+        .with_assert(Some(
+            "$value != NONE /* normalized */".to_string(),
+        ));
+        let cat: CatalogFieldDefinition = ast_field.into();
+        assert!(
+            cat.assert.as_ref().is_some(),
+            "normalize-annotated assert must still lower",
+        );
+    }
+
+    /// **D-AR-6.3** — an `ast::FieldDefinition.assert == None`
+    /// produces a catalog field with no assertion (the no-validation
+    /// path; preserves the pre-PR behaviour).
+    #[test]
+    fn d_ar_6_3_no_assert_when_ast_field_has_none() {
+        let ast_field =
+            ast::FieldDefinition::new("subject", "WorkPackage", ast::Kind::Any);
+        let cat: CatalogFieldDefinition = ast_field.into();
+        assert!(
+            cat.assert.as_ref().is_none(),
+            "expected no assert when ast field carries None",
+        );
+    }
+
+    /// **D-AR-6.3** — an unrecognised assertion string lowers to
+    /// `None` rather than corrupting the catalog. Conservative
+    /// safety net for future AR-shape expressions the bridge
+    /// doesn't yet know how to lower; matches the documented
+    /// `rails_assert_to_expr` return contract.
+    #[test]
+    fn d_ar_6_3_unknown_assert_string_lowers_to_none() {
+        let ast_field = ast::FieldDefinition::new(
+            "score",
+            "Test",
+            ast::Kind::Int.optional(),
+        )
+        .with_assert(Some(
+            "$value > 100 AND $value < 1000".to_string(),
+        ));
+        let cat: CatalogFieldDefinition = ast_field.into();
+        // The bridge doesn't yet know how to lower this; rather than
+        // dropping us into mis-construction territory, the assert
+        // becomes None and the catalog field stays accept-any.
+        assert!(cat.assert.as_ref().is_none());
     }
 
     #[test]
