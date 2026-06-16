@@ -85,10 +85,33 @@ impl From<ast::Kind> for CatalogKind {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// TableType — ast::TableType is single-variant today (Normal); catalog
-// defaults to Any but the C16b ToSql renders Normal/Relation. Map Normal
-// → CatalogTableType::Normal so the bridge's output matches the AST's
-// rendered intent exactly.
+// TableType — semantic-preserving mapping (see codex P2 r3418*).
+//
+// `op_surreal_ast::TableType` is single-variant today (Normal). The AST
+// renderer SKIPS the TYPE clause for `Normal` (matching the C9 baseline
+// which emits `DEFINE TABLE X SCHEMAFULL;` without `TYPE NORMAL`),
+// whereas `surrealdb_core::catalog::TableType` always renders a TYPE
+// clause (`TYPE ANY` for the default, `TYPE NORMAL` for non-relation,
+// `TYPE RELATION …` for relation tables).
+//
+// **Chosen mapping:** AST `Normal` → catalog `Normal` (semantic-correct
+// for the OpenProject AR domain — AR tables are non-relation data
+// records). This means:
+//
+// - `bridged_tbl.allows_relation() == false` — the correct semantic for
+//   `WorkPackage` / `Project` / `TimeEntry` etc.
+// - The catalog's `to_sql()` output diverges from the AST's: catalog
+//   emits `TYPE NORMAL` explicitly while the AST renderer skips it.
+//   That divergence is **acknowledged** as a D-AR-6.2 follow-up
+//   (exact-byte rendering equivalence requires either an AST `Any`
+//   variant or a catalog "omit-default" rendering mode).
+//
+// **Why not `Normal → Any`?** AST `Normal` semantically means "regular
+// data records, not a relation" — that's what OpenProject AR models
+// are. Mapping to catalog `Any` would allow relation insertion at
+// runtime, which is wrong: an AR `WorkPackage` is not a graph edge.
+// The codex P2 comment flagged the rendering divergence; the bridge
+// chooses semantic correctness over render-byte equivalence.
 // ─────────────────────────────────────────────────────────────────────────
 
 impl From<ast::TableType> for CatalogTableType {
@@ -248,6 +271,26 @@ mod tests {
         // Verify ddl-default state (matches C16b's new_for_ddl_does_not_leak_table_id test)
         assert_eq!(format!("{}", cat.name), "WorkPackage");
         assert!(cat.schemafull, "schemafull true mirrors AST default");
+    }
+
+    /// **Codex P2 regression (PR #37)** — the AST → catalog `TableType`
+    /// mapping is semantic-preserving: `Normal → Normal`, so the
+    /// bridged table reports `allows_relation() == false`. This is the
+    /// correct semantic for OpenProject AR tables (`WorkPackage`,
+    /// `Project`, `TimeEntry` are data records, not relation tables).
+    /// The codex P2 comment flagged the render divergence (catalog
+    /// emits `TYPE NORMAL` while AST skips); that's a D-AR-6.2
+    /// follow-up. This test locks in the semantic choice so a future
+    /// "render-equivalence" patch doesn't accidentally flip the
+    /// `allows_relation()` answer.
+    #[test]
+    fn table_type_normal_maps_to_non_relation_semantic() {
+        let ast_table = ast::TableDefinition::new("WorkPackage");
+        let cat: TableDefinition = ast_table.into();
+        assert!(
+            !cat.allows_relation(),
+            "AR table must NOT allow relation insertion (Normal != Any)",
+        );
     }
 
     #[test]
