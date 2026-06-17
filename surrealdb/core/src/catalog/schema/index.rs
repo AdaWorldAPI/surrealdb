@@ -166,6 +166,20 @@ impl IndexDefinition {
 		self.comment = v;
 		self
 	}
+
+	/// Mark this index as `UNIQUE` (or non-unique). Sets `index` to
+	/// either [`Index::Uniq`] or [`Index::Idx`]. The variant is
+	/// `pub(crate)` so this boolean-typed convenience method is the
+	/// public-API surface for choosing between the two basic kinds.
+	///
+	/// Used by `op_bridge` to lower `op_surreal_ast::IndexDefinition.
+	/// unique = true` (Rails `validates :foo, uniqueness: true` →
+	/// `DEFINE INDEX … UNIQUE`).
+	#[must_use]
+	pub fn with_unique(mut self, unique: bool) -> Self {
+		self.index = if unique { Index::Uniq } else { Index::Idx };
+		self
+	}
 }
 
 #[revisioned(revision = 1)]

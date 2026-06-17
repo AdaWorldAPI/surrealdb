@@ -6190,7 +6190,7 @@ dependencies = [
 [[package]]
 name = "lance-graph-contract"
 version = "0.1.0"
-source = "git+https://github.com/AdaWorldAPI/openproject-nexgen-rs?branch=main#44550a876617f85f187ff73acc42cb56342f0067"
+source = "git+https://github.com/AdaWorldAPI/openproject-nexgen-rs?branch=main#c48bef01b6bceb540c901fc374d6c2b1b2b8e26f"
 
 [[package]]
 name = "lance-graph-contract"
@@ -7471,7 +7471,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "op-surreal-ast"
 version = "0.1.0"
-source = "git+https://github.com/AdaWorldAPI/openproject-nexgen-rs?branch=main#44550a876617f85f187ff73acc42cb56342f0067"
+source = "git+https://github.com/AdaWorldAPI/openproject-nexgen-rs?branch=main#c48bef01b6bceb540c901fc374d6c2b1b2b8e26f"
 dependencies = [
  "lance-graph-contract 0.1.0 (git+https://github.com/AdaWorldAPI/openproject-nexgen-rs?branch=main)",
 ]
