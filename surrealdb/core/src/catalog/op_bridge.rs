@@ -55,6 +55,7 @@ use op_surreal_ast as ast;
 
 use crate::catalog::TableType as CatalogTableType;
 use crate::catalog::{IndexDefinition as CatalogIndexDefinition, TableDefinition};
+use crate::expr::function::{Function, FunctionCall};
 use crate::expr::operator::BinaryOperator;
 use crate::expr::param::Param;
 use crate::expr::{Expr, Idiom, Kind as CatalogKind, Literal};
@@ -201,16 +202,72 @@ fn rails_assert_to_expr(s: &str) -> Option<Expr> {
     }
     // Canonicalise whitespace.
     let canonical: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    match canonical.as_str() {
+    lower_single_clause(&canonical).or_else(|| lower_and_composed(&canonical))
+}
+
+/// Lower a single (non-AND-composed) Rails-mapped ASSERT clause.
+///
+/// One explicit arm per recognised shape — no parser glob until the
+/// AR-shape vocab demands it. The shapes mirror what
+/// `op_surreal_ast::from_triples::compose_validation_assert` emits:
+///
+/// - `$value != NONE`  (presence-style, default catch-all)
+/// - `$value == true`  (acceptance kind)
+/// - `$value == NONE`  (absence kind)
+/// - `type::is_number($value)` (numericality kind)
+fn lower_single_clause(canonical: &str) -> Option<Expr> {
+    let value_param = || Expr::Param(Param::new("value".to_string()));
+    match canonical {
         "$value != NONE" => Some(Expr::Binary {
-            left: Box::new(Expr::Param(Param::new("value".to_string()))),
+            left: Box::new(value_param()),
             op: BinaryOperator::NotEqual,
             right: Box::new(Expr::Literal(Literal::None)),
         }),
-        // Future Rails-mapped expressions land here (one explicit arm
-        // each; no parser glob until the AR-shape vocab demands it).
+        "$value == NONE" => Some(Expr::Binary {
+            left: Box::new(value_param()),
+            op: BinaryOperator::Equal,
+            right: Box::new(Expr::Literal(Literal::None)),
+        }),
+        "$value == true" => Some(Expr::Binary {
+            left: Box::new(value_param()),
+            op: BinaryOperator::Equal,
+            right: Box::new(Expr::Literal(Literal::Bool(true))),
+        }),
+        "type::is_number($value)" => Some(Expr::FunctionCall(Box::new(FunctionCall {
+            receiver: Function::Normal("type::is_number".to_string()),
+            arguments: vec![value_param()],
+        }))),
         _ => None,
     }
+}
+
+/// Lower an AND-composed expression of recognised clauses. Splits on
+/// the top-level ` AND ` token (no nesting today — Rails validation
+/// composition is flat).
+///
+/// Each sub-clause must lower via [`lower_single_clause`]; an
+/// unrecognised sub-clause makes the whole composition return `None`
+/// (safer than emitting a partial Expr that drops constraints).
+fn lower_and_composed(canonical: &str) -> Option<Expr> {
+    let parts: Vec<&str> = canonical.split(" AND ").collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut clauses = parts
+        .into_iter()
+        .map(lower_single_clause)
+        .collect::<Option<Vec<Expr>>>()?;
+    // Left-fold: `(A AND B) AND C` so the tree mirrors how the
+    // composer emitted it (left-associative).
+    let mut acc = clauses.remove(0);
+    for next in clauses {
+        acc = Expr::Binary {
+            left: Box::new(acc),
+            op: BinaryOperator::And,
+            right: Box::new(next),
+        };
+    }
+    Some(acc)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -457,6 +514,89 @@ mod tests {
         // dropping us into mis-construction territory, the assert
         // becomes None and the catalog field stays accept-any.
         assert!(cat.assert.as_ref().is_none());
+    }
+
+    /// **D-AR-6.4** — `lower_single_clause` recognises each
+    /// validation-kind-style ASSERT shape the nexgen-rs composer
+    /// emits. One explicit arm per shape (no parser glob); each
+    /// produces a structural `Expr` the catalog can store.
+    #[test]
+    fn lower_single_clause_recognises_validation_kind_shapes() {
+        use surrealdb_types::ToSql;
+        let lower = |s: &str| {
+            ast::FieldDefinition::new("x", "T", ast::Kind::Any)
+                .with_assert(Some(s.to_string()))
+                .into()
+        };
+        // Acceptance kind: $value == true (canonical from composer).
+        let cat: CatalogFieldDefinition = lower("$value == true");
+        let sql = cat.to_sql();
+        assert!(
+            sql.contains("true"),
+            "acceptance ASSERT must lower: {sql}",
+        );
+        // Absence kind: $value == NONE.
+        let cat: CatalogFieldDefinition = lower("$value == NONE");
+        let sql = cat.to_sql();
+        assert!(
+            sql.contains("NONE") || sql.contains("None"),
+            "absence ASSERT must lower: {sql}",
+        );
+        // Numericality kind: type::is_number($value).
+        let cat: CatalogFieldDefinition = lower("type::is_number($value)");
+        let sql = cat.to_sql();
+        assert!(
+            sql.contains("type::is_number") || sql.contains("is_number"),
+            "numericality ASSERT must lower: {sql}",
+        );
+    }
+
+    /// **D-AR-6.4** — AND-composed assertions (multiple validation
+    /// kinds on the same attribute) lower to a left-folded
+    /// `Expr::Binary { ..And.. }` chain. Each sub-clause must be
+    /// individually recognised; an unrecognised sub-clause makes
+    /// the whole composition return `None` (safer than dropping
+    /// half the constraint).
+    #[test]
+    fn lower_and_composed_lifts_validation_kind_compositions() {
+        use surrealdb_types::ToSql;
+        let lower = |s: &str| {
+            let cat: CatalogFieldDefinition =
+                ast::FieldDefinition::new("x", "T", ast::Kind::Any)
+                    .with_assert(Some(s.to_string()))
+                    .into();
+            cat.to_sql()
+        };
+        // numericality + presence (composer's stable BTreeSet
+        // alphabetical order means the type:: call sorts before
+        // $value).
+        let sql = lower("type::is_number($value) AND $value != NONE");
+        assert!(
+            sql.contains("type::is_number") && sql.contains("AND") && sql.contains("NONE"),
+            "composed ASSERT must lower with AND chain: {sql}",
+        );
+        // Three-way composition — left-fold preserves order.
+        let sql = lower(
+            "type::is_number($value) AND $value != NONE AND $value == true",
+        );
+        assert!(
+            sql.contains("type::is_number")
+                && sql.contains("NONE")
+                && sql.contains("true")
+                && sql.contains("AND"),
+            "three-way composed ASSERT must lower: {sql}",
+        );
+        // Mixed recognised + unknown — whole expression unlowered.
+        let cat: CatalogFieldDefinition =
+            ast::FieldDefinition::new("x", "T", ast::Kind::Any)
+                .with_assert(Some(
+                    "$value != NONE AND string::len($value) <= 255".to_string(),
+                ))
+                .into();
+        assert!(
+            cat.assert.as_ref().is_none(),
+            "unrecognised sub-clause must drop the whole composition (no partial Expr)",
+        );
     }
 
     #[test]
@@ -814,5 +954,103 @@ mod tests {
         // declared fields in this fixture).
         assert!(p.fields.is_empty());
         assert!(p.indices.is_empty());
+    }
+
+    /// **D-AR-6 validation-kind + UNIQUE-index coverage** —
+    /// post-nexgen-rs#41/#43 the producer side composes
+    /// kind-aware ASSERT clauses with AND and emits separate UNIQUE
+    /// indices for `validates :foo, uniqueness: true`. This test
+    /// proves both features survive the bridge into the catalog SQL
+    /// render.
+    ///
+    /// Mirrors a typical `validates :email, presence: true,
+    /// uniqueness: true, numericality: false` shape — the most
+    /// common Rails attribute-level constraint pattern.
+    #[test]
+    fn d_ar_6_validation_compose_and_unique_index_bridge_correctly() {
+        use surrealdb_types::ToSql;
+
+        // User table with:
+        //   - `email` validated for presence + uniqueness:
+        //       FieldDefinition carries the composed ASSERT
+        //       (which the AST-side composer renders as
+        //        `$value != NONE`), plus a sibling UNIQUE
+        //       IndexDefinition.
+        //   - `age` validated for presence + numericality:
+        //       FieldDefinition carries the composed ASSERT
+        //        `type::is_number($value) AND $value != NONE`.
+        //   - `tos` validated for acceptance: ASSERT $value == true.
+        let user = ast::TableDefinition::new("User")
+            .with_field(ast::FieldDefinition {
+                name: "email".to_string(),
+                table: "User".to_string(),
+                kind: ast::Kind::String.optional(),
+                assert: Some("$value != NONE".to_string()),
+            })
+            .with_field(ast::FieldDefinition {
+                name: "age".to_string(),
+                table: "User".to_string(),
+                kind: ast::Kind::Int.optional(),
+                assert: Some(
+                    "type::is_number($value) AND $value != NONE".to_string(),
+                ),
+            })
+            .with_field(ast::FieldDefinition {
+                name: "tos".to_string(),
+                table: "User".to_string(),
+                kind: ast::Kind::Bool.optional(),
+                assert: Some("$value == true".to_string()),
+            })
+            // UNIQUE index on email (Rails `uniqueness: true`).
+            .with_index(
+                ast::IndexDefinition::new(
+                    "idx_User_email_unique",
+                    "User",
+                    vec!["email".to_string()],
+                )
+                .unique(),
+            );
+        let schema = ast::Schema::new().with_table(user);
+        let bridged = bridge_schema(schema);
+
+        assert_eq!(bridged.len(), 1);
+        let u = &bridged[0];
+        assert_eq!(u.fields.len(), 3);
+        assert_eq!(u.indices.len(), 1);
+
+        let field_sqls: Vec<String> = u.fields.iter().map(|f| f.to_sql()).collect();
+
+        // Composed ASSERT survives the bridge. The catalog's SQL
+        // printer renders the binary equality operator as `=` (vs
+        // the AST's `==`), so we probe for the recognisable
+        // semantics rather than the AST's exact string form.
+        let age_sql = field_sqls
+            .iter()
+            .find(|s| s.contains("age"))
+            .expect("age field rendered");
+        assert!(
+            age_sql.contains("type::is_number")
+                && age_sql.contains("$value != NONE")
+                && age_sql.contains(" AND "),
+            "composed ASSERT must render via the catalog: {age_sql}",
+        );
+
+        // Boolean-equality ASSERT (acceptance kind). Catalog renders
+        // `$value = true` (single =).
+        let tos_sql = field_sqls
+            .iter()
+            .find(|s| s.contains("tos"))
+            .expect("tos field rendered");
+        assert!(
+            tos_sql.contains("$value") && tos_sql.contains("true"),
+            "acceptance ASSERT must render: {tos_sql}",
+        );
+
+        // UNIQUE index → catalog Index::Uniq → `... UNIQUE` SQL.
+        let idx_sql = u.indices[0].to_sql();
+        assert!(
+            idx_sql.contains("idx_User_email_unique") && idx_sql.contains("UNIQUE"),
+            "UNIQUE index must render via the bridge: {idx_sql}",
+        );
     }
 }
