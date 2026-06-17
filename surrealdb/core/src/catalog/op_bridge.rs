@@ -221,12 +221,15 @@ impl From<ast::IndexDefinition> for CatalogIndexDefinition {
     fn from(i: ast::IndexDefinition) -> Self {
         let cols: Vec<Idiom> = i.fields.into_iter().map(Idiom::field).collect();
         let table_name = TableName::from(i.table);
-        // The AST's IndexDefinition does not yet carry uniqueness or
-        // vector-index metadata; the catalog's `new_for_ddl` defaults
-        // to a plain non-unique `Index::Idx`. D-AR-5.1 / D-AR-6.1
-        // will extend `op_surreal_ast` and this mapping with `.unique`
-        // / `.search` slots.
+        // D-AR-6.1: `ast::IndexDefinition.unique` lowers to
+        // `catalog::Index::Uniq` (vs the default `Index::Idx`). The
+        // unique flag rides through nexgen-rs#43 — Rails
+        // `validates :foo, uniqueness: true` now emits the UNIQUE
+        // index on the AST side. Vector / full-text / count
+        // variants stay reserved for later sprints — those need
+        // additional metadata the AST doesn't carry yet.
         CatalogIndexDefinition::new_for_ddl(i.name, table_name, cols)
+            .with_unique(i.unique)
     }
 }
 
@@ -535,6 +538,40 @@ mod tests {
         );
         assert!(sql.contains("WorkPackage"), "table missing: {sql}");
         assert!(sql.contains("project_id"), "column missing: {sql}");
+    }
+
+    /// **D-AR-6.1** — `ast::IndexDefinition.unique = true` lowers to
+    /// `catalog::Index::Uniq` (renders `... UNIQUE`). The default
+    /// (`unique = false`) stays at `Index::Idx`.
+    #[test]
+    fn index_definition_unique_flag_lowers_to_uniq_kind() {
+        use surrealdb_types::ToSql;
+        // Default — non-unique.
+        let ast_default = ast::IndexDefinition::new(
+            "idx_User_position",
+            "User",
+            vec!["position".to_string()],
+        );
+        let cat_default: CatalogIndexDefinition = ast_default.into();
+        let sql_default = cat_default.to_sql();
+        assert!(
+            !sql_default.contains("UNIQUE"),
+            "default index must NOT render UNIQUE; got {sql_default}",
+        );
+
+        // Unique — flag set.
+        let ast_unique = ast::IndexDefinition::new(
+            "idx_User_email_unique",
+            "User",
+            vec!["email".to_string()],
+        )
+        .unique();
+        let cat_unique: CatalogIndexDefinition = ast_unique.into();
+        let sql_unique = cat_unique.to_sql();
+        assert!(
+            sql_unique.contains("UNIQUE"),
+            "unique index must render UNIQUE; got {sql_unique}",
+        );
     }
 
     #[test]
