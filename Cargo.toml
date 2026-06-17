@@ -164,11 +164,14 @@ lance-graph-contract = { git = "https://github.com/AdaWorldAPI/lance-graph.git" 
 # FieldDefinition, IndexDefinition, Kind, Schema}` are the upstream input
 # types for the C16c bridge (the `From<op_surreal_ast::*> for catalog::*`
 # impls in surrealdb-core::catalog::op_bridge, gated by `op-bridge` feature).
-# Pinned to the D-AR-5.2 nexgen branch (PR #29) which adds the 7 new Kind
-# variants (String/Bool/Float/Decimal/Datetime/Bytes/Uuid) + the
-# `FieldDefinition.assert` slot. Flip to `branch = "main"` after PR #29
-# merges. The crate is zero-async-deps so the pull stays cheap.
-op-surreal-ast = { git = "https://github.com/AdaWorldAPI/openproject-nexgen-rs", branch = "claude/op-surreal-ast-field-types-stacked" }
+# Pinned to nexgen-rs `main`: the D-AR-5.2 work (7 new Kind variants
+# String/Bool/Float/Decimal/Datetime/Bytes/Uuid + the
+# `FieldDefinition.assert` slot) re-landed via nexgen-rs#36, plus the
+# downstream improvements main carries since PR #29 first opened
+# (FK direction gating, polymorphic fallback, singularize tightening,
+# Rails type aliases). The crate is zero-async-deps so the pull stays
+# cheap.
+op-surreal-ast = { git = "https://github.com/AdaWorldAPI/openproject-nexgen-rs", branch = "main" }
 nix = { version = "0.30.1", default-features = false }
 num-traits = "0.2.19"
 num_cpus = "1.17.0"

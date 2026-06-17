@@ -6190,7 +6190,7 @@ dependencies = [
 [[package]]
 name = "lance-graph-contract"
 version = "0.1.0"
-source = "git+https://github.com/AdaWorldAPI/openproject-nexgen-rs?branch=claude%2Fop-surreal-ast-field-types-stacked#b024c7be1810b9ca50d1ae79999a9c64810d511d"
+source = "git+https://github.com/AdaWorldAPI/openproject-nexgen-rs?branch=main#44550a876617f85f187ff73acc42cb56342f0067"
 
 [[package]]
 name = "lance-graph-contract"
@@ -7471,9 +7471,9 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "op-surreal-ast"
 version = "0.1.0"
-source = "git+https://github.com/AdaWorldAPI/openproject-nexgen-rs?branch=claude%2Fop-surreal-ast-field-types-stacked#b024c7be1810b9ca50d1ae79999a9c64810d511d"
+source = "git+https://github.com/AdaWorldAPI/openproject-nexgen-rs?branch=main#44550a876617f85f187ff73acc42cb56342f0067"
 dependencies = [
- "lance-graph-contract 0.1.0 (git+https://github.com/AdaWorldAPI/openproject-nexgen-rs?branch=claude%2Fop-surreal-ast-field-types-stacked)",
+ "lance-graph-contract 0.1.0 (git+https://github.com/AdaWorldAPI/openproject-nexgen-rs?branch=main)",
 ]
 
 [[package]]
