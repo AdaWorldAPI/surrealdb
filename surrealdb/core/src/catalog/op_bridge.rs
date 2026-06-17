@@ -629,4 +629,153 @@ mod tests {
             "index renders name + col",
         );
     }
+
+    /// **D-AR-6 end-to-end feature matrix** — assemble an AST schema
+    /// that exercises every feature the nexgen-rs producer side now
+    /// emits (typed fields, FK record links, ASSERT non-null,
+    /// polymorphic `option<any>` fallback, table comments from
+    /// AR-shape annotations), bridge it, and assert each catalog-side
+    /// shape independently via its rendered SurrealQL.
+    ///
+    /// This is the "wired up" regression: each feature has a unit
+    /// test above; this one proves they all coexist correctly through
+    /// `bridge_schema`, which is the single ingress point for any
+    /// downstream ingestor. The catalog field internals are
+    /// `pub(crate)`, so the bridge's catalog output is observable
+    /// only via `to_sql()` rendering at this scope.
+    #[test]
+    fn d_ar_6_end_to_end_feature_matrix_bridges_correctly() {
+        use surrealdb_types::ToSql;
+
+        // WorkPackage:
+        //   - `subject` : typed `option<string>` + ASSERT (validates_presence)
+        //   - `position` : typed `option<int>` (no validation)
+        //   - `project_id` : FK `option<record<Project>>` (belongs_to)
+        //   - `assignable_id` : polymorphic `option<any>` (no known target)
+        //   - Comment: AR-shape annotations joined.
+        let work_package = ast::TableDefinition::new("WorkPackage")
+            .with_comment(Some(
+                "acts_as_journalized; has_many:time_entries→TimeEntry".to_string(),
+            ))
+            .with_field(ast::FieldDefinition {
+                name: "subject".to_string(),
+                table: "WorkPackage".to_string(),
+                kind: ast::Kind::String.optional(),
+                assert: Some("$value != NONE".to_string()),
+            })
+            .with_field(ast::FieldDefinition {
+                name: "position".to_string(),
+                table: "WorkPackage".to_string(),
+                kind: ast::Kind::Int.optional(),
+                assert: None,
+            })
+            .with_field(ast::FieldDefinition {
+                name: "project_id".to_string(),
+                table: "WorkPackage".to_string(),
+                kind: ast::Kind::Record(vec!["Project".to_string()]).optional(),
+                assert: None,
+            })
+            .with_field(ast::FieldDefinition {
+                name: "assignable_id".to_string(),
+                table: "WorkPackage".to_string(),
+                kind: ast::Kind::Any.optional(),
+                assert: None,
+            })
+            .with_index(ast::IndexDefinition::new(
+                "idx_WorkPackage_project_id",
+                "WorkPackage",
+                vec!["project_id".to_string()],
+            ));
+        let project = ast::TableDefinition::new("Project");
+        let schema = ast::Schema::new()
+            .with_table(work_package)
+            .with_table(project);
+        let bridged = bridge_schema(schema);
+
+        // Two tables in input order — `bridge_schema` is a flat map.
+        assert_eq!(bridged.len(), 2);
+        let wp = &bridged[0];
+        let p = &bridged[1];
+        assert_eq!(wp.fields.len(), 4);
+        assert_eq!(wp.indices.len(), 1);
+
+        // Render every bridged field to SQL and assert on the
+        // observable shape — internal catalog accessors are
+        // pub(crate) so the SQL is the only available probe at the
+        // test scope.
+        let field_sqls: Vec<String> = wp.fields.iter().map(|f| f.to_sql()).collect();
+
+        // Typed scalar with ASSERT: subject → option<string>
+        // ASSERT $value != NONE.
+        let subject_sql = field_sqls
+            .iter()
+            .find(|s| s.contains("subject"))
+            .expect("subject field rendered");
+        assert!(
+            subject_sql.contains("subject"),
+            "subject field name in SQL: {subject_sql}",
+        );
+        // Either(None, String) renders as option<string> via
+        // surrealdb's catalog SQL printer (case may differ from ast).
+        assert!(
+            subject_sql.to_lowercase().contains("string"),
+            "subject must carry string typing; got {subject_sql}",
+        );
+        assert!(
+            subject_sql.contains("ASSERT")
+                || subject_sql.contains("$value"),
+            "subject's ASSERT clause must render in catalog SQL; got {subject_sql}",
+        );
+
+        // Typed scalar no ASSERT: position → option<int>.
+        let position_sql = field_sqls
+            .iter()
+            .find(|s| s.contains("position"))
+            .expect("position field rendered");
+        assert!(
+            position_sql.to_lowercase().contains("int"),
+            "position must carry int typing; got {position_sql}",
+        );
+        assert!(
+            !position_sql.contains("ASSERT"),
+            "position has no ASSERT — must NOT render an assert clause; got {position_sql}",
+        );
+
+        // FK record link: project_id → option<record<Project>>.
+        let project_id_sql = field_sqls
+            .iter()
+            .find(|s| s.contains("project_id"))
+            .expect("project_id field rendered");
+        assert!(
+            project_id_sql.to_lowercase().contains("record")
+                && project_id_sql.contains("Project"),
+            "project_id must lower to record<Project>; got {project_id_sql}",
+        );
+
+        // Polymorphic FK: assignable_id → option<any>.
+        let assignable_sql = field_sqls
+            .iter()
+            .find(|s| s.contains("assignable_id"))
+            .expect("assignable_id field rendered");
+        assert!(
+            assignable_sql.to_lowercase().contains("any"),
+            "polymorphic FK must lower to option<any>; got {assignable_sql}",
+        );
+
+        // Companion index on project_id — exact name lock.
+        let idx_sql = wp.indices[0].to_sql();
+        assert!(
+            idx_sql.contains("idx_WorkPackage_project_id"),
+            "index name preserved: {idx_sql}",
+        );
+        assert!(
+            idx_sql.contains("project_id"),
+            "index points at project_id column: {idx_sql}",
+        );
+
+        // Project has no fields/indices (it's the FK target, no
+        // declared fields in this fixture).
+        assert!(p.fields.is_empty());
+        assert!(p.indices.is_empty());
+    }
 }
