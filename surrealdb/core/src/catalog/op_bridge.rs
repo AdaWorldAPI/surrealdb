@@ -211,34 +211,91 @@ fn rails_assert_to_expr(s: &str) -> Option<Expr> {
 /// AR-shape vocab demands it. The shapes mirror what
 /// `op_surreal_ast::from_triples::compose_validation_assert` emits:
 ///
+/// **Parameterless (kind-level):**
 /// - `$value != NONE`  (presence-style, default catch-all)
 /// - `$value == true`  (acceptance kind)
 /// - `$value == NONE`  (absence kind)
 /// - `type::is_number($value)` (numericality kind)
+///
+/// **Parametric (validation_param-level, post-nexgen-rs#46):**
+/// - `$value > N` / `$value < N` / `$value >= N` / `$value <= N` /
+///   `$value == N` (numericality / comparison kinds)
+/// - `string::len($value) <= N` / `>= N` / `== N` (length kind)
+///
+/// Where `N` is an i64 literal. Non-integer values were already
+/// filtered at the consumer-side `param_clause` lift; reaching here
+/// with a non-parseable N means a producer-side change drifted —
+/// return `None` to fall back to the safe accept-anything default.
 fn lower_single_clause(canonical: &str) -> Option<Expr> {
     let value_param = || Expr::Param(Param::new("value".to_string()));
+    // Try the fixed-shape catch-alls first.
     match canonical {
-        "$value != NONE" => Some(Expr::Binary {
-            left: Box::new(value_param()),
-            op: BinaryOperator::NotEqual,
-            right: Box::new(Expr::Literal(Literal::None)),
-        }),
-        "$value == NONE" => Some(Expr::Binary {
-            left: Box::new(value_param()),
-            op: BinaryOperator::Equal,
-            right: Box::new(Expr::Literal(Literal::None)),
-        }),
-        "$value == true" => Some(Expr::Binary {
-            left: Box::new(value_param()),
-            op: BinaryOperator::Equal,
-            right: Box::new(Expr::Literal(Literal::Bool(true))),
-        }),
-        "type::is_number($value)" => Some(Expr::FunctionCall(Box::new(FunctionCall {
-            receiver: Function::Normal("type::is_number".to_string()),
-            arguments: vec![value_param()],
-        }))),
-        _ => None,
+        "$value != NONE" => {
+            return Some(Expr::Binary {
+                left: Box::new(value_param()),
+                op: BinaryOperator::NotEqual,
+                right: Box::new(Expr::Literal(Literal::None)),
+            });
+        }
+        "$value == NONE" => {
+            return Some(Expr::Binary {
+                left: Box::new(value_param()),
+                op: BinaryOperator::Equal,
+                right: Box::new(Expr::Literal(Literal::None)),
+            });
+        }
+        "$value == true" => {
+            return Some(Expr::Binary {
+                left: Box::new(value_param()),
+                op: BinaryOperator::Equal,
+                right: Box::new(Expr::Literal(Literal::Bool(true))),
+            });
+        }
+        "type::is_number($value)" => {
+            return Some(Expr::FunctionCall(Box::new(FunctionCall {
+                receiver: Function::Normal("type::is_number".to_string()),
+                arguments: vec![value_param()],
+            })));
+        }
+        _ => {}
     }
+    // Parametric shapes. Try each prefix in turn.
+    if let Some(rest) = canonical.strip_prefix("$value ") {
+        return lower_numeric_comparison(rest, value_param());
+    }
+    if let Some(rest) = canonical.strip_prefix("string::len($value) ") {
+        return lower_numeric_comparison(
+            rest,
+            Expr::FunctionCall(Box::new(FunctionCall {
+                receiver: Function::Normal("string::len".to_string()),
+                arguments: vec![value_param()],
+            })),
+        );
+    }
+    None
+}
+
+/// Parse `<op> <int>` (e.g. `> 0`, `<= 255`, `== 42`) into an
+/// `Expr::Binary` whose left-hand side is the caller's choice
+/// (a bare param for `$value <op> N`, or a function call for
+/// `string::len($value) <op> N`). Returns `None` for unrecognised
+/// operators or non-i64 values.
+fn lower_numeric_comparison(rest: &str, left: Expr) -> Option<Expr> {
+    let (op_str, value_str) = rest.split_once(' ')?;
+    let value = value_str.trim().parse::<i64>().ok()?;
+    let op = match op_str {
+        ">" => BinaryOperator::MoreThan,
+        ">=" => BinaryOperator::MoreThanEqual,
+        "<" => BinaryOperator::LessThan,
+        "<=" => BinaryOperator::LessThanEqual,
+        "==" => BinaryOperator::Equal,
+        _ => return None,
+    };
+    Some(Expr::Binary {
+        left: Box::new(left),
+        op,
+        right: Box::new(Expr::Literal(Literal::Integer(value))),
+    })
 }
 
 /// Lower an AND-composed expression of recognised clauses. Splits on
@@ -507,10 +564,17 @@ mod tests {
             ast::Kind::Int.optional(),
         )
         .with_assert(Some(
-            "$value > 100 AND $value < 1000".to_string(),
+            // Free-form arithmetic that doesn't match any of the
+            // recognised single-clause shapes (`$value != NONE` /
+            // `$value == NONE` / `$value == true` /
+            // `type::is_number($value)` / `$value <op> N` /
+            // `string::len($value) <op> N` for the OPs we lift).
+            // The bracketed `($value > 100)` isn't a shape the
+            // composer ever emits.
+            "($value > 100) OR $value.is_empty()".to_string(),
         ));
         let cat: CatalogFieldDefinition = ast_field.into();
-        // The bridge doesn't yet know how to lower this; rather than
+        // The bridge doesn't know how to lower this; rather than
         // dropping us into mis-construction territory, the assert
         // becomes None and the catalog field stays accept-any.
         assert!(cat.assert.as_ref().is_none());
@@ -551,6 +615,68 @@ mod tests {
         );
     }
 
+    /// **D-AR-6.5 — parametric numeric clauses (post-nexgen-rs#46)** —
+    /// `$value <op> N` and `string::len($value) <op> N` shapes
+    /// lift to structural catalog `Expr::Binary` chains with i64
+    /// literal right-hand sides.
+    #[test]
+    fn lower_single_clause_lifts_parametric_numeric_shapes() {
+        use surrealdb_types::ToSql;
+        let lower = |s: &str| -> CatalogFieldDefinition {
+            ast::FieldDefinition::new("x", "T", ast::Kind::Any)
+                .with_assert(Some(s.to_string()))
+                .into()
+        };
+        // numericality:greater_than=N → $value > N
+        let sql = lower("$value > 0").to_sql();
+        assert!(
+            sql.contains("$value") && sql.contains("0") && sql.contains(">"),
+            "greater_than must lower: {sql}",
+        );
+        // Range operators (each individually).
+        for clause in [
+            "$value < 100",
+            "$value >= 18",
+            "$value <= 65",
+            "$value == 42",
+            "$value == -1",
+        ] {
+            assert!(
+                lower(clause).assert.is_some(),
+                "`{clause}` must lower to a structural Expr (not None)",
+            );
+        }
+        // length:maximum=N → string::len($value) <= N
+        let sql = lower("string::len($value) <= 255").to_sql();
+        assert!(
+            sql.contains("string::len") && sql.contains("255"),
+            "string::len <= must lower: {sql}",
+        );
+        // length:minimum=N / length:is=N.
+        for clause in [
+            "string::len($value) >= 3",
+            "string::len($value) == 36",
+        ] {
+            assert!(
+                lower(clause).assert.is_some(),
+                "`{clause}` must lower",
+            );
+        }
+        // Non-integer right-hand sides: NOT recognised — `param_clause`
+        // upstream rejects them (codex P2 on #46), but defend in
+        // depth here too.
+        for clause in [
+            "$value > MAX_SCORE",   // constant ref
+            "string::len($value) <= 3.14", // float
+            "$value > 0x10",        // hex
+        ] {
+            assert!(
+                lower(clause).assert.is_none(),
+                "non-i64 `{clause}` must NOT lower",
+            );
+        }
+    }
+
     /// **D-AR-6.4** — AND-composed assertions (multiple validation
     /// kinds on the same attribute) lower to a left-folded
     /// `Expr::Binary { ..And.. }` chain. Each sub-clause must be
@@ -586,11 +712,24 @@ mod tests {
                 && sql.contains("AND"),
             "three-way composed ASSERT must lower: {sql}",
         );
-        // Mixed recognised + unknown — whole expression unlowered.
+        // Composed with a parametric clause (D-AR-6.5): the bridge
+        // now also recognises `string::len($value) <= N` and
+        // `$value <op> N`, so this composition DOES lower.
+        let sql = lower("$value != NONE AND string::len($value) <= 255");
+        assert!(
+            sql.contains("$value")
+                && sql.contains("NONE")
+                && sql.contains("string::len")
+                && sql.contains("255")
+                && sql.contains("AND"),
+            "presence + length-max composition must lower: {sql}",
+        );
+        // Mixed recognised + still-unknown — whole expression
+        // unlowered (an arbitrary regex-ish or unrecognised shape).
         let cat: CatalogFieldDefinition =
             ast::FieldDefinition::new("x", "T", ast::Kind::Any)
                 .with_assert(Some(
-                    "$value != NONE AND string::len($value) <= 255".to_string(),
+                    "$value != NONE AND $value matches /^a/".to_string(),
                 ))
                 .into();
         assert!(
