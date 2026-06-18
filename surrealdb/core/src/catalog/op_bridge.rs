@@ -1192,4 +1192,45 @@ mod tests {
             "UNIQUE index must render via the bridge: {idx_sql}",
         );
     }
+
+    /// **D-AR-6.6 — composite UNIQUE bridge (post-nexgen-rs#47)** —
+    /// Rails `uniqueness: { scope: [:type, :project_id] }` lifts on
+    /// the AST side to a multi-column UNIQUE `IndexDefinition`. The
+    /// bridge's `From<ast::IndexDefinition>` already handles
+    /// `fields: Vec<Idiom>` of arbitrary length, so this works "for
+    /// free" — but we lock the contract so a future refactor doesn't
+    /// silently drop scope columns from the catalog.
+    #[test]
+    fn d_ar_6_6_composite_unique_index_bridges_correctly() {
+        use surrealdb_types::ToSql;
+        // Composite UNIQUE on `Enumeration` covering name + type +
+        // project_id (mirrors the Enumeration model on the OP corpus).
+        let ast_idx = ast::IndexDefinition::new(
+            "idx_Enumeration_name_type_project_id_unique",
+            "Enumeration",
+            vec![
+                "name".to_string(),
+                "type".to_string(),
+                "project_id".to_string(),
+            ],
+        )
+        .unique();
+        let cat: CatalogIndexDefinition = ast_idx.into();
+        let sql = cat.to_sql();
+        // Every scope column must survive the bridge.
+        for col in ["name", "type", "project_id"] {
+            assert!(
+                sql.contains(col),
+                "scope column `{col}` missing from rendered SQL: {sql}",
+            );
+        }
+        assert!(
+            sql.contains("UNIQUE"),
+            "composite UNIQUE must render the keyword: {sql}",
+        );
+        assert!(
+            sql.contains("idx_Enumeration_name_type_project_id_unique"),
+            "composite UNIQUE name must survive: {sql}",
+        );
+    }
 }
