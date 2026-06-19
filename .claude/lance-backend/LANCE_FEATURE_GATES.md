@@ -16,20 +16,39 @@
 ## TL;DR — the one command
 
 ```bash
-# Lite-unified: pure-Rust columnar surreal, no RocksDB(C++), no TiKV(gRPC).
-cargo build -p surrealdb --no-default-features --features kv-lance,rustls
-#                         ^^^^^^^^^^^^^^^^^^^^^^ drop protocol-ws default too
-# core-only (no SDK transport surface), fastest troubleshooting loop:
+# THE no-native-toolchain proof: pure-Rust columnar core, zero cc/C++.
+# No RocksDB(C++), no TiKV(gRPC), no TLS crypto backend.
 cargo check -p surrealdb-core --no-default-features --features kv-lance
 ```
 
-`--no-default-features` is the load-bearing flag. Without it the
-default set (`kv-mem` on `surrealdb-core`, `protocol-ws,rustls` on the
-`surrealdb` SDK) is *added to* whatever you pass — you would still get a
-clean build but you would NOT have proven that `kv-lance` stands alone.
+`--no-default-features` is the load-bearing flag. Without it the core
+default set (`kv-mem`, `graphql`) is *added to* whatever you pass — you
+would still get a clean build but you would NOT have proven that
+`kv-lance` stands alone.
 
-**Observed:** clean compile, ~5m43s cold (first build of the lance
-dependency closure), seconds incremental. Zero `cc`/C++ in the closure.
+**Observed (core-only):** clean compile, ~5m43s cold (first build of the
+lance dependency closure), seconds incremental. **Zero `cc`/C++ in the
+closure** — this claim holds for the core-only command above.
+
+### ⚠ The SDK build is NOT cc-free — TLS pulls aws-lc-sys
+
+```bash
+# Lite-unified SDK (adds the client transport surface) — NOT no-cc:
+cargo build -p surrealdb --no-default-features --features kv-lance,rustls
+```
+
+This still drops the C++ *storage* engines (RocksDB) and the gRPC one
+(TiKV), but `rustls` is **not** a pure-Rust choice here:
+`surrealdb/Cargo.toml` enables `rustls` with the **`aws_lc_rs`** crypto
+backend on non-WASM targets, and `aws-lc-sys` depends on **`cc` +
+`cmake`** (verified in `Cargo.lock`). So this command can require native
+build tooling and does **not** satisfy "zero cc/C++".
+
+To prove a no-native-toolchain *SDK* build you must also swap the TLS
+backend off `aws_lc_rs` (e.g. the `ring` backend the WASM target uses)
+or drop TLS entirely — `rustls`'s storage-engine independence does not
+extend to its crypto backend. For the storage-layer proof that this card
+is about, use the **core-only** command, which has no TLS surface at all.
 
 ---
 
@@ -95,6 +114,7 @@ crates.io lance for a fork build to make a compile pass.
 |---|---|---|
 | `error: linker cc not found` / libstdc++ link errors | a C++ backend (`kv-rocksdb`) is in the feature set | confirm `--no-default-features`; do not pass `kv-rocksdb` |
 | `failed to run protoc` | `kv-tikv` pulled gRPC | drop `kv-tikv`; lite-unified never needs it |
+| `cc`/`cmake` invoked despite no `kv-rocksdb` | the **SDK** `rustls` feature pulls `aws-lc-sys` (cc+cmake) for the `aws_lc_rs` TLS backend — unrelated to storage | use the core-only command for the no-cc proof; for a no-cc SDK, switch rustls to the `ring` backend or drop TLS |
 | `Patch lance ... was not used in the crate graph` | fork wiring / transitive semver mismatch | check direct `[patch]` + `Cargo.lock`; resolve the transitive blocker, do NOT fall back to crates.io (P0) |
 | `lancedb 0.30 requires lance =7.0.0 but =X found` | lance family drifted out of lockstep | re-pin all three (`lance`, `lance-index`, `lancedb`) to the lance-graph workspace versions together |
 | build "works" but kv-lance never exercised | default features silently re-added `kv-mem` | the proving build MUST use `--no-default-features` |
