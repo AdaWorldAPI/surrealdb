@@ -339,3 +339,40 @@ commit_gate module) — they need agent 2/3 / orchestrator follow-up. Did NOT ru
 - Datafusion is transitive via lance. Adding a direct `datafusion = "=53.1.0"` dep would manifest the pin explicitly but reaches outside the C16b scope. Deferred unless explicitly requested.
 
 **Commit(s):** _filled in by the committing session_
+
+---
+
+## 2026-06-19 — Lance feature-gate reference card + ractor messaging fix
+
+**Session:** lite-unified troubleshooting + ractor unblock (Opus, main thread)
+**Branch:** `claude/jirak-math-theorems-harvest-rfii13`
+
+**What landed:**
+- `.claude/lance-backend/LANCE_FEATURE_GATES.md` — the proven
+  `--no-default-features --features kv-lance` invocation, the
+  per-engine C++/gRPC-vs-pure-Rust contrast table, the exact in-tree
+  pins (`lance =7.0.0`, `lance-index =7.0.0`, `lancedb =0.30.0`,
+  `arrow 58`), a troubleshooting matrix, and the ractor breakthrough
+  loop (Lance `versions()` → scheduler actor → jitson → SoA write).
+  SUPERSEDES the stale `patches/Cargo-toml.patch.txt` (lance "1.0" /
+  arrow "55" / "not yet wired").
+- (cross-repo, AdaWorldAPI/ractor same branch) fixed the
+  `MessagingErr::Saturated` non-exhaustive-match compile break at 3
+  sites — bounded-mailbox backpressure now handled; ractor compiles on
+  default + cluster features, fmt+clippy clean, 130 tests + 13 doctests
+  pass. This unblocks an actor-driven Lance version-subscription loop.
+
+**Key facts recorded:** DataFusion is NOT on the compute loop (it is
+query-planning; the loop is formula compute). lance/lancedb/arrow ARE
+needed (zero-copy columnar store). `surreal_container` consumer remains
+`BLOCKED(C)` — the kv-lance fork dep is not yet wired into its
+Cargo.toml; that wiring + the loop is the remaining work, not a 12-day
+lift.
+
+**Open questions / follow-ups:**
+- Wire the `AdaWorldAPI/surrealdb` kv-lance fork dep into
+  `surreal_container/Cargo.toml` to clear `BLOCKED(C)`.
+- arrow pins are semver-range (`58`), resolving to `58.3.0`; exact-pin
+  deferred (matches lance-graph's own arrow handling).
+
+**Commit(s):** _filled in by the committing session_
