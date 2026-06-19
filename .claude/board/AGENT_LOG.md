@@ -376,3 +376,30 @@ lift.
   deferred (matches lance-graph's own arrow handling).
 
 **Commit(s):** _filled in by the committing session_
+
+---
+
+## 2026-06-19 — codex P2 follow-up: rustls is not cc-free (LANCE_FEATURE_GATES)
+
+**Session:** post-merge correction (Opus, main thread)
+**Branch:** `claude/jirak-math-theorems-harvest-rfii13`
+
+Codex flagged (P2) that the lite-unified TL;DR command included
+`rustls`, which on non-WASM enables the `aws_lc_rs` backend;
+`aws-lc-sys 0.41.0` depends on `cc` + `cmake` (verified `Cargo.lock`
+L884-893). That contradicted the doc's "zero cc/C++ in the closure"
+claim for the SDK command. Correction:
+- The **core-only** command (`cargo check -p surrealdb-core
+  --no-default-features --features kv-lance`) is now THE no-cc proof;
+  the "zero cc/C++" claim is scoped to it explicitly.
+- Added a ⚠ section: the SDK `--features kv-lance,rustls` build drops
+  the C++/gRPC *storage* engines but is NOT cc-free — rustls's crypto
+  backend pulls aws-lc-sys. To prove a no-cc SDK, swap to the `ring`
+  backend or drop TLS.
+- Added a troubleshooting-matrix row for the cc/cmake-despite-no-rocksdb
+  symptom.
+
+Storage-layer claim (drop RocksDB → no C++ storage dep) was always
+correct; only the TLS-transport conflation was wrong.
+
+**Commit(s):** _filled in by the committing session_
