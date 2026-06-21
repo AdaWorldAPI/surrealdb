@@ -268,3 +268,32 @@ contradiction (the lance-7 API surface used by timeline.rs is unverified; the do
 still says "confirmed Lance 6.0.0 surface").
 
 **Cross-ref:** lance-graph `EPIPHANIES.md` `E-S6-SCAN-SOA-NOT-ON-SHARED-VAL` + `E-SURREALDB-SECOND-BRAIN-IS-ZERO-COPY-IFF-FIXEDSIZEBINARY`; lance-graph capstone plan S6 row; `lance_graph_contract::canonical_node::node_rows_from_le_bytes`.
+
+## 2026-06-21 — CORRECTION: SoA is ONE FixedSizeBinary(512), no second copy; no time-series drop; lance 7 mandatory
+**Status:** FINDING (operator override; CORRECTS the prior 2026-06-21 "do NOT build scan_soa over shared val" note)
+**Scope:** surrealdb/core/src/kvs/lance/{schema.rs, timeline.rs}; Cargo.lock pins
+
+The prior note's *facts* about variable-`Binary` (per-cell alignment-silent-drop)
+hold — but its *conclusions* are RETRACTED per three operator NOs:
+
+1. **NO second copy / second column.** A `soa_val`-alongside-`val` column or an
+   owned `Vec<NodeRow>` copy is unacceptable. The SoA is stored ONCE as
+   `FixedSizeBinary(512)` and read in place as `&[NodeRow]` (zero-copy via
+   `node_rows_from_le_bytes`). The single SoA home is **lance-graph's own Lance
+   dataset**; surrealdb is the Rubicon **VIEW** over it ("view, never a store"),
+   so the bytes surrealdb views ARE lance-graph's SoA — no duplicate, no opacity
+   violation.
+2. **NO dropping time-series via tombstone+purge.** The Lance version history IS
+   the Rubicon timeline. A tombstone is logical deletion at a version; it must
+   NOT trigger a `cleanup_old_versions`/purge that drops history.
+   `Timeline::view_at(v).scan()` stays queryable across the whole arc.
+3. **lance 7.0.0 is MANDATORY (not "unverified").** Cargo.lock pinned to
+   lance 7.0.0 / lance-index 7.0.0 / lancedb 0.30.0 (object_store 0.13.2),
+   datafusion 53, arrow 58 — committed in this repo (commit b5e2927), not
+   reverted locally. lance-6→7 API drift is fixed on the fly, never a gate.
+   `timeline.rs` doc updated "Lance 6.0.0 surface" → 7.0.0.
+
+**Next engine step:** point `Timeline` at lance-graph's `FixedSizeBinary(512)`
+SoA dataset; zero-copy `&[NodeRow]` read; purge preserves history. On lance 7.
+
+**Cross-ref:** lance-graph `EPIPHANIES.md` `E-S6-SOA-IS-ONE-FIXEDSIZEBINARY-NO-SECOND-COPY`; this repo Cargo.lock (lance 7.0.0); `lance_graph_contract::canonical_node::node_rows_from_le_bytes`.
