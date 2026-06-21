@@ -994,14 +994,18 @@ async fn test_savepoint_release_with_no_savepoint_errors() {
 //  Versioning tests
 // ============================================================================
 
-/// get(key, Some(version)) on a versioned datastore reads the historical value.
+/// Transparent time-travel: `get(key, Some(versionstamp))` maps the requested
+/// wall-clock instant onto the Lance dataset version AS OF that instant (via
+/// Lance's native per-version timestamps in `lance_version_as_of`), NOT a
+/// surreal version-pointer column or a Lance dataset-version counter.
 #[tokio::test]
 async fn test_get_at_specific_version() {
 	let path = unique_tmp_path();
 	let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
 
-	// Capture the version before any writes.
-	let v_initial = ds.current_version().await;
+	// Instant before any write (the empty dataset already exists).
+	let t_before = chrono::Utc::now();
+	tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
 	// Commit v1.
 	{
@@ -1009,7 +1013,11 @@ async fn test_get_at_specific_version() {
 		tx.set(b"k".to_vec(), b"v1".to_vec()).await.expect("set v1");
 		tx.commit().await.expect("commit v1");
 	}
-	let v_after_first = ds.current_version().await;
+
+	// Instant strictly between the two commits.
+	tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+	let t_between = chrono::Utc::now();
+	tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
 	// Commit v2 (overwrites v1 — the native MergeInsert replaces the row).
 	{
@@ -1017,34 +1025,40 @@ async fn test_get_at_specific_version() {
 		tx.set(b"k".to_vec(), b"v2".to_vec()).await.expect("set v2");
 		tx.commit().await.expect("commit v2");
 	}
-	let v_latest = ds.current_version().await;
+
+	// The `version` arg is a VERSIONSTAMP (an instant), decoded by the backend's
+	// `timestamp_impl`. In tests that is `IncTimeStampImpl`, whose versionstamp
+	// IS the millisecond instant, so a wall-clock-millis value round-trips to the
+	// same `DateTime` the mapping compares against Lance's native version stamps.
+	let vs = |dt: chrono::DateTime<chrono::Utc>| dt.timestamp_millis() as u64;
 
 	// Read at latest → v2.
 	let tx = ds.transaction(false, false).await.expect("tx_now");
-	let now = tx.get(b"k".to_vec(), None).await.expect("get now");
-	assert_eq!(now.as_deref(), Some(b"v2".as_ref()), "latest read should be v2");
+	assert_eq!(
+		tx.get(b"k".to_vec(), None).await.expect("get now").as_deref(),
+		Some(b"v2".as_ref()),
+		"latest read should be v2",
+	);
 	tx.cancel().await.expect("cancel");
 
-	// Read at v_after_first → the value as of v1's commit.
-
-	// (delete-then-insert keyed on `key`), whether checkout_version(v1) sees
-	// Some(v1) or None depends on whether lance preserves per-version
-	// deletion vectors. POC tolerates both; we only pin that a version-pinned
-	// read MUST NOT observe the future v2 write.
-	let tx2 = ds.transaction(false, false).await.expect("tx_v1");
-	let at_v1 = tx2.get(b"k".to_vec(), Some(v_after_first)).await.expect("get at v1");
-	assert_ne!(at_v1.as_deref(), Some(b"v2".as_ref()),
-		"version-pinned read MUST NOT see future writes; got {:?}", at_v1);
+	// AS OF an instant between v1 and v2 → v1 (transparent time-travel: the
+	// state as it stood at that instant, never the future v2 write).
+	let tx2 = ds.transaction(false, false).await.expect("tx_between");
+	assert_eq!(
+		tx2.get(b"k".to_vec(), Some(vs(t_between))).await.expect("get as-of-between").as_deref(),
+		Some(b"v1".as_ref()),
+		"AS OF an instant between v1 and v2 must read v1",
+	);
 	tx2.cancel().await.expect("cancel");
 
-	// Read at v_initial — pre-any-commit. Must NOT return any value.
-	let tx3 = ds.transaction(false, false).await.expect("tx_init");
-	let at_init = tx3.get(b"k".to_vec(), Some(v_initial)).await.expect("get at initial");
-	assert!(at_init.is_none(),
-		"pre-write version should return None; got {:?}", at_init);
+	// AS OF an instant before any write → None (the key did not exist yet).
+	let tx3 = ds.transaction(false, false).await.expect("tx_before");
+	assert!(
+		tx3.get(b"k".to_vec(), Some(vs(t_before))).await.expect("get as-of-before").is_none(),
+		"AS OF a pre-write instant must return None",
+	);
 	tx3.cancel().await.expect("cancel");
 
-	let _ = v_latest;
 	ds.shutdown().await.expect("shutdown");
 }
 

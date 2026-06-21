@@ -37,7 +37,8 @@
 //!   (`WhenMatched::UpdateAll` / `WhenNotMatched::InsertAll`, keyed on
 //!   `key`). One SurrealDB commit = one lance dataset version.
 //! - **read** checks the pending buffer first (read-your-writes), then
-//!   reads lance (`checkout_version(v)` for an explicit version, else the
+//!   reads lance (the version AS OF the requested instant via
+//!   [`Transaction::lance_version_as_of`] for an explicit version, else the
 //!   latest manifest) with a DataFusion filter + projection, then merges.
 //! - **compaction / GC** is lance's own `optimize` via the
 //!   [`background_optimizer`], never a hand-rolled flusher.
@@ -60,12 +61,17 @@
 //! [`tx_buffer::PendingBuffer`] and apply them atomically as one native
 //! merge-insert on [`Transaction::commit`].
 //!
-//! ## Versioning
+//! ## Versioning (transparent)
 //!
-//! Lance's native dataset versioning (`Dataset::checkout_version(v)`) maps
-//! directly to SurrealDB's `version: Option<u64>` parameter. Each commit
-//! creates a new Lance dataset version, which becomes a valid snapshot for
-//! `get(key, Some(version))`.
+//! SurrealDB's `version: Option<u64>` is a *versionstamp* (a wall-clock
+//! instant encoded by the datastore's `timestamp_impl` — HLC in prod:
+//! `millis << 16 | counter`), NOT a Lance dataset-version counter. A
+//! versioned read maps that instant onto the latest Lance dataset version
+//! whose NATIVE creation timestamp is `<= instant`
+//! ([`Transaction::lance_version_as_of`], over `Dataset::versions()`) and
+//! `checkout_version`s it. This is transparent time-travel via Lance's own
+//! version metadata — there is no surreal "version pointer". The per-row
+//! `version` column is an informational commit stamp, never the read key.
 //!
 //! ## Concurrency
 //!
@@ -90,6 +96,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use lance::Dataset as LanceDataset;
 use lance::dataset::WriteParams;
 use lance::index::DatasetIndexExt;
@@ -128,8 +135,10 @@ pub struct Datastore {
 	dataset: Arc<RwLock<DatasetHandle>>,
 
 	/// Whether per-key versioning queries (`get(key, Some(version))`) are
-	/// supported. When `true`, we map the SurrealDB version onto Lance's
-	/// native dataset version (`Dataset::checkout_version`).
+	/// supported. When `true`, the requested versionstamp (a wall-clock
+	/// instant) is mapped onto the Lance dataset version AS OF that instant
+	/// via `lance_version_as_of` (transparent time-travel over
+	/// `Dataset::versions()`), then `checkout_version`d.
 	versioned: bool,
 
 	/// Background optimizer that periodically calls lance's native
@@ -327,17 +336,12 @@ impl Datastore {
 		write: bool,
 		_lock: bool,
 	) -> Result<Transaction> {
-		// Snapshot the current dataset version for read-consistency
-		// throughout this transaction.
-		let read_version = self.current_version().await;
-
 		Ok(Transaction {
 			done: AtomicBool::new(false),
 			write,
 			versioned: self.versioned,
 			pending: Arc::new(RwLock::new(PendingBuffer::new())),
 			save_points: Arc::new(RwLock::new(Vec::new())),
-			read_version,
 			dataset: Arc::clone(&self.dataset),
 			background_optimizer: self.background_optimizer.clone(),
 			commit_seq: Arc::clone(&self.commit_seq),
@@ -346,7 +350,10 @@ impl Datastore {
 
 	/// Return the current (latest) version of the underlying dataset.
 	///
-	/// Used to seed `read_version` for new transactions.
+	/// Test-only helper (the live read path maps requested instants onto Lance
+	/// versions via [`Transaction::lance_version_as_of`], so no transaction
+	/// seeds a read version any more).
+	#[allow(dead_code)]
 	async fn current_version(&self) -> u64 {
 		self.dataset.read().await.inner.version().version
 	}
@@ -501,16 +508,6 @@ pub struct Transaction {
 	/// `new_save_point()` pushes, `rollback_to_save_point()` pops, etc.
 	save_points: Arc<RwLock<Vec<PendingBuffer>>>,
 
-	/// Lance dataset version this transaction reads from.
-	///
-	/// Captured at transaction start (snapshot isolation). Versioned reads
-	/// (`version.is_some()`) use the caller-supplied version instead.
-	/// Unversioned reads read Lance @ latest, so this is consulted only as
-	/// the base for the per-row `version` stamp written at commit time
-	/// (`read_version + 1`); `dead_code` is therefore allowed on the read
-	/// side but the field is load-bearing for `commit`.
-	read_version: u64,
-
 	/// Shared reference to the underlying Lance dataset.
 	dataset: Arc<RwLock<DatasetHandle>>,
 
@@ -577,12 +574,16 @@ impl Transactable for Transaction {
 		// One per-commit seq for this transaction; every row it writes
 		// carries it into Lance's `seq` column.
 		let seq = self.commit_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-		// Per-row `version` stamp: the snapshot this txn read from + 1, so
-		// each commit's rows carry a version monotonically increasing with
-		// its snapshot boundary. The authoritative lance dataset version is
-		// assigned by the merge-insert itself; this column is the MVCC
-		// convenience stamp the schema documents.
-		let version = self.read_version.saturating_add(1);
+		// Per-row `version` stamp: the datastore's real monotonic commit
+		// versionstamp (HLC in prod = `millis << 16 | counter`), NOT the old
+		// `read_version + 1` GUESS. That guess silently drifted from the true
+		// dataset version whenever a background optimize / concurrent commit
+		// minted a Lance version, making it a misleading "surreal version
+		// pointer". Time-travel reads do NOT key off this column — they map the
+		// requested instant onto a Lance native version (`lance_version_as_of`),
+		// so versioning is fully transparent; this column is an informational,
+		// wall-clock-comparable commit stamp.
+		let version = self.timestamp().await?.as_versionstamp() as u64;
 		let write_seqs = vec![seq; writes.len()];
 		let delete_seqs = vec![seq; deletes.len()];
 
@@ -662,19 +663,26 @@ impl Transactable for Transaction {
 
 		// (2) Fall through to a native Lance scan.
 		//
-		// Snapshot selection:
-		// - `version.is_some()` → `checkout_version(v)`; a missing/invalid
-		//   version yields `None` (`.ok()` keeps this clippy-clean).
+		// Snapshot selection (TRANSPARENT versioning):
+		// - `version.is_some()` → map the versionstamp to the Lance version
+		//   AS OF that instant (`lance_version_as_of`, via Lance's native
+		//   per-version timestamps) and `checkout_version` it; no version
+		//   at-or-before that instant → `None` (key did not exist yet).
 		// - `version.is_none()` → read Lance @ latest. Every committed
 		//   write is its own lance version, so the latest manifest already
 		//   reflects all durable commits; pinning to a stale `read_version`
 		//   would hide rows committed by concurrent transactions.
 		let ds = self.dataset.read().await;
 		let snapshot = match version {
-			Some(v) => match ds.inner.checkout_version(v).await.ok() {
-				Some(s) => s,
-				None => return Ok(None),
-			},
+			Some(v) => {
+				let Some(lance_v) = self.lance_version_as_of(&ds.inner, v).await else {
+					return Ok(None);
+				};
+				match ds.inner.checkout_version(lance_v).await.ok() {
+					Some(s) => s,
+					None => return Ok(None),
+				}
+			}
 			None => ds.inner.clone(),
 		};
 
@@ -1076,6 +1084,38 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Map a SurrealDB versionstamp (the `version` argument to `get`/`scan`,
+	/// encoded by the datastore's `timestamp_impl`) to the Lance dataset
+	/// version to read **AS OF** that instant.
+	///
+	/// This is **transparent versioning**: the requested instant is matched
+	/// against Lance's OWN per-version creation timestamps (`Dataset::versions()`
+	/// — the same native metadata `Timeline` enumerates), never against a
+	/// surreal-maintained `version`-pointer column. Returns the latest Lance
+	/// version whose creation timestamp is `<= dt`, or `None` when the dataset
+	/// has no version that old (the read yields not-found / empty — the key did
+	/// not exist yet at that instant).
+	///
+	/// The versionstamp is decoded via the SAME `timestamp_impl` that encoded
+	/// it (HLC in prod: `millis << 16 | counter`; Inc in test: `millis`), so the
+	/// instant is unit-correct for both clocks and any future impl. Reads no
+	/// longer assume `versionstamp == lance_dataset_version` (the old bug: a
+	/// versionstamp is a wall-clock value, a Lance version is a small sequential
+	/// counter that also advances on background compaction — the two spaces
+	/// diverge, so `checkout_version(versionstamp)` was always wrong).
+	async fn lance_version_as_of(&self, ds: &LanceDataset, versionstamp: u64) -> Option<u64> {
+		let dt: DateTime<Utc> = self
+			.timestamp_impl()
+			.create_from_versionstamp(versionstamp as u128)?
+			.as_datetime()?;
+		let versions = ds.versions().await.ok()?;
+		versions
+			.into_iter()
+			.filter(|v| v.timestamp <= dt)
+			.max_by_key(|v| v.version)
+			.map(|v| v.version)
+	}
+
 	/// Unified scan/scanr implementation. Merges:
 	///   - Lance dataset state (at `version` if requested, else @ latest)
 	///   - pending writes (in-memory, overrides Lance)
@@ -1098,16 +1138,20 @@ impl Transaction {
 
 		// ── (1) Read Lance rows in range ───────────────────────────────────────
 		//
-		// Snapshot selection mirrors `Transaction::get`:
-		// - `version.is_some()` → `checkout_version(v)` (`.ok()` → None on a
-		//   missing/invalid version, which yields an empty Lance side).
+		// Snapshot selection mirrors `Transaction::get` (TRANSPARENT versioning):
+		// - `version.is_some()` → map the versionstamp to the Lance version AS
+		//   OF that instant (`lance_version_as_of`) and `checkout_version` it;
+		//   no version that old → empty Lance side.
 		// - `version.is_none()` → Lance @ latest (every commit is its own
 		//   version, so latest already reflects all durable commits).
 		let mut lance_rows: Vec<(Key, Val)> = Vec::new();
 		{
 			let ds = self.dataset.read().await;
 			let snapshot_result: Option<LanceDataset> = match version {
-				Some(v) => ds.inner.checkout_version(v).await.ok(),
+				Some(v) => match self.lance_version_as_of(&ds.inner, v).await {
+					Some(lance_v) => ds.inner.checkout_version(lance_v).await.ok(),
+					None => None,
+				},
 				None => Some(ds.inner.clone()),
 			};
 			if let Some(snapshot) = snapshot_result {
