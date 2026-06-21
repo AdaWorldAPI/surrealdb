@@ -1108,10 +1108,22 @@ impl Transaction {
 			.timestamp_impl()
 			.create_from_versionstamp(versionstamp as u128)?
 			.as_datetime()?;
+		// Compare at MILLISECOND resolution on both sides. `as_datetime` floors
+		// an HLC versionstamp to the ms (the 16-bit logical counter is not a
+		// queryable time axis, and Lance does not persist it), whereas Lance's
+		// `Version.timestamp` carries sub-ms wall-clock precision. Flooring the
+		// Lance side too makes a commit visible AS OF its OWN millisecond —
+		// otherwise an exact `<=` compared the floored instant against a sub-ms
+		// stamp, so "AS OF a commit's versionstamp" mapped to the PREVIOUS
+		// version / `None` (codex P2 #50). Residual limitation: commits sharing
+		// one millisecond resolve to the latest (highest Lance version) in that
+		// millisecond. VERSION-clause reads use counter 0 (`create_from_datetime`),
+		// so they are exact at millisecond granularity.
+		let dt_ms = dt.timestamp_millis();
 		let versions = ds.versions().await.ok()?;
 		versions
 			.into_iter()
-			.filter(|v| v.timestamp <= dt)
+			.filter(|v| v.timestamp.timestamp_millis() <= dt_ms)
 			.max_by_key(|v| v.version)
 			.map(|v| v.version)
 	}
