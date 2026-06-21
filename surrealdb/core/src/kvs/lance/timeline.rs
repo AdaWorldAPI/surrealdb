@@ -13,7 +13,7 @@
 //! reads only; it owns no write path, so "SurrealDB never mutates the SoA"
 //! is enforced by the type system, not by convention.
 //!
-//! ## What it builds on (all confirmed Lance 6.0.0 surface)
+//! ## What it builds on (all Lance 7.0.0 surface — the mandatory pin)
 //!
 //! - `Dataset::versions() -> Vec<lance::dataset::Version>` — the version
 //!   timeline (same call the lance-graph `VersionedGraph` uses).
