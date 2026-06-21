@@ -239,3 +239,32 @@ The fork is already on-spec for the AdaWorldAPI ecosystem pinning rule (rust 1.9
 No code changes needed at this point. Authoritative reference doc added at `.claude/knowledge/adaworldapi-pinning.md` so future sessions don't re-derive the matrix.
 
 **Cross-ref:** PR #33 (C16b) verifies the pins in its preflight table; knowledge doc captures the spec long-term.
+
+## 2026-06-21 — Do NOT build a NodeRow `scan_soa` over the shared variable-`Binary` `val` (5+3 council)
+**Status:** FINDING
+**Scope:** surrealdb/core/src/kvs/lance/{schema.rs, timeline.rs}; the "second brain / zero-copy symbiont" proposal
+
+A lance-graph-side 5+3 hardening council (8/8) navigated the "surrealdb becomes a
+zero-copy second brain" fork and ruled AGAINST adding a `TimelineView::scan_soa`
+that interprets `val` bytes as lance-graph `NodeRow`s over the CURRENT schema.
+Three independent reasons: (1) `val` is `DataType::Binary` (variable) — `BinaryArray::value(i)`
+returns a `&[u8]` at an arbitrary cumulative offset, so one non-512 cell (a tombstone
+empty-val, a legacy KV value) knocks every subsequent cell off the 64-byte lattice
+and `lance_graph_contract::node_rows_from_le_bytes` returns `None` → the reader sees
+**zero rows on real data, no error** (silent alignment-drop). (2) Teaching `TimelineView`
+NodeRow semantics erodes the deliberate byte-opacity of the `val` column and re-creates
+the lance-graph `I-LEGACY-API-FEATURE-GATED` skew — surrealdb has NO `ENVELOPE_LAYOUT_VERSION`
+gate of its own, so a layout drift vs lance-graph would silently misinterpret reclaim-zone
+bits. (3) The shipped read path is `.value(i).to_vec()` — a copy; "zero-copy" is false today.
+
+**Navigated decision:** the NodeRow interpretation stays CONSUMER-side (a lance-graph
+consumer reads surrealdb's existing opaque `scan()->Vec<(Key,Val)>` and feeds the bytes
+to `node_rows_from_le_bytes` itself — per-cell-checked with copy-fallback). The
+"view never a store" Rubicon ruling + byte-opacity stay intact. IF whole-column
+ptr-identity zero-copy is later wanted, it is a SEPARATE seam: a nullable
+`soa_val: FixedSizeBinary(512)` column (general `val` untouched) + writer population —
+and it is gated FIRST on resolving the `Cargo.lock` lance **6.0.0** vs manifest **=7.0.0**
+contradiction (the lance-7 API surface used by timeline.rs is unverified; the doc-comment
+still says "confirmed Lance 6.0.0 surface").
+
+**Cross-ref:** lance-graph `EPIPHANIES.md` `E-S6-SCAN-SOA-NOT-ON-SHARED-VAL` + `E-SURREALDB-SECOND-BRAIN-IS-ZERO-COPY-IFF-FIXEDSIZEBINARY`; lance-graph capstone plan S6 row; `lance_graph_contract::canonical_node::node_rows_from_le_bytes`.
