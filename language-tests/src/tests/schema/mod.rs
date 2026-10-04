@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
 use semver::VersionReq;
 use serde::{Deserialize, Serialize, de};
 use surrealdb_core::dbs::NewPlannerStrategy;
 use surrealdb_core::dbs::capabilities::{
-	ExperimentalTarget, FuncTarget, MethodTarget, NetTarget, RouteTarget,
+	ArbitraryQueryTarget, EvalQueryTarget, ExperimentalTarget, FuncTarget, MethodTarget, NetTarget,
+	RouteTarget,
 };
 use surrealdb_core::syn::parser::ParserSettings;
 use surrealdb_core::syn::{self};
@@ -26,7 +28,19 @@ fn default_planner_strategy() -> Vec<NewPlannerStrategyConfig> {
 	]
 }
 
-pub const ENV_DEFAULT_TIMEOUT: u64 = 1000;
+fn t() -> bool {
+	true
+}
+
+fn default_duration<const V: u64>() -> TestDuration {
+	TestDuration(Duration::from_millis(V))
+}
+
+fn default_usize<const V: usize>() -> usize {
+	V
+}
+
+pub const ENV_DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 pub const ENV_DEFAULT_NAMESPACE: &str = "test";
 pub const ENV_DEFAULT_DATABASE: &str = "test";
 
@@ -38,6 +52,10 @@ pub struct TestConfig {
 	pub env: TestEnv,
 	#[serde(default)]
 	pub test: TestDetails,
+	#[serde(default)]
+	pub bench: BenchDetails,
+	#[serde(default)]
+	pub graphql: GraphQlDetails,
 	#[serde(skip_serializing)]
 	#[serde(flatten)]
 	_unused_keys: BTreeMap<String, toml::Value>,
@@ -49,8 +67,30 @@ impl TestConfig {
 		let mut res: Vec<_> = self._unused_keys.keys().cloned().collect();
 		res.append(&mut self.env.unused_keys());
 		res.append(&mut self.test.unused_keys());
+		res.extend(self.bench._unused_keys.keys().cloned());
+		res.extend(self.graphql._unused_keys.keys().map(|x| format!("graphql.{x}")));
 		res
 	}
+}
+
+/// Request options for GraphQL (`.graphql`) test cases.
+///
+/// Only consulted when the test's dialect is GraphQL; for SurrealQL tests the
+/// section is unused (and flagged by the unused-key warning if present).
+#[derive(Default, Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct GraphQlDetails {
+	/// Variables sent with the GraphQL request, e.g.
+	/// `variables = { id = "person:1", min = 2 }`.
+	#[serde(default)]
+	pub variables: Option<toml::Table>,
+	/// The operation to execute when the document defines multiple named
+	/// operations (the GraphQL `operationName` request field).
+	#[serde(default)]
+	pub operation: Option<String>,
+	#[serde(skip_serializing)]
+	#[serde(flatten)]
+	_unused_keys: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -59,8 +99,12 @@ pub struct TestEnv {
 	/// Should the test be run sequentially
 	#[serde(default)]
 	pub sequential: bool,
+	/// Does the test keep values around in the datastore which can't be removed with a REMOVE NS
 	#[serde(default)]
 	pub clean: bool,
+	/// Does the test make no modification to the datastore itself.
+	#[serde(default)]
+	pub readonly: bool,
 
 	#[serde(default)]
 	pub namespace: BoolOr<String>,
@@ -74,7 +118,7 @@ pub struct TestEnv {
 	#[serde(default)]
 	pub imports: Vec<String>,
 	#[serde(default)]
-	pub timeout: BoolOr<u64>,
+	pub timeout: BoolOr<TestDuration>,
 	#[serde(default)]
 	pub capabilities: BoolOr<Capabilities>,
 
@@ -111,6 +155,7 @@ impl Default for TestEnv {
 		Self {
 			sequential: Default::default(),
 			clean: Default::default(),
+			readonly: Default::default(),
 			namespace: Default::default(),
 			database: Default::default(),
 			auth: Default::default(),
@@ -286,6 +331,58 @@ pub struct MatchTestResult {
 	pub error: Option<bool>,
 }
 
+/// Duration which deserializes from both a string as well as a number.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TestDuration(pub Duration);
+
+impl<'de> Deserialize<'de> for TestDuration {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		#[derive(Deserialize)]
+		#[serde(untagged)]
+		enum NumberOrString {
+			String(String),
+			Number(u64),
+		}
+
+		match NumberOrString::deserialize(deserializer)? {
+			NumberOrString::Number(x) => Ok(Self(Duration::from_millis(x))),
+			NumberOrString::String(x) => {
+				let settings = ParserSettings {
+					object_recursion_limit: 100,
+					query_recursion_limit: 100,
+					expr_recursion_limit: 100,
+					legacy_strands: false,
+					flexible_record_id: true,
+					files_enabled: true,
+					surrealism_enabled: true,
+					json_string_escapes: false,
+				};
+
+				let v = syn::parse_with_settings(x.as_bytes(), settings, async |parser, stk| {
+					parser.parse_value(stk).await
+				})
+				.map_err(<D::Error as serde::de::Error>::custom)?;
+				let Value::Duration(x) = v else {
+					return Err(<D::Error as serde::de::Error>::custom("Invalid duration"));
+				};
+				Ok(Self(x.into_inner()))
+			}
+		}
+	}
+}
+
+impl Serialize for TestDuration {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		format!("{:?}", self.0).serialize(serializer)
+	}
+}
+
 /// A enum for when configuration which can be disabled, enabled or configured to have a specific
 /// value.
 ///
@@ -350,10 +447,6 @@ impl<T> BoolOr<T> {
 			BoolOr::Value(x) => Some(x),
 		}
 	}
-}
-
-fn t() -> bool {
-	true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -512,6 +605,7 @@ impl<'de> Deserialize<'de> for SurrealConfigValue {
 		let settings = ParserSettings {
 			object_recursion_limit: 100,
 			query_recursion_limit: 100,
+			expr_recursion_limit: 100,
 			legacy_strands: false,
 			flexible_record_id: true,
 			files_enabled: true,
@@ -575,6 +669,7 @@ impl<'de> Deserialize<'de> for SurrealRecordId {
 		let settings = ParserSettings {
 			object_recursion_limit: 100,
 			query_recursion_limit: 100,
+			expr_recursion_limit: 100,
 			legacy_strands: false,
 			flexible_record_id: true,
 			files_enabled: true,
@@ -618,6 +713,7 @@ impl<'de> Deserialize<'de> for SurrealObject {
 		let settings = ParserSettings {
 			object_recursion_limit: 100,
 			query_recursion_limit: 100,
+			expr_recursion_limit: 100,
 			legacy_strands: false,
 			flexible_record_id: true,
 			files_enabled: true,
@@ -707,6 +803,16 @@ pub struct Capabilities {
 	#[serde(default = "bool_or_f")]
 	pub deny_experimental: BoolOr<Vec<SchemaTarget<ExperimentalTarget>>>,
 
+	#[serde(default)]
+	pub allow_arbitrary_query: BoolOr<Vec<SchemaTarget<ArbitraryQueryTarget>>>,
+	#[serde(default = "bool_or_f")]
+	pub deny_arbitrary_query: BoolOr<Vec<SchemaTarget<ArbitraryQueryTarget>>>,
+
+	#[serde(default = "bool_or_f")]
+	pub allow_eval_query: BoolOr<Vec<SchemaTarget<EvalQueryTarget>>>,
+	#[serde(default = "bool_or_f")]
+	pub deny_eval_query: BoolOr<Vec<SchemaTarget<EvalQueryTarget>>>,
+
 	#[serde(skip_serializing)]
 	#[serde(flatten)]
 	_unused_keys: BTreeMap<String, toml::Value>,
@@ -730,6 +836,10 @@ impl Default for Capabilities {
 			deny_http: BoolOr::Bool(false),
 			allow_experimental: Default::default(),
 			deny_experimental: BoolOr::Bool(false),
+			allow_arbitrary_query: BoolOr::Bool(true),
+			deny_arbitrary_query: BoolOr::Bool(false),
+			allow_eval_query: BoolOr::Bool(false),
+			deny_eval_query: BoolOr::Bool(false),
 			_unused_keys: Default::default(),
 		}
 	}
@@ -765,4 +875,62 @@ impl Capabilities {
 	pub fn unused_keys(&self) -> Vec<String> {
 		self._unused_keys.keys().map(|x| format!("env.capabilities.{x}")).collect()
 	}
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct BenchDetails {
+	/// Whether to include this file in the benchmark suite (`bench run`). The
+	/// bench equivalent of `[test].run`; set to `false` for files that exist
+	/// only to be imported by other benches. Defaults to `true`.
+	#[serde(default = "t")]
+	pub run: bool,
+	/// Whether to rebuild the datastore (and rerun imports) before every
+	/// measured iteration.
+	///
+	/// Defaults to `false`, which builds the datastore and runs imports once
+	/// before the warmup/measurement loops, so a read-only bench measures only
+	/// the timed statement against a stable, pre-populated dataset. Set to
+	/// `true` for mutating benches (CREATE/UPDATE/DELETE) which require a clean
+	/// slate per iteration.
+	#[serde(default)]
+	pub rebuild: bool,
+	/// Run this bench once per named dataset, each resolved (transitively) as the
+	/// bench's import for that run. Lets a single read-only scan be measured
+	/// against multiple datasets — e.g. one without indexes and one with — from a
+	/// single file. The key is a short variant name (shown in the run label and
+	/// selectable with `--dataset <name>`); the value is the import path. When
+	/// empty (default) the bench runs once using `[env].imports`.
+	///
+	/// ```toml
+	/// datasets = { unindexed = "../_dataset.surql", indexed = "../_dataset_indexed.surql" }
+	/// ```
+	#[serde(default)]
+	pub datasets: BTreeMap<String, String>,
+	/// How long to warm up before measuring — the statement is run in a loop for
+	/// this duration to stabilise caches before timing begins. Defaults to 3s.
+	#[serde(default = "default_duration::<3000>")]
+	pub warmup: TestDuration,
+	/// Number of timed samples to collect; the reported mean / median / std-dev /
+	/// MAD are computed over these. Defaults to 100.
+	#[serde(default = "default_usize::<100>")]
+	pub sample_size: usize,
+	/// Target total time to spend collecting the samples. The harness sizes the
+	/// per-sample iteration count from the warmup estimate so the measurement run
+	/// takes roughly this long. Defaults to 100s.
+	#[serde(default = "default_duration::<100000>")]
+	pub measurement_time: TestDuration,
+	/// Hard wall-clock backstop on the sample-collection loop. `measurement_time`
+	/// only sizes the iteration count from the warmup estimate; it does not cap
+	/// the loop, so a mis-scoped bench whose per-iteration cost dwarfs the warmup
+	/// estimate (e.g. an O(n²) query) collects all `sample_size` samples no matter
+	/// how long that takes. This caps the collection so no single bench can consume
+	/// the whole run: the harness always keeps at least one sample, then stops once
+	/// cumulative measured time exceeds this. Defaults to 600s.
+	#[serde(default = "default_duration::<600000>")]
+	pub max_time: TestDuration,
+
+	#[serde(skip_serializing)]
+	#[serde(flatten)]
+	_unused_keys: BTreeMap<String, toml::Value>,
 }

@@ -19,10 +19,6 @@
 
 #![doc(html_favicon_url = "https://surrealdb.s3.amazonaws.com/favicon.png")]
 #![doc(html_logo_url = "https://surrealdb.s3.amazonaws.com/icon.png")]
-// TODO: Remove
-// This is added to keep the move anyhow PR somewhat smaller. This should be removed in a follow-up
-// PR.
-#![allow(clippy::large_enum_variant)]
 
 #[macro_use]
 extern crate tracing;
@@ -39,6 +35,7 @@ mod exe;
 mod fmt;
 mod fnc;
 mod key;
+mod lq;
 #[doc(hidden)]
 pub mod str;
 #[cfg(feature = "surrealism")]
@@ -54,16 +51,25 @@ pub mod env;
 pub mod err;
 pub mod exec;
 pub mod expr;
-#[cfg(feature = "graphql")]
+#[cfg(feature = "gql")]
 pub mod gql;
+#[cfg(feature = "graphql")]
+pub mod graphql;
 #[cfg(feature = "http")]
 mod http;
 pub mod iam;
 pub mod idx;
 pub mod kvs;
 pub mod mem;
+// Capability-aware networking helpers shared by the outbound HTTP clients
+// (`http` feature) and the JWKS fetch client (`jwks` feature). Not available on
+// WASM, where the clients are built without a custom DNS resolver.
+#[cfg(all(not(target_family = "wasm"), any(feature = "http", feature = "jwks")))]
+mod net;
 pub mod obs;
+pub mod observe;
 pub mod options;
+pub mod rnd;
 pub mod rpc;
 pub mod sql;
 pub mod syn;
@@ -86,23 +92,11 @@ pub(crate) mod types {
 	};
 }
 
+/// Used by the `map!` macro (`$crate::VecMap`); not public API.
+#[doc(hidden)]
+pub use surrealdb_collections::VecMap;
 #[cfg(feature = "ml")]
 pub use surrealml_core as ml;
-
-/// Re-export of the `lance-graph` contract crate (trait + type definitions
-/// only, zero runtime deps) from the AdaWorldAPI/lance-graph workspace.
-///
-/// Available when the `lance-graph` feature is enabled. Consumers can write:
-///
-/// ```ignore
-/// use surrealdb_core::lance_graph::orchestration::OrchestrationBridge;
-/// use surrealdb_core::lance_graph::plan::PlannerContract;
-/// ```
-///
-/// Implementations of these traits (HHTL cascade, blasgraph GraphBLAS, etc.)
-/// land via the synergy sprints on top of this agnostic-build wire.
-#[cfg(feature = "lance-graph")]
-pub use lance_graph_contract as lance_graph;
 
 /// Channels for receiving a SurrealQL database export
 pub mod channel {

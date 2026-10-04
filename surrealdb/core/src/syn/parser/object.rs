@@ -56,7 +56,10 @@ impl Parser<'_> {
 						}
 
 						let value = stk.run(|stk| this.parse_expr_inherit(stk)).await?;
-						let res = vec![ObjectEntry{ key, value }];
+						let res = vec![ObjectEntry {
+							key: key.into(),
+							value,
+						}];
 
 						if this.eat(t!(",")){
 							this.parse_object_inner(stk, start, res).await.map(Some)
@@ -130,9 +133,13 @@ impl Parser<'_> {
 			}
 
 			let (key, value) = self.parse_object_entry(stk).await?;
-			// TODO: Error on duplicate key?
+			// Duplicate keys are accepted at parse time and resolved last-wins
+			// when the literal is computed (`Literal::Object` inserts into a
+			// `BTreeMap`, see `expr/literal.rs`). This matches JSON / JavaScript
+			// object literal semantics — note that DEFINE FIELD does still
+			// reject duplicate field names at the schema layer.
 			res.push(ObjectEntry {
-				key,
+				key: key.into(),
 				value,
 			});
 
@@ -238,7 +245,7 @@ impl Parser<'_> {
 				let str = self.span_str(token.span);
 				Ok(str.to_string())
 			}
-			TokenKind::Identifier => self.parse_ident(),
+			TokenKind::Identifier => self.parse_ident().map(|s| s.into_string()),
 			t!("\"") | t!("'") => Ok(self.parse_string_lit()?),
 			TokenKind::Digits => {
 				self.pop_peek();

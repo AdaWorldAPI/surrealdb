@@ -5,13 +5,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use surrealdb_core::channel;
+use surrealdb_core::cnf::ConfigMap;
 use surrealdb_core::dbs::Capabilities;
 use surrealdb_core::dbs::capabilities::Targets;
-use surrealdb_core::kvs::{Datastore, LockType, TransactionType};
+use surrealdb_core::kvs::Datastore;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::cli::Backend;
-use crate::tests::schema::{BoolOr, Capabilities as TestCapabilities, SchemaTarget, TestEnv};
+use crate::cmd::util;
+use crate::tests::schema::{BoolOr, TestEnv};
 use crate::util::{get_timestamp, xorshift};
 
 struct CreateInfo {
@@ -56,7 +58,34 @@ impl CreateInfo {
 
 		let allows_live = cap.allows_live_query_notifications();
 
-		let builder = Datastore::builder().with_capabilities(cap).with_auth(true);
+		// Enable a temporary directory so TEMPFILES queries route to the
+		// ExternalSort operator. For backends that already provision a
+		// per-run scratch dir we reuse it (cleaned up in `shutdown`); the
+		// Memory backend has none, so fall back to the system temp dir —
+		// `ext_sort` namespaces each invocation under its own `TempDir`
+		// which cleans up on drop, so no leak there either.
+		let sort_temp_dir = match self.dir.as_deref() {
+			Some(d) => std::path::PathBuf::from(d),
+			None => std::env::temp_dir(),
+		};
+		// File access (e.g. `DEFINE ANALYZER ... mapper('<path>')`) is denied by
+		// default unless `file_allowlist` is configured. Tests that read mapper
+		// data files reference them under the `tests` tree, so allow it.
+		//
+		// `"../tests"` is resolved relative to the test runner's CWD and
+		// canonicalized at parse time, which assumes the harness is invoked as
+		// `cd language-tests && cargo run run` (the documented entrypoint). If
+		// the harness is ever run from a different CWD, `../tests` fails to
+		// canonicalize, `extract_allowed_paths` drops it (with only a `warn!`
+		// log, which the test runner does not surface by default), and the
+		// now-empty allowlist denies *all* `mapper()` access — every mapper test
+		// would then fail with `File access denied`. This also sets a single
+		// global allowlist shared by every language test.
+		let builder = Datastore::builder()
+			.with_capabilities(cap)
+			.with_auth(true)
+			.with_temporary_directory(Some(sort_temp_dir))
+			.with_config(ConfigMap::empty().with_key_value("file_allowlist", "../tests"));
 
 		let builder = if allows_live {
 			let (send, _) = channel::bounded(15_000);
@@ -76,8 +105,10 @@ impl CreateInfo {
 			Backend::RocksDb => {
 				let p = self.produce_path();
 				let ds = if versioned {
-					builder.build_with_path(&format!("rocksdb://{p}?versioned=true&retention=1h")).await?
-				}else{
+					builder
+						.build_with_path(&format!("rocksdb://{p}?versioned=true&retention=1h"))
+						.await?
+				} else {
 					builder.build_with_path(&format!("rocksdb://{p}")).await?
 				};
 				path = Some(p);
@@ -86,7 +117,9 @@ impl CreateInfo {
 			Backend::SurrealKv => {
 				let p = self.produce_path();
 				let ds = if versioned {
-					builder.build_with_path(&format!("surrealkv://{p}?versioned=true&retention=1h")).await?
+					builder
+						.build_with_path(&format!("surrealkv://{p}?versioned=true&retention=1h"))
+						.await?
 				} else {
 					builder.build_with_path(&format!("surrealkv://{p}")).await?
 				};
@@ -96,9 +129,11 @@ impl CreateInfo {
 			Backend::TikV => {
 				let p = "127.0.0.1:2379";
 				let ds = builder.build_with_path(&format!("tikv://{p}")).await?;
-				let tx = ds.transaction(TransactionType::Write, LockType::Optimistic).await?;
-				tx.delr(vec![0u8]..vec![0xffu8]).await?;
-				tx.commit().await?;
+				// Every TiKV datastore in a run aliases the one physical cluster, so a
+				// freshly built handle still sees whatever earlier tests left behind.
+				// Physically drop the entire keyspace out-of-transaction; `bootstrap`
+				// below then re-seeds the node keys. See `reset_storage`.
+				ds.unsafe_destroy_range(vec![0u8], vec![0xffu8]).await?;
 				ds
 			}
 		};
@@ -106,9 +141,40 @@ impl CreateInfo {
 		ds.bootstrap().await?;
 
 		Ok(Ds {
-			store: Box::new(ds),
+			store: Arc::new(ds),
 			path,
 		})
+	}
+
+	/// Reset a reused datastore's storage between tests.
+	///
+	/// Only TiKV needs this. Every TiKV datastore in a run aliases the one
+	/// physical cluster, so the reused base datastore can observe keys left
+	/// behind by `clean`/create-path tests — whose post-run cleanup the harness
+	/// does not verify — and the next base test then fails the retained-key
+	/// check on that foreign data. Embedded backends give each datastore its
+	/// own directory, so there is nothing to reset, hence the no-op.
+	///
+	/// We physically drop the keys via `unsafe_destroy_range` rather than a
+	/// transactional `delr`: the wipe runs serially (`--jobs 1`) with no open
+	/// transaction, so the MVCC-bypass hazards do not apply, and it avoids both
+	/// the `delr` key cap and the tombstone build-up of wiping on every test.
+	///
+	/// Crucially we wipe *around* the node/bootstrap keys rather than the whole
+	/// keyspace: `/!ic` (index-compaction queue), `/!nd` (cluster membership)
+	/// and `/!nh` / `/!ni` (namespace-ID generator) live contiguously in
+	/// `[/!ic, /!ns)`, and nothing a test creates falls in that band (tests
+	/// create `/!ac`, `/!cg`, `/!eq` below it and `/!ns`, `/!tl`, `/!us` plus
+	/// the `/*` data keys at or above it). Preserving that block keeps this
+	/// long-lived datastore registered, so we skip the per-test `bootstrap`
+	/// (three node-registry transactions) that a full wipe would force —
+	/// these are the same prefixes the retained-key check whitelists.
+	async fn reset_storage(&self, ds: &Datastore) -> Result<()> {
+		if let Backend::TikV = self.backend {
+			ds.unsafe_destroy_range(vec![0u8], b"/!ic".to_vec()).await?;
+			ds.unsafe_destroy_range(b"/!ns".to_vec(), vec![0xffu8]).await?;
+		}
+		Ok(())
 	}
 
 	fn produce_path(&self) -> String {
@@ -122,8 +188,9 @@ impl CreateInfo {
 }
 
 pub struct Ds {
-	/// The store itself
-	store: Box<Datastore>,
+	/// The store itself. Held in an `Arc` because GraphQL schema generation
+	/// (and the resolvers it produces) capture a clone of the datastore.
+	store: Arc<Datastore>,
 	/// The path where you can find the store, none if the store is in-memory
 	path: Option<String>,
 }
@@ -162,18 +229,23 @@ pub struct Permit {
 }
 
 impl Permit {
-	pub async fn with<F: AsyncFnOnce(&mut Box<Datastore>, &Box<Datastore>) -> (CanReuse, R), R>(
+	pub async fn with<F: AsyncFnOnce(&Arc<Datastore>, &Box<Datastore>) -> (CanReuse, R), R>(
 		self,
 		f: F,
 	) -> Result<R> {
 		let mut sender = None;
 
-		let mut store = match self.inner {
+		let store = match self.inner {
 			PermitInner::Reuse {
 				ds,
 				channel,
 			} => {
 				sender = Some(channel);
+				// The create path wipes at build time; the reused base datastore is
+				// never rebuilt, so reset it here to clear any cruft a prior test
+				// (e.g. a `clean` test defining extra namespaces) left on the shared
+				// physical cluster before handing it to this test.
+				self.info.reset_storage(ds.store.as_ref()).await?;
 				ds
 			}
 			PermitInner::Create {
@@ -182,7 +254,7 @@ impl Permit {
 			} => self.info.produce_ds(versioned, *capabilities).await?,
 		};
 
-		let (can_reuse, res) = f(&mut store.store, &self.grade_ds).await;
+		let (can_reuse, res) = f(&store.store, &self.grade_ds).await;
 
 		if let CanReuse::Reset = can_reuse {
 			if let Err(e) = self.grade_ds.shutdown().await {
@@ -304,7 +376,7 @@ impl Provisioner {
 			let capabilities = match &env.capabilities {
 				BoolOr::Bool(true) => Capabilities::all().with_experimental(Targets::All),
 				BoolOr::Bool(false) => Capabilities::none(),
-				BoolOr::Value(x) => core_capabilities_from_test_config(x),
+				BoolOr::Value(x) => util::core_capabilities_from_test_config(x),
 			};
 			Permit {
 				info: self.create_info.clone(),
@@ -351,39 +423,4 @@ impl Provisioner {
 
 fn is_base_environment(env: &TestEnv) -> bool {
 	!env.clean && !env.versioned && matches!(env.capabilities, BoolOr::Bool(true))
-}
-
-/// Creates the right core capabilities from a test config.
-pub fn core_capabilities_from_test_config(cap: &TestCapabilities) -> Capabilities {
-	/// Returns Targets::All if there is no value and none_on_missing is false,
-	/// Returns Targets::None if there is no value and none_on_missing is true ensuring the default
-	/// behaviour is to allow everything.
-	///
-	/// If there is a value it will return Targets::All on the value true, Targets::None on the
-	/// value false, and otherwise the returns the specified values.
-	fn extract_targets<T>(v: &BoolOr<Vec<SchemaTarget<T>>>) -> Targets<T>
-	where
-		T: Eq + std::hash::Hash + Ord + Clone,
-	{
-		match v {
-			BoolOr::Bool(true) => Targets::All,
-			BoolOr::Bool(false) => Targets::None,
-			BoolOr::Value(x) => Targets::Some(x.iter().map(|x| x.0.clone()).collect()),
-		}
-	}
-
-	Capabilities::none()
-		.with_scripting(cap.scripting)
-		.with_guest_access(cap.quest_access)
-		.with_live_query_notifications(cap.live_query_notifications)
-		.with_functions(extract_targets(&cap.allow_functions))
-		.without_functions(extract_targets(&cap.deny_functions))
-		.with_network_targets(extract_targets(&cap.allow_net))
-		.without_network_targets(extract_targets(&cap.deny_net))
-		.with_rpc_methods(extract_targets(&cap.allow_rpc))
-		.without_rpc_methods(extract_targets(&cap.deny_rpc))
-		.with_http_routes(extract_targets(&cap.allow_http))
-		.without_http_routes(extract_targets(&cap.deny_http))
-		.with_experimental(extract_targets(&cap.allow_experimental))
-		.without_experimental(extract_targets(&cap.deny_experimental))
 }

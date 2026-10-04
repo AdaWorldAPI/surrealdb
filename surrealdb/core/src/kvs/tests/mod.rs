@@ -28,8 +28,8 @@ mod multiwriter_different_keys;
 mod multiwriter_same_keys_allow;
 mod multiwriter_same_keys_conflict;
 mod raw;
-#[cfg(feature = "kv-rocksdb")]
-mod read_and_deletion_only;
+#[cfg(feature = "kv-mem")]
+mod reclaim_test;
 mod snapshot;
 #[cfg(feature = "kv-mem")]
 mod tx_cache_test;
@@ -119,7 +119,6 @@ mod rocksdb {
 		multireader,
 		multiwriter_different_keys,
 		multiwriter_same_keys_conflict,
-		read_and_deletion_only,
 		metrics
 	);
 }

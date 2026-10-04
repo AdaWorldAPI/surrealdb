@@ -4,6 +4,7 @@ use reblessive::tree::Stk;
 use crate::ctx::FrozenContext;
 use crate::dbs::Options;
 use crate::doc::CursorDoc;
+use crate::err::Error;
 use crate::expr::FlowResultExt as _;
 use crate::expr::paths::ID;
 use crate::val::{RecordId, Value};
@@ -13,7 +14,15 @@ pub async fn exists(
 	(arg,): (RecordId,),
 ) -> Result<Value> {
 	if let Some(opt) = opt {
-		let v = Value::RecordId(arg).get(stk, ctx, opt, doc, ID.as_ref()).await.catch_return()?;
+		let v = match Value::RecordId(arg).get(stk, ctx, opt, doc, ID.as_ref()).await.catch_return()
+		{
+			Ok(v) => v,
+			// An undefined table means the record cannot exist.
+			Err(e) if matches!(e.downcast_ref(), Some(Error::TbNotFound { .. })) => {
+				return Ok(Value::Bool(false));
+			}
+			Err(e) => return Err(e),
+		};
 		Ok(Value::Bool(!v.is_none()))
 	} else {
 		Ok(Value::None)
@@ -25,7 +34,7 @@ pub fn id((arg,): (RecordId,)) -> Result<Value> {
 }
 
 pub fn tb((arg,): (RecordId,)) -> Result<Value> {
-	Ok(arg.table.into_string().into())
+	Ok(Value::String(arg.table.into()))
 }
 
 pub mod is {
@@ -80,7 +89,7 @@ pub mod is {
 				opt.valid_for_db()?;
 
 				// Check if the user has permission to view records at the database level
-				opt.is_allowed(Action::View, ResourceKind::Record, &Base::Db)?;
+				ctx.is_allowed(opt, Action::View, ResourceKind::Record, Base::Db)?;
 
 				// Get the namespace and database IDs
 				let (ns, db) = ctx.expect_ns_db_ids(opt).await?;

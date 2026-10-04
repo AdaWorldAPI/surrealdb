@@ -7,6 +7,7 @@ use std::str::FromStr;
 use geo::{LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use revision::revisioned;
 use rust_decimal::Decimal;
+use surrealdb_strand::Strand;
 use surrealdb_types::{SqlFormat, ToSql};
 
 use crate::expr::statements::info::InfoStructure;
@@ -170,6 +171,78 @@ impl Kind {
 	/// Returns true if this type is a record
 	pub(crate) fn is_record(&self) -> bool {
 		matches!(self, Kind::Record(_))
+	}
+
+	/// Returns `true` if a `DEFINE FIELD ... REFERENCE` declared with this kind
+	/// could hold a record id belonging to `table`.
+	///
+	/// A reference key is only ever written (by `process_reference_clause`)
+	/// when a reference field holds a record id, and the field's declared kind
+	/// constrains which tables those ids may belong to via TYPE coercion. So
+	/// this answers, from the schema alone, whether records in `table` can have
+	/// incoming reference keys — used by the DELETE purge path to skip the
+	/// per-record reference scan when they provably cannot.
+	///
+	/// The matched shapes mirror exactly the kinds accepted for reference
+	/// fields by [`crate::sql::statements::DefineFieldStatement::validate_reference_options`]:
+	/// `record<..>`, `array`/`set` of those, `option<..>` (an `Either`
+	/// containing `None`), and literal arrays of those. An untyped `record`
+	/// (`Kind::Record` with an empty table list) can hold a record of *any*
+	/// table, so it always matches. `Kind::Any` is rejected for reference
+	/// fields at definition time but is treated as a match here defensively —
+	/// erring towards running the scan is always safe.
+	pub(crate) fn reference_can_target(&self, table: &TableName) -> bool {
+		match self {
+			Kind::Record(tables) => tables.is_empty() || tables.iter().any(|t| t == table),
+			Kind::Array(inner, _) | Kind::Set(inner, _) => inner.reference_can_target(table),
+			Kind::Either(kinds) => kinds.iter().any(|k| k.reference_can_target(table)),
+			Kind::Literal(KindLiteral::Array(kinds)) => {
+				kinds.iter().any(|k| k.reference_can_target(table))
+			}
+			Kind::Any => true,
+			_ => false,
+		}
+	}
+
+	/// Collects the concrete record tables a `REFERENCE` field of this kind can
+	/// target into `out`, returning `true` if the kind can target *any* table
+	/// (an untyped `record` / `record<>`, or — defensively — `any`), in which
+	/// case `out` is not exhaustive and every table must be treated as
+	/// potentially referenced.
+	///
+	/// This is the enumerating dual of [`Self::reference_can_target`]: it lets a
+	/// caller build a database-wide set of referenceable tables once (e.g. the
+	/// memoized DELETE purge gate) rather than re-deciding per table. The
+	/// matched shapes are identical to that method's.
+	pub(crate) fn collect_reference_target_tables(&self, out: &mut HashSet<TableName>) -> bool {
+		match self {
+			Kind::Record(tables) => {
+				if tables.is_empty() {
+					return true;
+				}
+				out.extend(tables.iter().cloned());
+				false
+			}
+			Kind::Array(inner, _) | Kind::Set(inner, _) => {
+				inner.collect_reference_target_tables(out)
+			}
+			Kind::Either(kinds) => {
+				let mut unbounded = false;
+				for k in kinds {
+					unbounded |= k.collect_reference_target_tables(out);
+				}
+				unbounded
+			}
+			Kind::Literal(KindLiteral::Array(kinds)) => {
+				let mut unbounded = false;
+				for k in kinds {
+					unbounded |= k.collect_reference_target_tables(out);
+				}
+				unbounded
+			}
+			Kind::Any => true,
+			_ => false,
+		}
 	}
 
 	/// Returns true if this type is optional
@@ -574,13 +647,13 @@ impl From<Kind> for crate::types::PublicKind {
 #[revisioned(revision = 1)]
 #[derive(Clone, Debug)]
 pub enum KindLiteral {
-	String(String),
+	String(Strand),
 	Integer(i64),
 	Float(f64),
 	Decimal(Decimal),
 	Duration(Duration),
 	Array(Vec<Kind>),
-	Object(BTreeMap<String, Kind>),
+	Object(BTreeMap<Strand, Kind>),
 	// This variant is just for a performance optimization.
 	// Should probably be removed when we have a planner.
 	//DiscriminatedObject(String, Vec<BTreeMap<String, Kind>>),
@@ -590,7 +663,7 @@ pub enum KindLiteral {
 impl From<crate::types::PublicKindLiteral> for KindLiteral {
 	fn from(v: crate::types::PublicKindLiteral) -> Self {
 		match v {
-			crate::types::PublicKindLiteral::String(s) => KindLiteral::String(s),
+			crate::types::PublicKindLiteral::String(s) => KindLiteral::String(s.into()),
 			crate::types::PublicKindLiteral::Integer(i) => KindLiteral::Integer(i),
 			crate::types::PublicKindLiteral::Float(f) => KindLiteral::Float(f),
 			crate::types::PublicKindLiteral::Decimal(d) => KindLiteral::Decimal(d),
@@ -600,9 +673,9 @@ impl From<crate::types::PublicKindLiteral> for KindLiteral {
 			crate::types::PublicKindLiteral::Array(kinds) => {
 				KindLiteral::Array(kinds.into_iter().map(Kind::from).collect())
 			}
-			crate::types::PublicKindLiteral::Object(obj) => {
-				KindLiteral::Object(obj.into_iter().map(|(k, v)| (k, Kind::from(v))).collect())
-			}
+			crate::types::PublicKindLiteral::Object(obj) => KindLiteral::Object(
+				obj.into_iter().map(|(k, v)| (k.into(), Kind::from(v))).collect(),
+			),
 			crate::types::PublicKindLiteral::Bool(b) => KindLiteral::Bool(b),
 		}
 	}
@@ -611,7 +684,7 @@ impl From<crate::types::PublicKindLiteral> for KindLiteral {
 impl From<KindLiteral> for crate::types::PublicKindLiteral {
 	fn from(v: KindLiteral) -> Self {
 		match v {
-			KindLiteral::String(s) => crate::types::PublicKindLiteral::String(s),
+			KindLiteral::String(s) => crate::types::PublicKindLiteral::String(s.into_string()),
 			KindLiteral::Integer(i) => crate::types::PublicKindLiteral::Integer(i),
 			KindLiteral::Float(f) => crate::types::PublicKindLiteral::Float(f),
 			KindLiteral::Decimal(d) => crate::types::PublicKindLiteral::Decimal(d),
@@ -622,7 +695,7 @@ impl From<KindLiteral> for crate::types::PublicKindLiteral {
 				crate::types::PublicKindLiteral::Array(kinds.into_iter().map(Into::into).collect())
 			}
 			KindLiteral::Object(obj) => crate::types::PublicKindLiteral::Object(
-				obj.into_iter().map(|(k, v)| (k, v.into())).collect(),
+				obj.into_iter().map(|(k, v)| (k.into_string(), v.into())).collect(),
 			),
 			KindLiteral::Bool(b) => crate::types::PublicKindLiteral::Bool(b),
 		}
@@ -801,7 +874,7 @@ impl KindLiteral {
 					while lit_next.is_some() || val_next.is_some() {
 						match (lit_next, val_next) {
 							(Some((lit_k, lit_kind)), Some((val_k, val_v))) => {
-								match lit_k.cmp(val_k) {
+								match lit_k.as_str().cmp(val_k.as_str()) {
 									Ordering::Less => {
 										// Key in type but not in value - check if optional
 										if !lit_kind.can_be_none() {
@@ -904,7 +977,7 @@ impl KindLiteral {
 			KindLiteral::Object(x) => match path.first() {
 				Some(Part::All) => x.iter().all(|(_, y)| y.allows_nested_kind(&path[1..], kind)),
 				Some(Part::Field(k)) => {
-					if let Some(y) = x.get(&**k) {
+					if let Some(y) = x.get(k.as_str()) {
 						y.allows_nested_kind(&path[1..], kind)
 					} else {
 						false
@@ -936,5 +1009,147 @@ impl ToSql for KindLiteral {
 	fn fmt_sql(&self, f: &mut String, fmt: SqlFormat) {
 		let lit: crate::sql::kind::KindLiteral = self.clone().into();
 		lit.fmt_sql(f, fmt)
+	}
+}
+
+#[cfg(test)]
+mod reference_target_tests {
+	use super::*;
+
+	fn tb(name: &str) -> TableName {
+		name.into()
+	}
+
+	#[test]
+	fn typed_record_targets_only_its_table() {
+		let k = Kind::Record(vec![tb("person")]);
+		assert!(k.reference_can_target(&tb("person")));
+		assert!(!k.reference_can_target(&tb("comment")));
+	}
+
+	#[test]
+	fn untyped_record_targets_any_table() {
+		// `record` / `record<>` has no table constraint, so it can hold a
+		// record of any table and must never let the scan be skipped.
+		let k = Kind::Record(Vec::new());
+		assert!(k.reference_can_target(&tb("person")));
+		assert!(k.reference_can_target(&tb("anything")));
+	}
+
+	#[test]
+	fn multi_table_record_targets_each() {
+		let k = Kind::Record(vec![tb("person"), tb("robot")]);
+		assert!(k.reference_can_target(&tb("person")));
+		assert!(k.reference_can_target(&tb("robot")));
+		assert!(!k.reference_can_target(&tb("comment")));
+	}
+
+	#[test]
+	fn array_and_set_of_records() {
+		let arr = Kind::Array(Box::new(Kind::Record(vec![tb("house")])), None);
+		assert!(arr.reference_can_target(&tb("house")));
+		assert!(!arr.reference_can_target(&tb("person")));
+
+		let set = Kind::Set(Box::new(Kind::Record(vec![tb("house")])), None);
+		assert!(set.reference_can_target(&tb("house")));
+		assert!(!set.reference_can_target(&tb("person")));
+	}
+
+	#[test]
+	fn option_record_is_either_none_record() {
+		// `option<record<person>>` is represented as `Either([None, Record([person])])`.
+		let k = Kind::Either(vec![Kind::None, Kind::Record(vec![tb("person")])]);
+		assert!(k.reference_can_target(&tb("person")));
+		assert!(!k.reference_can_target(&tb("comment")));
+	}
+
+	#[test]
+	fn either_of_records_targets_each() {
+		let k =
+			Kind::Either(vec![Kind::Record(vec![tb("person")]), Kind::Record(vec![tb("robot")])]);
+		assert!(k.reference_can_target(&tb("person")));
+		assert!(k.reference_can_target(&tb("robot")));
+		assert!(!k.reference_can_target(&tb("comment")));
+	}
+
+	#[test]
+	fn literal_array_of_records() {
+		let k = Kind::Literal(KindLiteral::Array(vec![Kind::Record(vec![tb("a")])]));
+		assert!(k.reference_can_target(&tb("a")));
+		assert!(!k.reference_can_target(&tb("b")));
+	}
+
+	#[test]
+	fn nested_option_array_record() {
+		// `option<array<record<house>>>` => `Either([None, Array(Record([house]))])`.
+		let k = Kind::Either(vec![
+			Kind::None,
+			Kind::Array(Box::new(Kind::Record(vec![tb("house")])), None),
+		]);
+		assert!(k.reference_can_target(&tb("house")));
+		assert!(!k.reference_can_target(&tb("person")));
+	}
+
+	#[test]
+	fn non_record_kinds_never_target() {
+		assert!(!Kind::String.reference_can_target(&tb("person")));
+		assert!(!Kind::Int.reference_can_target(&tb("person")));
+		assert!(!Kind::None.reference_can_target(&tb("person")));
+		assert!(!Kind::Object.reference_can_target(&tb("person")));
+	}
+
+	#[test]
+	fn any_kind_matches_defensively() {
+		// `Kind::Any` is rejected for reference fields at DEFINE time, but the
+		// walker treats it as a match so the scan still runs if it ever occurs.
+		assert!(Kind::Any.reference_can_target(&tb("person")));
+	}
+
+	fn collect(kind: &Kind) -> (bool, HashSet<TableName>) {
+		let mut out = HashSet::new();
+		let unbounded = kind.collect_reference_target_tables(&mut out);
+		(unbounded, out)
+	}
+
+	#[test]
+	fn collect_typed_record() {
+		let (unbounded, tables) = collect(&Kind::Record(vec![tb("person")]));
+		assert!(!unbounded);
+		assert_eq!(tables, HashSet::from([tb("person")]));
+	}
+
+	#[test]
+	fn collect_untyped_record_is_unbounded() {
+		let (unbounded, _) = collect(&Kind::Record(Vec::new()));
+		assert!(unbounded);
+	}
+
+	#[test]
+	fn collect_either_union_and_containers() {
+		// either<array<record<a>> | record<b>> => {a, b}
+		let k = Kind::Either(vec![
+			Kind::Array(Box::new(Kind::Record(vec![tb("a")])), None),
+			Kind::Record(vec![tb("b")]),
+		]);
+		let (unbounded, tables) = collect(&k);
+		assert!(!unbounded);
+		assert_eq!(tables, HashSet::from([tb("a"), tb("b")]));
+	}
+
+	#[test]
+	fn collect_mixed_typed_and_untyped_is_unbounded() {
+		// A union that includes an untyped record is unbounded, even though the
+		// typed arm's table is still collected.
+		let k = Kind::Either(vec![Kind::Record(vec![tb("a")]), Kind::Record(Vec::new())]);
+		let (unbounded, tables) = collect(&k);
+		assert!(unbounded);
+		assert!(tables.contains(&tb("a")));
+	}
+
+	#[test]
+	fn collect_non_record_is_empty() {
+		let (unbounded, tables) = collect(&Kind::String);
+		assert!(!unbounded);
+		assert!(tables.is_empty());
 	}
 }

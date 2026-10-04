@@ -11,6 +11,7 @@ SurrealDB is a multi-model database built in Rust supporting document, graph, re
 ```
 surrealdb/           # Main SDK crate
 surrealdb/core/      # Core database engine (query execution, storage)
+surrealdb/mcp/       # Model Context Protocol server (stdio + HTTP)
 surrealdb/server/    # HTTP, WebSocket, gRPC server
 surrealdb/types/     # Public types and derive macros
 surrealism/          # Surrealism (WASM plugin system) crates
@@ -38,18 +39,23 @@ cd language-tests && cargo run run
 
 # Run specific language test
 # Note: all paths are relative to the language-tests/tests directory
-cd language-tests && cargo run run -- --test path/to/test.surql
+cd language-tests && cargo run run path/to/test.surql
 
 # Auto-generate test results
 # Note: The test results must be empty for the auto-generation to work.
-cd language-tests && cargo run run -- --results accept path/to/test.surql
+cd language-tests && cargo run run --results accept path/to/test.surql
+
+# Benchmark a language-test bench (measures by default; --profile records a flamegraph)
+# Pass the bench filter and flags after `--`. See language-tests/README.md > Benchmarking.
+cargo make bench -- scans/where_integer_in_many_full --save
+cargo make bench -- scans/where_integer_in_many_full --profile --dataset indexed
 ```
 
 ## Testing Conventions
 
-### Language Tests (`language-tests/tests/*.surql`)
+### Language Tests (`language-tests/tests/*.surql`, `*.gql`)
 
-Test SurrealQL queries with expected results. Bug reproductions go in `language-tests/tests/reproductions/ISSUE_NUMBER_description.surql`.
+Test SurrealQL queries with expected results (`.gql` files test the GQL dialect). Bug reproductions go in `language-tests/tests/reproductions/ISSUE_NUMBER_description.surql`.
 
 **Test file format:**
 ```surql
@@ -98,6 +104,12 @@ Located in `surrealdb/tests/` and `tests/`. Follow standard Rust testing convent
 
 ## Documentation References
 
+Before changing code that touches authentication, sessions, permissions, RPC/HTTP
+transport, the SurrealQL parser, function execution, storage keys, or import/export,
+consult `SECURITY_GUIDE.md` and confirm the relevant invariants still hold.
+
+- Security model and review invariants: `SECURITY_GUIDE.md`
+- General code review checklist: `REVIEW.md`
 - SurrealQL docs: https://surrealdb.com/docs
 - SurrealDB University: https://surrealdb.com/learn
 - Detailed cursor rules: `.cursor/rules/`

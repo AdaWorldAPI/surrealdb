@@ -2,14 +2,13 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use surrealdb_types::{SqlFormat, ToSql};
 
 use super::helpers::args_access_mode;
 #[cfg(feature = "scripting")]
 use super::helpers::evaluate_args;
-use crate::exec::AccessMode;
 use crate::exec::physical_expr::{EvalContext, PhysicalExpr};
+use crate::exec::{AccessMode, BoxFut};
 use crate::expr::{FlowResult, Script};
 use crate::val::Value;
 
@@ -19,13 +18,20 @@ pub struct JsFunctionExec {
 	#[allow(dead_code)]
 	pub(crate) script: Script,
 	pub(crate) arguments: Vec<Arc<dyn PhysicalExpr>>,
+	/// Expression-nesting depth recorded when this node was planned. A script
+	/// can re-enter SurrealQL (via `surrealdb.query`), so the remaining
+	/// computation-depth budget handed to it is reduced by this much, keeping
+	/// the limit continuous across the boundary.
+	#[allow(dead_code)]
+	pub(crate) plan_depth: u32,
 }
-
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl PhysicalExpr for JsFunctionExec {
 	fn name(&self) -> &'static str {
 		"JsFunction"
+	}
+
+	fn as_any(&self) -> &dyn std::any::Any {
+		self
 	}
 
 	fn required_context(&self) -> crate::exec::ContextLevel {
@@ -36,47 +42,57 @@ impl PhysicalExpr for JsFunctionExec {
 	}
 
 	#[cfg(feature = "scripting")]
-	async fn evaluate(&self, ctx: EvalContext<'_>) -> FlowResult<Value> {
-		use reblessive::TreeStack;
+	fn evaluate<'a>(&'a self, ctx: EvalContext<'a>) -> BoxFut<'a, FlowResult<Value>> {
+		Box::pin(async move {
+			use reblessive::TreeStack;
 
-		use crate::doc::CursorDoc;
-		use crate::fnc::script;
+			use crate::doc::CursorDoc;
+			use crate::fnc::script;
 
-		// Get the frozen context and options
-		let frozen_ctx = ctx.exec_ctx.ctx().clone();
-		let opt = ctx
-			.exec_ctx
-			.options()
-			.ok_or_else(|| anyhow::anyhow!("Script functions require Options context"))?
-			.clone();
+			// Get the frozen context and options
+			let frozen_ctx = Arc::clone(ctx.exec_ctx.ctx());
+			let opt = ctx
+				.exec_ctx
+				.options()
+				.ok_or_else(|| anyhow::anyhow!("Script functions require Options context"))?
+				.clone();
 
-		// Check if scripting is allowed
-		frozen_ctx.check_allowed_scripting()?;
+			// Continue the depth count across the JS boundary: a script that
+			// re-enters SurrealQL (via `surrealdb.query`, which runs on the legacy
+			// `compute` path) must keep counting from the depth the streaming
+			// planner already reached, rather than getting a fresh budget.
+			let opt = opt.with_dive_consumed(self.plan_depth);
 
-		// Evaluate all arguments
-		let args = evaluate_args(&self.arguments, ctx.clone()).await?;
+			// Check if scripting is allowed
+			frozen_ctx.check_allowed_scripting()?;
 
-		// Build CursorDoc from current value
-		let doc = ctx.current_value.map(|v| CursorDoc::new(None, None, v.clone()));
+			// Evaluate all arguments
+			let args = evaluate_args(&self.arguments, ctx.clone()).await?;
 
-		// Execute the script within a TreeStack context
-		// This is required because JavaScript can call back into SurrealDB functions
-		// via surrealdb.functions.* which need TreeStack for recursive computation
-		let mut stack = TreeStack::new();
-		Ok(stack
-			.enter(|_stk| async {
-				script::run(&frozen_ctx, &opt, doc.as_ref(), &self.script.0, args).await
-			})
-			.finish()
-			.await?)
+			// Build CursorDoc from current value
+			let doc = ctx.current_value.map(|v| CursorDoc::new(None, None, v.clone()));
+
+			// Execute the script within a TreeStack context
+			// This is required because JavaScript can call back into SurrealDB functions
+			// via surrealdb.functions.* which need TreeStack for recursive computation
+			let mut stack = TreeStack::new();
+			Ok(stack
+				.enter(|_stk| async {
+					script::run(&frozen_ctx, &opt, doc.as_ref(), &self.script.0, args).await
+				})
+				.finish()
+				.await?)
+		})
 	}
 
 	#[cfg(not(feature = "scripting"))]
-	async fn evaluate(&self, _ctx: EvalContext<'_>) -> FlowResult<Value> {
-		Err(crate::err::Error::InvalidScript {
-			message: String::from("Embedded functions are not enabled."),
-		}
-		.into())
+	fn evaluate<'a>(&'a self, _ctx: EvalContext<'a>) -> BoxFut<'a, FlowResult<Value>> {
+		Box::pin(async move {
+			Err(crate::err::Error::InvalidScript {
+				message: String::from("Embedded functions are not enabled."),
+			}
+			.into())
+		})
 	}
 
 	fn access_mode(&self) -> AccessMode {

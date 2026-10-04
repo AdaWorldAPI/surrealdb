@@ -5,12 +5,13 @@
 
 FROM docker.io/rockylinux/rockylinux:9@sha256:53f4c6dcb34e1403bd93207351f0af9a593610faeb7165cb8a037346765199b0 AS builder
 
-RUN dnf install -y gcc-toolset-13 git cmake llvm-toolset patch zlib-devel python3.11 openssl-devel
+RUN dnf install -y gcc-toolset-13 git cmake llvm-toolset patch zlib-devel python3.11 openssl-devel \
+	&& dnf clean all
 
 ENV OPENSSL_NO_VENDOR=1
 
 # Install rust
-ARG RUST_VERSION=1.91.1
+ARG RUST_VERSION=1.95.0
 ARG RUSTUP_SHA256=6c30b75a75b28a96fd913a037c8581b580080b6ee9b8169a3c0feb1af7fe8caf
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh \
     && echo "${RUSTUP_SHA256}  /tmp/rustup.sh" | sha256sum -c - \
@@ -35,7 +36,7 @@ ENTRYPOINT ["/builder-entrypoint.sh"]
 # This stage is used to install the timezone files
 ###
 
-FROM cgr.dev/chainguard/wolfi-base:latest@sha256:52e71f61c6afd1f8d2625cff4465d8ecee156668ca665f7e9c582d1cc914eb6a AS tzdata
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:e161445c05b19e668cb5cc44df2f0403329fd4f0ac892794255e328e760612a1 AS tzdata
 
 RUN apk add --no-cache tzdata
 
@@ -46,7 +47,7 @@ RUN apk add --no-cache tzdata
 #
 # Development image (built on the CI environment)
 #
-FROM cgr.dev/chainguard/glibc-dynamic:latest-dev@sha256:efdf19de47cd6bb6f374c5813a097495b41135bd7e3d7d66791c50badab4b6b5 AS dev-ci
+FROM cgr.dev/chainguard/glibc-dynamic:latest-dev@sha256:9f2379c134b72a7fdd73694db2adec6d524a35b19bc346507e9e4685abeff459 AS dev-ci
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -70,16 +71,21 @@ RUN mkdir /data /logs \
 	&& chmod -R 777 /logs \
 	&& echo "OK"
 
+USER nonroot
+
 VOLUME /data /logs
 
 ENV SURREAL_BIND="0.0.0.0:8000"
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+	CMD ["/surreal", "isready", "--endpoint", "http://localhost:8000"]
 
 ENTRYPOINT ["/surreal"]
 
 #
 # Production image (built on the CI environment)
 #
-FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:e9a3236ebb746bbab93bda4ca842e55a6aaea2c812a685646043e842e69220be AS prod-ci
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:0dc86136587f0ac15d61d307dcd8193e4a9880d26d2f2659b9e2b142640eecc0 AS prod-ci
 
 COPY --from=dev-ci /surreal /surreal
 
@@ -91,16 +97,21 @@ COPY --from=dev-ci /data /data
 
 COPY --from=dev-ci /logs /logs
 
+USER nonroot
+
 VOLUME /data /logs
 
 ENV SURREAL_BIND="0.0.0.0:8000"
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+	CMD ["/surreal", "isready", "--endpoint", "http://localhost:8000"]
 
 ENTRYPOINT ["/surreal"]
 
 #
 # Development image (built locally)
 #
-FROM cgr.dev/chainguard/glibc-dynamic:latest-dev@sha256:efdf19de47cd6bb6f374c5813a097495b41135bd7e3d7d66791c50badab4b6b5 AS dev
+FROM cgr.dev/chainguard/glibc-dynamic:latest-dev@sha256:9f2379c134b72a7fdd73694db2adec6d524a35b19bc346507e9e4685abeff459 AS dev
 
 ARG SURREALDB_BINARY=target/release/surreal
 
@@ -121,16 +132,21 @@ RUN mkdir /data /logs \
 	&& chmod -R 777 /logs \
 	&& echo "OK"
 
+USER nonroot
+
 VOLUME /data /logs
 
 ENV SURREAL_BIND="0.0.0.0:8000"
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+	CMD ["/surreal", "isready", "--endpoint", "http://localhost:8000"]
 
 ENTRYPOINT ["/surreal"]
 
 #
 # Production image (built locally)
 #
-FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:e9a3236ebb746bbab93bda4ca842e55a6aaea2c812a685646043e842e69220be AS prod
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:0dc86136587f0ac15d61d307dcd8193e4a9880d26d2f2659b9e2b142640eecc0 AS prod
 
 COPY --from=dev /surreal /surreal
 
@@ -142,8 +158,13 @@ COPY --from=dev /data /data
 
 COPY --from=dev /logs /logs
 
+USER nonroot
+
 VOLUME /data /logs
 
 ENV SURREAL_BIND="0.0.0.0:8000"
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+	CMD ["/surreal", "isready", "--endpoint", "http://localhost:8000"]
 
 ENTRYPOINT ["/surreal"]

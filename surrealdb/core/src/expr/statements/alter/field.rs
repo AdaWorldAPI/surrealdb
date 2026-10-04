@@ -1,7 +1,9 @@
 use std::ops::Deref;
 
 use anyhow::Result;
+use reblessive::tree::Stk;
 use surrealdb_types::{SqlFormat, ToSql};
+use tracing::instrument;
 use uuid::Uuid;
 
 use super::AlterKind;
@@ -9,9 +11,11 @@ use crate::catalog::providers::TableProvider;
 use crate::catalog::{self, Permission, Permissions, TableDefinition};
 use crate::ctx::FrozenContext;
 use crate::dbs::Options;
+use crate::doc::CursorDoc;
 use crate::err::Error;
+use crate::expr::parameterize::{expr_to_ident, expr_to_idiom};
 use crate::expr::reference::Reference;
-use crate::expr::{Base, Expr, Idiom, Kind};
+use crate::expr::{Base, Expr, Kind, Literal};
 use crate::iam::{Action, AuthLimit, ResourceKind};
 use crate::val::{TableName, Value};
 
@@ -24,10 +28,10 @@ pub(crate) enum AlterDefault {
 	Set(Expr),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct AlterFieldStatement {
-	pub name: Idiom,
-	pub what: TableName,
+	pub name: Expr,
+	pub what: Expr,
 	pub if_exists: bool,
 	pub kind: AlterKind<Kind>,
 	pub flexible: AlterKind<()>,
@@ -40,19 +44,47 @@ pub(crate) struct AlterFieldStatement {
 	pub reference: AlterKind<Reference>,
 }
 
+impl Default for AlterFieldStatement {
+	fn default() -> Self {
+		Self {
+			name: Expr::Literal(Literal::None),
+			what: Expr::Literal(Literal::None),
+			if_exists: false,
+			kind: AlterKind::None,
+			flexible: AlterKind::None,
+			readonly: AlterKind::None,
+			value: AlterKind::None,
+			assert: AlterKind::None,
+			default: AlterDefault::None,
+			permissions: None,
+			comment: AlterKind::None,
+			reference: AlterKind::None,
+		}
+	}
+}
+
 impl AlterFieldStatement {
 	#[instrument(level = "trace", name = "AlterFieldStatement::compute", skip_all)]
-	pub(crate) async fn compute(&self, ctx: &FrozenContext, opt: &Options) -> Result<Value> {
+	pub(crate) async fn compute(
+		&self,
+		stk: &mut Stk,
+		ctx: &FrozenContext,
+		opt: &Options,
+		doc: Option<&CursorDoc>,
+	) -> Result<Value> {
 		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Field, &Base::Db)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Field, Base::Db)?;
 		// Get the NS and DB
 		let (ns_name, db_name) = opt.ns_db()?;
 		let (ns, db) = ctx.expect_ns_db_ids(opt).await?;
 		// Fetch the transaction
 		let txn = ctx.tx();
+		let idiom = expr_to_idiom(stk, ctx, opt, doc, &self.name, "field name").await?;
+		let name = idiom.to_raw_string();
+		let what =
+			TableName::new(expr_to_ident(stk, ctx, opt, doc, &self.what, "table name").await?);
 		// Get the table definition
-		let name = self.name.to_sql();
-		let mut df = match txn.get_tb_field(ns, db, &self.what, &name, None).await? {
+		let mut df = match txn.get_tb_field(ns, db, &what, &name, None).await? {
 			Some(tb) => tb.deref().clone(),
 			None => {
 				if self.if_exists {
@@ -65,6 +97,10 @@ impl AlterFieldStatement {
 				.into());
 			}
 		};
+
+		// Snapshot the definition before mutating it so we can tell which
+		// reference target tables the change drops.
+		let old_definition = df.clone();
 
 		match self.kind {
 			AlterKind::Set(ref k) => df.field_kind = Some(k.clone()),
@@ -130,18 +166,36 @@ impl AlterFieldStatement {
 			AlterKind::None => {}
 		}
 
-		// Disallow mismatched types
-		//df.disallow_mismatched_types(ctx, ns, db).await?;
-
 		// Recompute auth_limit from the current principal to prevent privilege escalation
 		df.auth_limit = AuthLimit::new_from_auth(opt.auth.as_ref()).into();
 
-		let key = crate::key::table::fd::new(ns, db, &self.what, &name);
+		// The `id` field forbids the same clauses on ALTER as on DEFINE — VALUE,
+		// REFERENCE, COMPUTED, DEFAULT ALWAYS, READONLY, FLEXIBLE, and non-key
+		// TYPEs — validated against the fully-resolved definition. Without this,
+		// ALTER FIELD silently bypassed the restrictions DEFINE FIELD enforces.
+		crate::expr::statements::define::validate_id_field_restrictions(&df)?;
+
+		let key = crate::key::table::fd::new(ns, db, &what, &name);
 		txn.set(&key, &df).await?;
+		// Dropping the REFERENCE clause or narrowing/changing the record kind can
+		// strand reference keys under target tables the field no longer
+		// references. Purge them so the DELETE reference-purge gate stays sound.
+		// Skipped during import, which restores reference keys verbatim.
+		if !opt.import {
+			crate::expr::statements::define::purge_dropped_reference_keys(
+				&txn,
+				ns,
+				db,
+				&what,
+				&old_definition,
+				Some(&df),
+			)
+			.await?;
+		}
 		// Refresh the table cache
-		let Some(tb) = txn.get_tb(ns, db, &self.what, None).await? else {
+		let Some(tb) = txn.get_tb(ns, db, &what, None).await? else {
 			return Err(Error::TbNotFound {
-				name: self.what.clone(),
+				name: what.clone(),
 			}
 			.into());
 		};
@@ -154,8 +208,6 @@ impl AlterFieldStatement {
 			},
 		)
 		.await?;
-		// Process possible recursive defitions
-		//df.process_recursive_definitions(ns, db, txn.clone()).await?;
 		// Clear the cache
 		txn.clear_cache();
 		// Ok all good

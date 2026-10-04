@@ -32,7 +32,7 @@ impl ShowStatement {
 		_doc: Option<&CursorDoc>,
 	) -> Result<Value> {
 		// Allowed to run?
-		opt.is_allowed(Action::View, ResourceKind::Table, &Base::Db)?;
+		ctx.is_allowed(opt, Action::View, ResourceKind::Table, Base::Db)?;
 		// Get the transaction
 		let txn = ctx.tx();
 		// Process the show query
@@ -40,7 +40,7 @@ impl ShowStatement {
 		let r = crate::cf::read(&txn, ns, db, self.table.as_ref(), self.since.clone(), self.limit)
 			.await?;
 		// Return the changes
-		let a: Vec<Value> = r.iter().cloned().map(|x| x.into_value()).collect();
+		let a = r.iter().cloned().map(|x| x.into_value()).collect::<Result<Vec<Value>>>()?;
 		Ok(a.into())
 	}
 }

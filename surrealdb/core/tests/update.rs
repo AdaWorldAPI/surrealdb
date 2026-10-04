@@ -1,5 +1,5 @@
+#![recursion_limit = "256"]
 #![allow(clippy::unwrap_used)]
-#![recursion_limit = "1024"]
 
 use surrealdb_core::iam::Level;
 use surrealdb_types::{Array, ToSql, Value};

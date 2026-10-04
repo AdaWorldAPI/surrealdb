@@ -40,6 +40,24 @@ impl DeserializeRevisioned for Block {
 	}
 }
 
+impl revision::SkipRevisioned for Block {
+	fn skip_revisioned<R: std::io::Read>(reader: &mut R) -> Result<(), revision::Error> {
+		<String as revision::SkipRevisioned>::skip_revisioned(reader)
+	}
+}
+
+impl revision::WalkRevisioned for Block {
+	type Walker<'r, R: revision::BorrowedReader + 'r> = revision::LeafWalker<'r, Block, R>;
+
+	fn walk_revisioned<'r, R: revision::BorrowedReader>(
+		reader: &'r mut R,
+	) -> Result<Self::Walker<'r, R>, revision::Error> {
+		Ok(revision::LeafWalker::new(reader))
+	}
+}
+
+impl revision::LengthPrefixedBytes for Block {}
+
 impl Deref for Block {
 	type Target = [Expr];
 	fn deref(&self) -> &Self::Target {
@@ -51,6 +69,11 @@ impl Block {
 	/// Check if this block does only reads.
 	pub(crate) fn read_only(&self) -> bool {
 		self.0.iter().all(|x| x.read_only())
+	}
+
+	/// Check if this block directly contains a data-modifying statement.
+	pub(crate) fn has_direct_write(&self) -> bool {
+		self.0.iter().any(|x| x.has_direct_write())
 	}
 
 	/// Process this type returning a computed simple Value
@@ -97,6 +120,27 @@ impl ToSql for Block {
 
 impl InfoStructure for Block {
 	fn structure(self) -> Value {
-		Value::String(self.to_sql())
+		Value::String(self.to_sql().into())
+	}
+}
+
+#[cfg(test)]
+mod length_prefixed_bytes_tests {
+	use revision::{SerializeRevisioned, WalkRevisioned};
+	use surrealdb_types::ToSql;
+
+	use super::Block;
+
+	#[test]
+	fn block_with_bytes_matches_serialize() {
+		let block = Block::default();
+		let mut bytes = Vec::new();
+		block.serialize_revisioned(&mut bytes).unwrap();
+		let wire_text = block.to_sql();
+		let mut r = bytes.as_slice();
+		let walker = Block::walk_revisioned(&mut r).unwrap();
+		let observed = walker.with_bytes(|raw| raw.to_vec()).unwrap();
+		assert_eq!(observed.as_slice(), wire_text.as_bytes());
+		assert!(r.is_empty());
 	}
 }

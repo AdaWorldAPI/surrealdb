@@ -5,7 +5,6 @@ use revision::{DeserializeRevisioned, Revisioned, SerializeRevisioned};
 use surrealdb_types::{RecordId, SqlFormat, ToSql};
 
 use super::SleepStatement;
-use crate::cnf::GENERATION_ALLOCATION_LIMIT;
 use crate::ctx::FrozenContext;
 use crate::dbs::Options;
 use crate::doc::CursorDoc;
@@ -88,6 +87,15 @@ pub(crate) enum Expr {
 		analyze: bool,
 		statement: Box<Expr>,
 	},
+	/// An GQL `MATCH` query, lowered to its declarative binding-table plan.
+	///
+	/// Only constructed by the GQL lowering at top level. It runs exclusively
+	/// under the streaming execution planner; see the `compute` and
+	/// `From<expr::Expr> for sql::Expr` arms for the invariants it relies on.
+	// Constructed by the GQL lowering, which lands as a sibling piece of PR-A.
+	#[cfg(feature = "gql")]
+	#[allow(dead_code)]
+	Match(Box<crate::expr::match_plan::MatchPlan>),
 }
 
 impl Expr {
@@ -131,6 +139,10 @@ impl Expr {
 				..
 			} => statement.read_only(),
 			Expr::Closure(_) => true,
+			// A GQL query is read-only unless it carries mutation stages; a
+			// mutation-bearing plan must run under a write transaction.
+			#[cfg(feature = "gql")]
+			Expr::Match(plan) => !plan.has_mutations(),
 			Expr::Create(_)
 			| Expr::Update(_)
 			| Expr::Delete(_)
@@ -144,6 +156,64 @@ impl Expr {
 		}
 	}
 
+	/// Check whether this expression's own tree *directly* contains a
+	/// data-modifying statement (CREATE/UPDATE/DELETE/RELATE/INSERT/UPSERT or
+	/// DDL).
+	///
+	/// Used to reject side-effecting `PERMISSIONS` clauses at definition time
+	/// (GHSA-66r2-5gwj-gxm2). Unlike [`Expr::read_only`], a function or closure
+	/// *call* is treated as opaque — a custom function may itself write, but
+	/// that is enforced at runtime via [`crate::dbs::Options::new_for_permission_predicate`]
+	/// — so common read-only helper predicates such as
+	/// `PERMISSIONS WHERE fn::is_owner()` remain valid. Writes buried inside a
+	/// subquery or idiom are likewise left to the runtime guard.
+	pub(crate) fn has_direct_write(&self) -> bool {
+		match self {
+			// Data-modifying statements: a direct write.
+			Expr::Create(_)
+			| Expr::Update(_)
+			| Expr::Delete(_)
+			| Expr::Relate(_)
+			| Expr::Insert(_)
+			| Expr::Define(_)
+			| Expr::Remove(_)
+			| Expr::Rebuild(_)
+			| Expr::Upsert(_)
+			| Expr::Alter(_) => true,
+
+			// Combinators: recurse into nested expressions.
+			Expr::Prefix {
+				expr,
+				..
+			}
+			| Expr::Postfix {
+				expr,
+				..
+			}
+			| Expr::Throw(expr) => expr.has_direct_write(),
+			Expr::Binary {
+				left,
+				right,
+				..
+			} => left.has_direct_write() || right.has_direct_write(),
+			Expr::Return(s) => s.what.has_direct_write(),
+			Expr::Let(s) => s.what.has_direct_write(),
+			Expr::Block(block) => block.has_direct_write(),
+			Expr::IfElse(s) => s.has_direct_write(),
+			Expr::Foreach(s) => s.has_direct_write(),
+			Expr::Explain {
+				statement,
+				..
+			} => statement.has_direct_write(),
+			// Call arguments are evaluated in place, so inspect them; the callee
+			// body is opaque and handled by the runtime guard.
+			Expr::FunctionCall(function) => function.arguments.iter().any(|x| x.has_direct_write()),
+
+			// Leaves, closures, subqueries and idioms contain no *direct* write.
+			_ => false,
+		}
+	}
+
 	pub fn from_public_value(value: PublicValue) -> Self {
 		match value {
 			surrealdb_types::Value::None => Expr::Literal(Literal::None),
@@ -154,7 +224,7 @@ impl Expr {
 				surrealdb_types::Number::Float(f) => Expr::Literal(Literal::Float(f)),
 				surrealdb_types::Number::Decimal(d) => Expr::Literal(Literal::Decimal(d)),
 			},
-			surrealdb_types::Value::String(s) => Expr::Literal(Literal::String(s)),
+			surrealdb_types::Value::String(s) => Expr::Literal(Literal::String(s.into())),
 			surrealdb_types::Value::Bytes(b) => {
 				Expr::Literal(Literal::Bytes(crate::val::Bytes(b.into_inner())))
 			}
@@ -176,7 +246,7 @@ impl Expr {
 			surrealdb_types::Value::Object(o) => Expr::Literal(Literal::Object(
 				o.into_iter()
 					.map(|(k, v)| ObjectEntry {
-						key: k,
+						key: k.into(),
 						value: Expr::from_public_value(v),
 					})
 					.collect(),
@@ -188,7 +258,7 @@ impl Expr {
 			}) => {
 				let key_lit = match key {
 					surrealdb_types::RecordIdKey::Number(n) => RecordIdKeyLit::Number(n),
-					surrealdb_types::RecordIdKey::String(s) => RecordIdKeyLit::String(s),
+					surrealdb_types::RecordIdKey::String(s) => RecordIdKeyLit::String(s.into()),
 					surrealdb_types::RecordIdKey::Uuid(u) => {
 						RecordIdKeyLit::Uuid(crate::val::Uuid(u.into_inner()))
 					}
@@ -198,7 +268,7 @@ impl Expr {
 					surrealdb_types::RecordIdKey::Object(o) => RecordIdKeyLit::Object(
 						o.into_iter()
 							.map(|(k, v)| ObjectEntry {
-								key: k,
+								key: k.into(),
 								value: Expr::from_public_value(v),
 							})
 							.collect(),
@@ -323,13 +393,16 @@ impl Expr {
 			| Expr::Explain {
 				..
 			} => false,
+			// GQL MATCH reads from the datastore, so it is never static.
+			#[cfg(feature = "gql")]
+			Expr::Match(_) => false,
 		}
 	}
 
 	pub(crate) fn to_idiom(&self) -> Idiom {
 		match self {
 			Expr::Idiom(i) => i.simplify(),
-			Expr::Param(i) => Idiom::field(i.as_str().to_owned()),
+			Expr::Param(i) => Idiom::field(i.clone().into_strand()),
 			Expr::FunctionCall(x) => x.receiver.to_idiom(),
 			Expr::Literal(l) => match l {
 				Literal::String(s) => Idiom::field(s.clone()),
@@ -341,10 +414,6 @@ impl Expr {
 	}
 
 	/// Process this type returning a computed simple Value
-	#[cfg_attr(
-		feature = "trace-doc-ops",
-		instrument(level = "trace", name = "Expr::compute", skip_all)
-	)]
 	pub(crate) async fn compute(
 		&self,
 		stk: &mut Stk,
@@ -353,6 +422,29 @@ impl Expr {
 		doc: Option<&CursorDoc>,
 	) -> FlowResult<Value> {
 		let opt = opt.dive(1).map_err(anyhow::Error::new)?;
+
+		// While evaluating a PERMISSIONS predicate (which runs with permission
+		// enforcement disabled) no statement may modify data — otherwise a
+		// stored permission expression could perform unauthorized writes during
+		// a permission check (GHSA-66r2-5gwj-gxm2). This catches writes reached
+		// directly, through nested subqueries, or through function/closure
+		// bodies, on both the legacy and streaming execution paths.
+		if opt.permission_predicate
+			&& matches!(
+				self,
+				Expr::Create(_)
+					| Expr::Update(_)
+					| Expr::Upsert(_)
+					| Expr::Delete(_)
+					| Expr::Relate(_)
+					| Expr::Insert(_)
+					| Expr::Define(_)
+					| Expr::Remove(_)
+					| Expr::Rebuild(_)
+					| Expr::Alter(_)
+			) {
+			return Err(ControlFlow::Err(anyhow::Error::new(Error::PermissionPredicateSideEffect)));
+		}
 
 		match self {
 			Expr::Literal(literal) => literal.compute(stk, ctx, &opt, doc).await,
@@ -376,7 +468,7 @@ impl Expr {
 					.1
 					.map(|x| {
 						x.saturating_mul(std::mem::size_of::<Value>())
-							> *GENERATION_ALLOCATION_LIMIT
+							> ctx.config.generation_allocation_limit
 					})
 					.unwrap_or(true)
 				{
@@ -449,13 +541,11 @@ impl Expr {
 			Expr::Foreach(foreach_statement) => {
 				foreach_statement.compute(stk, ctx, &opt, doc).await
 			}
-			Expr::Let(_) => {
-				//TODO: This error needs to be improved or it needs to be rejected in the
-				// parser.
-				Err(ControlFlow::Err(anyhow::Error::new(Error::unreachable(
-					"Set statement outside of block",
-				))))
-			}
+			Expr::Let(_) => Err(ControlFlow::Err(anyhow::Error::new(Error::InvalidStatement(
+				"LET statements can only appear at the top level of a query or inside a block \
+				 expression"
+					.to_string(),
+			)))),
 			Expr::Sleep(sleep_statement) => {
 				sleep_statement.compute(ctx, &opt, doc).await.map_err(ControlFlow::Err)
 			}
@@ -463,6 +553,12 @@ impl Expr {
 				..
 			} => Err(ControlFlow::Err(anyhow::Error::new(Error::InvalidStatement(
 				"EXPLAIN is only supported with the new execution model".to_string(),
+			)))),
+			#[cfg(feature = "gql")]
+			Expr::Match(_) => Err(ControlFlow::Err(anyhow::Error::new(Error::InvalidStatement(
+				"GQL MATCH requires the streaming execution engine; it cannot run under the \
+				 compute-only planner strategy"
+					.to_string(),
 			)))),
 		}
 	}
@@ -735,7 +831,7 @@ impl Expr {
 	pub(crate) fn to_raw_string(&self) -> String {
 		match self {
 			Expr::Idiom(idiom) => idiom.to_raw_string(),
-			Expr::Table(ident) => ident.clone().into_string(),
+			Expr::Table(ident) => ident.as_str().to_string(),
 			_ => self.to_sql(),
 		}
 	}
@@ -772,6 +868,11 @@ impl Expr {
 				..
 			} => true,
 
+			// GQL MATCH renders as a multi-clause statement; parenthesize it
+			// when nested.
+			#[cfg(feature = "gql")]
+			Expr::Match(_) => true,
+
 			Expr::Literal(_)
 			| Expr::Param(_)
 			| Expr::Idiom(_)
@@ -795,6 +896,14 @@ impl Expr {
 
 impl ToSql for Expr {
 	fn fmt_sql(&self, f: &mut String, fmt: SqlFormat) {
+		// `Expr::Match` cannot round-trip through `sql::Expr` (it has no SurrealQL
+		// surface). Render it directly via the dedicated `MatchPlan` renderer
+		// before the conversion would replace it with a placeholder.
+		#[cfg(feature = "gql")]
+		if let Expr::Match(plan) = self {
+			plan.fmt_sql(f, fmt);
+			return;
+		}
 		let sql_expr: crate::sql::Expr = self.clone().into();
 		sql_expr.fmt_sql(f, fmt);
 	}
@@ -817,6 +926,23 @@ impl SerializeRevisioned for Expr {
 		&self,
 		writer: &mut W,
 	) -> Result<(), revision::Error> {
+		// `Expr::Match` renders GQL-ish text via `to_sql()`, which the
+		// SurrealQL-only `deserialize_revisioned` path below cannot round-trip.
+		// The invariant (V2_DESIGN §2; SECURITY_GUIDE §15a) is that `Expr::Match`
+		// is only ever the top-level expr of a `PreparedGqlQuery` consumed
+		// directly by the planner — it never nests into a `sql::Ast`, the
+		// catalog, or a cached/revisioned `Expr`, so this path is unreachable by
+		// construction. Mirror the `From<expr::Expr> for sql::Expr` arm and fail
+		// loud (in debug) rather than silently emit unparseable bytes, so a
+		// future regression that nests `Expr::Match` is caught here.
+		#[cfg(feature = "gql")]
+		if matches!(self, Expr::Match(_)) {
+			tracing::error!(
+				"Expr::Match reached Revisioned serialization; it must never enter a \
+				 sql::Ast, the catalog, or Revisioned serialization"
+			);
+			debug_assert!(false, "Expr::Match must not be Revisioned-serialized");
+		}
 		SerializeRevisioned::serialize_revisioned(&self.to_sql(), writer)
 	}
 }
@@ -830,11 +956,58 @@ impl DeserializeRevisioned for Expr {
 			crate::syn::parser::ParserSettings {
 				files_enabled: true,
 				surrealism_enabled: true,
+				// At some point we parsed this query, so it fit in some kind of defined limit.
+				// So it should be relatively safe to parse this without a limit.
+				object_recursion_limit: usize::MAX,
+				query_recursion_limit: usize::MAX,
+				expr_recursion_limit: usize::MAX,
 				..Default::default()
 			},
 			async |p, stk| p.parse_expr(stk).await,
 		)
 		.map_err(|err| revision::Error::Conversion(err.to_string()))?;
 		Ok(expr.into())
+	}
+}
+
+impl revision::SkipRevisioned for Expr {
+	fn skip_revisioned<R: std::io::Read>(reader: &mut R) -> Result<(), revision::Error> {
+		// Wire format is the SurrealQL source string. Skip its bytes without
+		// re-parsing into an `Expr`.
+		<String as revision::SkipRevisioned>::skip_revisioned(reader)
+	}
+}
+
+impl revision::WalkRevisioned for Expr {
+	type Walker<'r, R: revision::BorrowedReader + 'r> = revision::LeafWalker<'r, Expr, R>;
+
+	fn walk_revisioned<'r, R: revision::BorrowedReader>(
+		reader: &'r mut R,
+	) -> Result<Self::Walker<'r, R>, revision::Error> {
+		Ok(revision::LeafWalker::new(reader))
+	}
+}
+
+impl revision::LengthPrefixedBytes for Expr {}
+
+#[cfg(test)]
+mod length_prefixed_bytes_tests {
+	use revision::{SerializeRevisioned, WalkRevisioned};
+	use surrealdb_types::ToSql;
+
+	use crate::expr::Expr;
+	use crate::expr::literal::Literal;
+
+	#[test]
+	fn expr_with_bytes_matches_serialize() {
+		let expr = Expr::Literal(Literal::Integer(42));
+		let mut bytes = Vec::new();
+		expr.serialize_revisioned(&mut bytes).unwrap();
+		let wire_text = expr.to_sql();
+		let mut r = bytes.as_slice();
+		let walker = Expr::walk_revisioned(&mut r).unwrap();
+		let observed = walker.with_bytes(|raw| raw.to_vec()).unwrap();
+		assert_eq!(observed.as_slice(), wire_text.as_bytes());
+		assert!(r.is_empty());
 	}
 }

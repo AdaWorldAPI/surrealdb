@@ -15,6 +15,14 @@ use crate::exec::operators::{
 use crate::exec::parts::LookupDirection;
 use crate::exec::planner::select::SelectPipelineConfig;
 use crate::expr::{Expr, Literal};
+use crate::val::TableName;
+
+/// Planned representation of a `->edge->vertex` fast-path collapse.
+pub(crate) struct TargetVertexPlan {
+	pub direction: LookupDirection,
+	pub edge_tables: Vec<EdgeTableSpec>,
+	pub target_tables: Vec<TableName>,
+}
 
 // ============================================================================
 // impl Planner — Source Planning
@@ -113,7 +121,7 @@ impl<'ctx> Planner<'ctx> {
 						name
 					),
 				})?;
-				IndexContext::Knn(knn_ctx.clone())
+				IndexContext::Knn(Arc::clone(knn_ctx))
 			}
 		};
 
@@ -217,7 +225,32 @@ impl<'ctx> Planner<'ctx> {
 		}: crate::expr::lookup::Lookup,
 	) -> Result<Arc<dyn ExecOperator>, Error> {
 		let needs_full_pipeline = expr.is_some() || group.is_some();
-		let needs_full_records = needs_full_pipeline || cond.is_some() || split.is_some();
+		let is_graph = matches!(&kind, crate::expr::lookup::LookupKind::Graph(_));
+		// For a graph lookup outside the full (expr/group) pipeline, compile
+		// the `cond` once and classify it so it can be pushed into the scan
+		// instead of a downstream `Filter`. A key-resident predicate (see
+		// `graph_predicate_is_key_resident`) is evaluated from the adjacency
+		// key alone, so the scan stays in `TargetId` mode and skips fetching
+		// non-matching edge records; a record-referencing predicate needs the
+		// full edge record.
+		let graph_pushdown: Option<(Arc<dyn crate::exec::PhysicalExpr>, bool)> =
+			if is_graph && !needs_full_pipeline {
+				match &cond {
+					Some(c) => {
+						let pred = self.physical_expr(c.0.clone()).await?;
+						let key_resident = Self::graph_predicate_is_key_resident(&pred);
+						Some((pred, key_resident))
+					}
+					None => None,
+				}
+			} else {
+				None
+			};
+		let cond_key_resident = graph_pushdown.as_ref().map(|(_, kr)| *kr).unwrap_or(false);
+		// A `cond` still forces full records unless it is a key-resident graph
+		// predicate; `SPLIT` and the expr/group pipeline force full as before.
+		let needs_full_records =
+			needs_full_pipeline || (cond.is_some() && !cond_key_resident) || split.is_some();
 		let output_mode = if needs_full_records {
 			GraphScanOutput::FullEdge
 		} else {
@@ -265,25 +298,41 @@ impl<'ctx> Planner<'ctx> {
 				// change the result count. This avoids scanning all edges
 				// when only a few are needed. When START is present, add
 				// the offset so the scan fetches enough rows for the skip.
-				let scan =
-					if cond.is_none() && split.is_none() && order.is_none() && group.is_none() {
-						if let Some(crate::expr::limit::Limit(crate::expr::Expr::Literal(
-							crate::expr::Literal::Integer(n),
-						))) = &limit
-						{
-							let offset = match &start {
-								Some(crate::expr::start::Start(crate::expr::Expr::Literal(
-									crate::expr::Literal::Integer(s),
-								))) => *s as usize,
-								_ => 0,
-							};
-							scan.with_limit(*n as usize + offset)
-						} else {
-							scan
-						}
+				// Only push the limit into the scan when the scan's output is the
+				// final filtered set: no downstream clause changes the row count. A
+				// `cond` is safe only when it was pushed into the scan
+				// (`graph_pushdown`); when it flows through the expr/group pipeline
+				// or a downstream Filter, limiting the scan first would drop rows the
+				// filter has not yet seen.
+				let scan = if (cond.is_none() || graph_pushdown.is_some())
+					&& split.is_none()
+					&& order.is_none()
+					&& group.is_none()
+				{
+					if let Some(crate::expr::limit::Limit(crate::expr::Expr::Literal(
+						crate::expr::Literal::Integer(n),
+					))) = &limit
+					{
+						let offset = match &start {
+							Some(crate::expr::start::Start(crate::expr::Expr::Literal(
+								crate::expr::Literal::Integer(s),
+							))) => *s as usize,
+							_ => 0,
+						};
+						scan.with_limit(*n as usize + offset)
 					} else {
 						scan
-					};
+					}
+				} else {
+					scan
+				};
+				// Push the compiled predicate into the scan, replacing the
+				// downstream Filter for graph lookups.
+				let scan = if let Some((pred, key_resident)) = &graph_pushdown {
+					scan.with_predicate(Arc::clone(pred), *key_resident)
+				} else {
+					scan
+				};
 				Arc::new(scan)
 			}
 			crate::expr::lookup::LookupKind::Reference => {
@@ -333,7 +382,10 @@ impl<'ctx> Planner<'ctx> {
 
 		if needs_full_pipeline {
 			let config = SelectPipelineConfig {
-				cond,
+				where_clause: match cond {
+					Some(c) => crate::exec::planner::select::WhereClauseState::Original(c),
+					None => crate::exec::planner::select::WhereClauseState::None,
+				},
 				split,
 				group,
 				order,
@@ -341,16 +393,15 @@ impl<'ctx> Planner<'ctx> {
 				start,
 				omit: vec![],
 				tempfiles: false,
-				filter_pushed: false,
-				precompiled_predicate: None,
+				topk_pushdown: None,
 			};
 			self.plan_pipeline(base_scan, expr, config).await
 		} else {
-			let filtered: Arc<dyn ExecOperator> = if let Some(cond) = cond {
-				let predicate = self.physical_expr(cond.0).await?;
-				Arc::new(Filter::new(base_scan, predicate))
-			} else {
-				base_scan
+			let filtered: Arc<dyn ExecOperator> = match cond {
+				// Graph lookups pushed the predicate into the scan above.
+				Some(_) if graph_pushdown.is_some() => base_scan,
+				Some(cond) => Arc::new(Filter::new(base_scan, self.physical_expr(cond.0).await?)),
+				None => base_scan,
 			};
 
 			let split_op: Arc<dyn ExecOperator> = if let Some(splits) = split {
@@ -389,5 +440,194 @@ impl<'ctx> Planner<'ctx> {
 
 			Ok(limited)
 		}
+	}
+
+	/// Whether a compiled graph-lookup predicate is "key-resident":
+	/// evaluable from the adjacency key alone (currently only the edge
+	/// `id`), free of subqueries, functions, and side effects. Key-resident
+	/// predicates are applied before fetching the edge record. Conservative
+	/// — anything not provably key-resident is treated as
+	/// record-referencing, which only costs a fetch. Milestone E implements
+	/// the id-only recognizer; until then every predicate is
+	/// record-referencing.
+	fn graph_predicate_is_key_resident(_pred: &Arc<dyn crate::exec::PhysicalExpr>) -> bool {
+		false
+	}
+
+	/// Decide whether a consecutive `(edge_lookup, vertex_lookup)` pair can
+	/// be served by a single `GraphEdgeScan` in `TargetVertex` mode.
+	///
+	/// Returns the collapsed scan parameters when eligible. The pair must:
+	///
+	/// - Both be `Graph(dir)` lookups in the same direction.
+	/// - Have no edge/vertex-side filtering, projection, ordering, alias, sub-range, or `ONLY`
+	///   markers — the new layout only optimises the pure "walk through the edge to the target
+	///   table" case.
+	/// - Reference only edge tables whose `SELECT` permission is `Permission::Full`. `Specific`
+	///   permissions would otherwise be bypassed by reading the target directly from the adjacency
+	///   key.
+	pub(crate) async fn try_fast_path_pair(
+		&self,
+		edge: &crate::expr::lookup::Lookup,
+		vertex: &crate::expr::lookup::Lookup,
+	) -> Result<Option<TargetVertexPlan>, Error> {
+		use crate::expr::lookup::{LookupKind, LookupSubject};
+
+		// Both hops must be graph traversal in the same direction. The
+		// `d1 == d2` guard means the vertex-hop direction is exactly
+		// `edge_dir`, so we only bind the one we use.
+		let edge_dir = match (&edge.kind, &vertex.kind) {
+			(LookupKind::Graph(d1), LookupKind::Graph(d2)) if d1 == d2 => d1,
+			_ => return Ok(None),
+		};
+		// SECURITY: time-travel queries (`VERSION <ts>`) must enforce the
+		// edge table's SELECT permissions as they stood at the requested
+		// version, not the current catalog. The eligibility check below
+		// inspects the *current* `Permission::Full` state, so a query that
+		// targets a historical version where the edge had a row-level WHERE
+		// could be admitted to the fast path -- which then skips the edge
+		// record entirely and bypasses that WHERE. Always take the slow
+		// path when a VERSION expression is present so the historical
+		// permission gate is honoured.
+		if self.version.is_some() {
+			return Ok(None);
+		}
+		// Bidirectional (`<->`) traversal has the slow path scan the edge's
+		// own adjacency in *both* directions on the second hop, so each
+		// edge contributes both endpoint vertices to the result -- the
+		// embedded target plus the originating source vertex. The fast
+		// path emits only the embedded target, dropping the source-side
+		// duplicate. Force the slow path on `<->` to preserve semantics;
+		// `->` and `<-` keep the optimisation.
+		if matches!(edge_dir, crate::expr::Dir::Both) {
+			return Ok(None);
+		}
+
+		// Neither hop may carry edge-side filtering, projection, or other
+		// clauses that depend on reading the edge / vertex record.
+		let lookup_is_plain = |l: &crate::expr::lookup::Lookup| {
+			l.expr.is_none()
+				&& l.cond.is_none()
+				&& l.split.is_none()
+				&& l.group.is_none()
+				&& l.order.is_none()
+				&& l.limit.is_none()
+				&& l.start.is_none()
+				&& l.alias.is_none()
+				&& !l.only
+		};
+		if !lookup_is_plain(edge) || !lookup_is_plain(vertex) {
+			return Ok(None);
+		}
+
+		// We only support unbounded `LookupSubject::Table` subjects on both
+		// hops. Range subjects on the edge would change the bound semantics
+		// (and would need the trailing-target-aware bound construction);
+		// keep them on the slow path for now.
+		let mut edge_tables: Vec<EdgeTableSpec> = Vec::with_capacity(edge.what.len());
+		for s in &edge.what {
+			let LookupSubject::Table {
+				table,
+				..
+			} = s
+			else {
+				return Ok(None);
+			};
+			edge_tables.push(EdgeTableSpec {
+				table: table.clone(),
+				range_start: std::ops::Bound::Unbounded,
+				range_end: std::ops::Bound::Unbounded,
+			});
+		}
+		// The edge `what` list must be non-empty so we can resolve each
+		// edge table's permissions. The unbounded "any edge table" case
+		// stays on the slow path because we don't know which tables to
+		// permission-check at plan time.
+		if edge_tables.is_empty() {
+			return Ok(None);
+		}
+
+		let mut target_tables: Vec<TableName> = Vec::with_capacity(vertex.what.len());
+		for s in &vertex.what {
+			let LookupSubject::Table {
+				table,
+				..
+			} = s
+			else {
+				return Ok(None);
+			};
+			target_tables.push(table.clone());
+		}
+		// Mirror the edge `what` check above: the unbounded "any vertex
+		// table" case (empty `what`) stays on the slow path. The scan
+		// operator would otherwise accept every embedded target without a
+		// table filter, leaving the per-target permission check as the
+		// only gate; keep the eligibility contract symmetric so plan-time
+		// reasoning matches the edge side.
+		if target_tables.is_empty() {
+			return Ok(None);
+		}
+
+		// Verify every edge table has `PERMISSIONS FULL` for SELECT.
+		// Without a plan-time transaction we cannot check, so fall back.
+		let Some(txn) = self.txn() else {
+			return Ok(None);
+		};
+		let (Some(ns), Some(db)) = (self.ns(), self.db()) else {
+			return Ok(None);
+		};
+		// SECURITY: the fast path emits the embedded target vertex without
+		// consulting the edge record, so any per-row WHERE on the edge
+		// table would be silently bypassed. We require either:
+		//   1. The edge table's SELECT permission is `Full` (no per-row gate exists), OR
+		//   2. The runtime would skip permission evaluation altogether for this session (root/owner
+		//      with the right level, or auth-disabled anonymous). In that case the slow path's
+		//      WHERE wouldn't run either, so the bypass is equivalent.
+		// (2) requires the calling auth principal; when it isn't wired
+		// through (txn-less or deeply-nested planner) we stay conservative.
+		if !self.should_check_perms_for_view(ns, db) {
+			return Ok(Some(TargetVertexPlan {
+				direction: LookupDirection::from(edge_dir),
+				edge_tables,
+				target_tables,
+			}));
+		}
+		for spec in &edge_tables {
+			use crate::catalog::providers::TableProvider;
+			let td = match txn.get_tb_by_name(ns, db, &spec.table, None).await {
+				Ok(Some(td)) => td,
+				// Missing edge table or any catalog error → take the slow
+				// path; this is purely an optimisation, never a correctness
+				// gate.
+				_ => return Ok(None),
+			};
+			if !matches!(td.permissions.select, crate::catalog::Permission::Full) {
+				return Ok(None);
+			}
+		}
+
+		Ok(Some(TargetVertexPlan {
+			direction: LookupDirection::from(edge_dir),
+			edge_tables,
+			target_tables,
+		}))
+	}
+
+	/// Build the operator that implements a fast-path `->edge->vertex`
+	/// collapse, returning a `GraphEdgeScan` in `TargetVertex` mode.
+	pub(crate) async fn plan_target_vertex_scan(
+		&self,
+		input: Arc<dyn ExecOperator>,
+		plan: TargetVertexPlan,
+	) -> Result<Arc<dyn ExecOperator>, Error> {
+		let scan = GraphEdgeScan::new(
+			input,
+			plan.direction,
+			plan.edge_tables,
+			GraphScanOutput::TargetVertex,
+			self.version.clone(),
+		)
+		.with_target_tables(plan.target_tables);
+		Ok(Arc::new(scan))
 	}
 }

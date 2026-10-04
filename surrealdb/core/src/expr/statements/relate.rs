@@ -7,7 +7,7 @@ use surrealdb_types::ToSql;
 use crate::catalog::providers::{DatabaseProvider, NamespaceProvider, TableProvider};
 use crate::ctx::{Context, FrozenContext};
 use crate::dbs::{Iterable, Iterator, Options, Statement};
-use crate::doc::{CursorDoc, NsDbTbCtx};
+use crate::doc::{CursorDoc, DocumentContext, NsDbCtx};
 use crate::err::Error;
 use crate::expr::{Data, Expr, FlowResultExt as _, Output, Value};
 use crate::idx::planner::RecordStrategy;
@@ -16,6 +16,8 @@ use crate::val::{Duration, RecordId, RecordIdKey, TableName};
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct RelateStatement {
 	pub only: bool,
+	/// When true, update an existing edge record with the same explicit id.
+	pub or_update: bool,
 	/// The expression resulting in the table through which we create a relation
 	pub through: Expr,
 	/// The expression the relation is from
@@ -164,15 +166,13 @@ impl RelateStatement {
 				// Auto-create the through table if it doesn't exist
 				let tb =
 					txn.get_or_add_tb(Some(ctx), opt.ns()?, opt.db()?, through_table, None).await?;
-				let fields = txn
-					.all_tb_fields(ns.namespace_id, db.database_id, through_table, opt.version)
-					.await?;
-				let doc_ctx = NsDbTbCtx {
+				let parent = NsDbCtx {
 					ns: Arc::clone(&ns),
 					db: Arc::clone(&db),
-					tb,
-					fields,
 				};
+				let doc_ctx =
+					DocumentContext::initialise(ctx, &parent, tb, through_table, opt.version, true)
+						.await?;
 
 				iterator.ingest(Iterable::Relatable(doc_ctx, f.clone(), through, t.clone(), None));
 			}

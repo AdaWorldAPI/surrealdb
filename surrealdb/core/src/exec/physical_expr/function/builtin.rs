@@ -2,12 +2,11 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use surrealdb_types::{SqlFormat, ToSql};
 
 use super::helpers::{args_access_mode, args_required_context, evaluate_args};
-use crate::exec::AccessMode;
 use crate::exec::physical_expr::{EvalContext, PhysicalExpr};
+use crate::exec::{AccessMode, BoxFut};
 use crate::expr::FlowResult;
 use crate::val::Value;
 
@@ -20,13 +19,18 @@ pub struct BuiltinFunctionExec {
 	pub(crate) arguments: Vec<Arc<dyn PhysicalExpr>>,
 	/// The required context level for this function (looked up at planning time).
 	pub(crate) func_required_context: crate::exec::ContextLevel,
+	/// Expression-nesting depth recorded when this node was planned. Only
+	/// meaningful for `eval::*`, which uses it to continue the depth count when
+	/// it re-plans its query string (see `exec/function/builtin/eval.rs`).
+	pub(crate) plan_depth: u32,
 }
-
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl PhysicalExpr for BuiltinFunctionExec {
 	fn name(&self) -> &'static str {
 		"BuiltinFunction"
+	}
+
+	fn as_any(&self) -> &dyn std::any::Any {
+		self
 	}
 
 	fn required_context(&self) -> crate::exec::ContextLevel {
@@ -36,30 +40,39 @@ impl PhysicalExpr for BuiltinFunctionExec {
 		args_ctx.max(self.func_required_context)
 	}
 
-	async fn evaluate(&self, ctx: EvalContext<'_>) -> FlowResult<Value> {
-		// Check if function is allowed by capabilities
-		ctx.check_allowed_function(&self.name)?;
+	fn evaluate<'a>(&'a self, ctx: EvalContext<'a>) -> BoxFut<'a, FlowResult<Value>> {
+		Box::pin(async move {
+			// Check if function is allowed by capabilities
+			ctx.check_allowed_function(&self.name)?;
 
-		// Look up the function in the registry
-		let registry = ctx.exec_ctx.function_registry();
-		let func = registry.get(&self.name).ok_or_else(|| {
-			anyhow::anyhow!("Unknown function '{}' - not found in function registry", self.name)
-		})?;
+			// Look up the function in the registry
+			let registry = ctx.exec_ctx.function_registry();
+			let func = registry.get(&self.name).ok_or_else(|| {
+				anyhow::anyhow!("Unknown function '{}' - not found in function registry", self.name)
+			})?;
 
-		// Evaluate all arguments
-		let args = evaluate_args(&self.arguments, ctx.clone()).await?;
+			// Evaluate all arguments
+			let args = evaluate_args(&self.arguments, ctx.clone()).await?;
 
-		// Invoke the function based on whether it's pure or needs context
-		if func.is_pure() && !func.is_async() {
-			Ok(func.invoke(args)?)
-		} else {
-			Ok(func.invoke_async(&ctx, args).await?)
-		}
+			// Invoke the function based on whether it's pure or needs context
+			if func.is_pure() && !func.is_async() {
+				Ok(func.invoke(args)?)
+			} else {
+				// Surface the plan-time nesting depth so `eval::*` can continue
+				// counting toward `max_computation_depth` when it re-plans its
+				// query string. Harmless for every other builtin (they ignore it).
+				let mut ctx = ctx;
+				ctx.plan_depth = self.plan_depth;
+				Ok(func.invoke_async(&ctx, args).await?)
+			}
+		})
 	}
 
 	fn access_mode(&self) -> AccessMode {
-		// api::invoke is read-write, everything else is read-only
-		let func_mode = if self.name == "api::invoke" {
+		// `api::invoke` and the `eval::*` functions can run nested writes, so they
+		// are read-write; everything else is read-only.
+		let func_mode = if matches!(self.name.as_str(), "api::invoke" | "eval::surql" | "eval::gql")
+		{
 			AccessMode::ReadWrite
 		} else {
 			AccessMode::ReadOnly

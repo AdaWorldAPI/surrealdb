@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use reblessive::tree::Stk;
+use surrealdb_strand::Strand;
 
 use super::DefineKind;
 use crate::catalog::providers::{CatalogProvider, DatabaseProvider};
@@ -15,7 +16,7 @@ use crate::val::Value;
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct DefineParamStatement {
 	pub kind: DefineKind,
-	pub name: String,
+	pub name: Strand,
 	pub value: Expr,
 	pub comment: Expr,
 	pub permissions: Permission,
@@ -32,7 +33,15 @@ impl DefineParamStatement {
 		doc: Option<&CursorDoc>,
 	) -> Result<Value> {
 		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Parameter, &Base::Db)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Parameter, Base::Db)?;
+
+		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
+		if self.permissions.has_direct_write() {
+			bail!(Error::PermissionClauseNotReadonly {
+				kind: "param",
+				name: self.name.to_string(),
+			});
+		}
 
 		let value = stk.run(|stk| self.value.compute(stk, ctx, opt, doc)).await.catch_return()?;
 
@@ -46,7 +55,7 @@ impl DefineParamStatement {
 				DefineKind::Default => {
 					if !opt.import {
 						bail!(Error::PaAlreadyExists {
-							name: self.name.clone(),
+							name: self.name.to_string(),
 						});
 					}
 				}

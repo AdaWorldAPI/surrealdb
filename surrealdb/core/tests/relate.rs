@@ -1,4 +1,4 @@
-#![recursion_limit = "1024"]
+#![recursion_limit = "256"]
 
 mod helpers;
 use anyhow::Result;
@@ -330,6 +330,6 @@ async fn relate_enforced() -> Result<()> {
 	}",
 	)
 	.unwrap();
-	t.expect_value(info)?;
+	t.expect_value(&info)?;
 	Ok(())
 }

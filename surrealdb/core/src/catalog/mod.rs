@@ -12,8 +12,6 @@ mod auth;
 mod database;
 mod module;
 mod namespace;
-#[cfg(feature = "op-bridge")]
-pub mod op_bridge;
 pub(crate) mod providers;
 mod record;
 mod schema;
@@ -33,7 +31,7 @@ pub(crate) use namespace::*;
 pub(crate) use record::*;
 pub use schema::ApiMethod;
 pub(crate) use schema::{
-	ApiDefinition, Distance, FullTextParams, HnswParams, Scoring, VectorType, *,
+	ApiDefinition, DiskAnnParams, Distance, FullTextParams, HnswParams, Scoring, VectorType, *,
 };
 pub(crate) use subscription::*;
 pub(crate) use table::*;

@@ -10,14 +10,13 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use futures::StreamExt;
 #[cfg(not(target_family = "wasm"))]
-use rayon::prelude::ParallelSliceMut;
+use rayon::prelude::{IntoParallelIterator, ParallelIterator, ParallelSliceMut};
 #[cfg(not(target_family = "wasm"))]
 use tokio::task::spawn_blocking;
 
-use super::common::{OrderByField, SortDirection, SortKey, compare_keys, compare_records_by_keys};
+use super::common::{OrderByField, SortDirection, SortKey, compare_keys, compare_keys_by_sort_key};
 use crate::exec::{
 	AccessMode, CardinalityHint, CombineAccessModes, ContextLevel, EvalContext, ExecOperator,
 	ExecutionContext, FlowResult, OperatorMetrics, PhysicalExpr, ValueBatch, ValueBatchStream,
@@ -55,9 +54,6 @@ impl Sort {
 		}
 	}
 }
-
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl ExecOperator for Sort {
 	fn name(&self) -> &'static str {
 		"Sort"
@@ -138,6 +134,7 @@ impl ExecOperator for Sort {
 			self.input.execute(ctx)?,
 			self.input.access_mode(),
 			self.input.cardinality_hint(),
+			ctx.root().ctx.config.operator_buffer_size,
 		);
 		let order_by = self.order_by.clone();
 		let ctx = ctx.clone();
@@ -268,9 +265,6 @@ impl SortByKey {
 		}
 	}
 }
-
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl ExecOperator for SortByKey {
 	fn name(&self) -> &'static str {
 		"SortByKey"
@@ -335,6 +329,7 @@ impl ExecOperator for SortByKey {
 			self.input.execute(ctx)?,
 			self.input.access_mode(),
 			self.input.cardinality_hint(),
+			ctx.root().ctx.config.operator_buffer_size,
 		);
 		let sort_keys = self.sort_keys.clone();
 		let cancellation = ctx.cancellation().clone();
@@ -384,14 +379,34 @@ impl ExecOperator for SortByKey {
 }
 
 /// Sort values by extracting fields and comparing.
+///
+/// Decorate–sort–undecorate: each row's sort keys are extracted exactly once
+/// (O(n) extractions) and sorted alongside the row, rather than re-extracting
+/// inside the comparator (O(n log n) extractions).
 #[cfg(not(target_family = "wasm"))]
 async fn sort_by_keys(
-	mut values: Vec<Value>,
+	values: Vec<Value>,
 	sort_keys: Vec<SortKey>,
 ) -> Result<Vec<Value>, crate::expr::ControlFlow> {
+	// Below this size rayon's par_sort_unstable_by is fully sequential
+	// (MAX_SEQUENTIAL = 2000), so a parallel decorate would be the sort's
+	// only entry into the shared rayon pool — pure coordination overhead
+	// for small sorts. Extract serially there, in parallel above it.
+	const PARALLEL_EXTRACT_THRESHOLD: usize = 2000;
+
 	spawn_blocking(move || {
-		values.par_sort_unstable_by(|a, b| compare_records_by_keys(a, b, &sort_keys));
-		values
+		let extract = |v: Value| {
+			let keys: Vec<Value> =
+				sort_keys.iter().map(|k| k.path.extract(&v).into_owned()).collect();
+			(keys, v)
+		};
+		let mut keyed: Vec<(Vec<Value>, Value)> = if values.len() < PARALLEL_EXTRACT_THRESHOLD {
+			values.into_iter().map(extract).collect()
+		} else {
+			values.into_par_iter().map(extract).collect()
+		};
+		keyed.par_sort_unstable_by(|a, b| compare_keys_by_sort_key(&a.0, &b.0, &sort_keys));
+		keyed.into_iter().map(|(_, v)| v).collect()
 	})
 	.await
 	.context("Sort error")
@@ -400,9 +415,17 @@ async fn sort_by_keys(
 /// Sort values by extracting fields and comparing (WASM version).
 #[cfg(target_family = "wasm")]
 async fn sort_by_keys(
-	mut values: Vec<Value>,
+	values: Vec<Value>,
 	sort_keys: Vec<SortKey>,
 ) -> Result<Vec<Value>, crate::expr::ControlFlow> {
-	values.sort_by(|a, b| compare_records_by_keys(a, b, &sort_keys));
-	Ok(values)
+	let mut keyed: Vec<(Vec<Value>, Value)> = values
+		.into_iter()
+		.map(|v| {
+			let keys: Vec<Value> =
+				sort_keys.iter().map(|k| k.path.extract(&v).into_owned()).collect();
+			(keys, v)
+		})
+		.collect();
+	keyed.sort_by(|a, b| compare_keys_by_sort_key(&a.0, &b.0, &sort_keys));
+	Ok(keyed.into_iter().map(|(_, v)| v).collect())
 }

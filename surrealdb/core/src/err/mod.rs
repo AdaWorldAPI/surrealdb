@@ -41,6 +41,16 @@ pub fn anyhow_to_types_error(error: anyhow::Error) -> surrealdb_types::Error {
 	}
 }
 
+/// Returns true if an [`anyhow::Error`] contains a core query-cancellation error.
+pub fn is_query_cancelled(error: &anyhow::Error) -> bool {
+	matches!(error.downcast_ref::<Error>(), Some(Error::QueryCancelled))
+}
+
+/// Returns true if an [`anyhow::Error`] contains a core query-timeout error.
+pub fn is_query_timedout(error: &anyhow::Error) -> bool {
+	matches!(error.downcast_ref::<Error>(), Some(Error::QueryTimedout(_)))
+}
+
 /// An error originating from an embedded SurrealDB database.
 #[derive(Error, Debug)]
 #[allow(clippy::enum_variant_names)]
@@ -158,7 +168,7 @@ pub(crate) enum Error {
 	},
 
 	/// The wrong quantity or magnitude of arguments was given for the specified
-	/// function
+	/// method
 	#[error("Incorrect arguments for method {name}(). {message}")]
 	InvalidMethodArguments {
 		name: String,
@@ -270,7 +280,7 @@ pub(crate) enum Error {
 	},
 
 	/// The requested function does not exist
-	#[error("The function 'fn::{name}' does not exist")]
+	#[error("The function '{name}' does not exist")]
 	FcNotFound {
 		name: String,
 	},
@@ -333,6 +343,16 @@ pub(crate) enum Error {
 	#[error("The analyzer '{name}' does not exist")]
 	AzNotFound {
 		name: String,
+	},
+
+	/// The analyzer cannot be removed because it is referenced by an index
+	#[error(
+		"The analyzer '{name}' is in use by index '{index}' on table '{table}' and cannot be removed"
+	)]
+	AzInUse {
+		name: String,
+		table: String,
+		index: String,
 	},
 
 	/// The requested api does not exist
@@ -494,6 +514,23 @@ pub(crate) enum Error {
 		op: BucketOperation,
 	},
 
+	/// A permission predicate attempted to perform a write or other side effect
+	/// while being evaluated (GHSA-66r2-5gwj-gxm2). Permission expressions are
+	/// evaluated with permission enforcement disabled, so they must be free of
+	/// observable side effects.
+	#[error("A PERMISSIONS clause cannot contain a statement that modifies data")]
+	PermissionPredicateSideEffect,
+
+	/// A DEFINE/ALTER (or import) supplied a permission clause that directly
+	/// contains a data-modifying statement, which is not allowed.
+	#[error(
+		"Found a non-read-only expression in the PERMISSIONS clause for {kind} `{name}`, but a PERMISSIONS clause must not modify data"
+	)]
+	PermissionClauseNotReadonly {
+		kind: &'static str,
+		name: String,
+	},
+
 	/// A database entry for the specified record already exists
 	#[error("Database record `{record}` already exists", record = record.to_sql())]
 	RecordExists {
@@ -514,6 +551,14 @@ pub(crate) enum Error {
 		record: String,
 		relation: bool,
 		target_type: String,
+	},
+
+	/// The specified table is a view (`DEFINE TABLE ... AS SELECT`) and is read-only
+	#[error(
+		"Cannot write to the `{table}` table, as it is a view (defined with `AS SELECT`); view tables are read-only and their records are computed from the source query"
+	)]
+	TableIsView {
+		table: String,
 	},
 
 	/// The specified field did not conform to the field ASSERT clause
@@ -789,6 +834,14 @@ pub(crate) enum Error {
 		value: String,
 	},
 
+	/// The same method appears in more than one `FOR` clause on a single
+	/// `DEFINE API` statement
+	#[error("The method '{method}' is defined in more than one FOR clause on api '{value}'")]
+	ApMethodDuplicate {
+		value: String,
+		method: String,
+	},
+
 	/// The requested analyzer already exists
 	#[error("The analyzer '{name}' already exists")]
 	AzAlreadyExists {
@@ -820,7 +873,7 @@ pub(crate) enum Error {
 	},
 
 	/// The requested function already exists
-	#[error("The function 'fn::{name}' already exists")]
+	#[error("The function '{name}' already exists")]
 	FcAlreadyExists {
 		name: String,
 	},
@@ -1019,6 +1072,11 @@ pub(crate) enum Error {
 	#[error("This access method results in an invalid expiration")]
 	AccessInvalidExpiration,
 
+	#[error(
+		"Tokens issued by record access methods can be consumed by third parties and must have an expiration; DURATION FOR TOKEN cannot be NONE on TYPE RECORD access"
+	)]
+	AccessRecordTokenDurationRequired,
+
 	#[error("The record access signup query failed")]
 	AccessRecordSignupQueryFailed,
 
@@ -1210,6 +1268,15 @@ pub(crate) enum Error {
 	/// Cannot use the `{0}` keyword on the `id` field
 	#[error("Cannot use the `{0}` type on the `id` field, as that's not a valid record id key.")]
 	IdFieldUnsupportedKind(String),
+
+	/// A record id could not be auto-generated for the table's declared `id` type
+	#[error(
+		"Cannot generate a record id of type `{kind}` for the `{table}` table; specify an explicit record id, or declare the `id` field as `uuid` or `string` to auto-generate one."
+	)]
+	IdFieldGenerateUnsupported {
+		table: String,
+		kind: String,
+	},
 
 	#[error(
 		"Error with the event {0}. The ID of the namespace `{1}` does not match the namespace this event has been generated from."

@@ -145,6 +145,9 @@ pub(crate) static PATHS: phf::Map<
 		UniCase::ascii("encoding::json::decode") => (PathKind::Function, None),
 		UniCase::ascii("encoding::json::encode") => (PathKind::Function, None),
 		//
+		UniCase::ascii("eval::gql") => (PathKind::Function, None),
+		UniCase::ascii("eval::surql") => (PathKind::Function, None),
+		//
 		UniCase::ascii("file::bucket") => (PathKind::Function, None),
 		UniCase::ascii("file::key") => (PathKind::Function, None),
 		UniCase::ascii("file::put") => (PathKind::Function, None),
@@ -458,6 +461,8 @@ pub(crate) static PATHS: phf::Map<
 		//
 		UniCase::ascii("value::diff") => (PathKind::Function, None),
 		UniCase::ascii("value::patch") => (PathKind::Function, None),
+		UniCase::ascii("value::chain") => (PathKind::Function, None),
+		UniCase::ascii("value::expect") => (PathKind::Function, None),
 		//
 		UniCase::ascii("vector::add") => (PathKind::Function, None),
 		UniCase::ascii("vector::angle") => (PathKind::Function, None),

@@ -26,6 +26,8 @@ pub enum Method {
 	Delete,
 	Version,
 	Query,
+	Gql,
+	Graphql,
 	Relate,
 	Run,
 	InsertRelation,
@@ -84,6 +86,8 @@ impl Method {
 			"delete" => Self::Delete,
 			"version" => Self::Version,
 			"query" => Self::Query,
+			"gql" => Self::Gql,
+			"graphql" => Self::Graphql,
 			"relate" => Self::Relate,
 			"run" => Self::Run,
 			"insert_relation" => Self::InsertRelation,
@@ -99,7 +103,10 @@ impl Method {
 }
 
 impl Method {
-	pub fn to_str(&self) -> &str {
+	/// Stable lower-case label for this method. Always a `'static`
+	/// literal so it is safe to use as a Prometheus label value or to
+	/// stash on a `&'static str` field.
+	pub fn to_str(&self) -> &'static str {
 		match self {
 			Self::Unknown => "unknown",
 			Self::Ping => "ping",
@@ -126,6 +133,8 @@ impl Method {
 			Self::Delete => "delete",
 			Self::Version => "version",
 			Self::Query => "query",
+			Self::Gql => "gql",
+			Self::Graphql => "graphql",
 			Self::Relate => "relate",
 			Self::Run => "run",
 			Self::InsertRelation => "insert_relation",
@@ -149,5 +158,28 @@ impl Method {
 	/// Checks if the provided method is a valid and supported RPC method
 	pub fn is_valid(&self) -> bool {
 		!matches!(self, Self::Unknown)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn gql_method_round_trips() {
+		assert_eq!(Method::parse_case_sensitive("gql"), Method::Gql);
+		assert_eq!(Method::parse_case_insensitive("GQL"), Method::Gql);
+		assert_eq!(Method::Gql.to_str(), "gql");
+		assert!(Method::Gql.is_valid());
+	}
+
+	#[test]
+	fn graphql_method_round_trips() {
+		assert_eq!(Method::parse_case_sensitive("graphql"), Method::Graphql);
+		assert_eq!(Method::parse_case_insensitive("GraphQL"), Method::Graphql);
+		assert_eq!(Method::Graphql.to_str(), "graphql");
+		assert!(Method::Graphql.is_valid());
+		// `gql` (GQL) and `graphql` are distinct methods.
+		assert_ne!(Method::Gql, Method::Graphql);
 	}
 }

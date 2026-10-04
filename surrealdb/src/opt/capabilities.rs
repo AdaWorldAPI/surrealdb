@@ -44,6 +44,8 @@ pub enum ExperimentalFeature {
 	Files,
 	/// Enable Surrealism feature.
 	Surrealism,
+	/// Enable the GQL query language.
+	Gql,
 }
 
 /// Not public API
@@ -53,6 +55,7 @@ impl From<&ExperimentalFeature> for ExperimentalTarget {
 		match feature {
 			ExperimentalFeature::Files => ExperimentalTarget::Files,
 			ExperimentalFeature::Surrealism => ExperimentalTarget::Surrealism,
+			ExperimentalFeature::Gql => ExperimentalTarget::Gql,
 		}
 	}
 }
@@ -207,7 +210,7 @@ impl Capabilities {
 		}
 	}
 
-	/// Set wether to enable live query notifications.
+	/// Set whether to enable live query notifications.
 	pub fn with_live_query_notifications(self, enabled: bool) -> Self {
 		Self {
 			cap: self.cap.with_live_query_notifications(enabled),

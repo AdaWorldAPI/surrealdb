@@ -6,16 +6,18 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use futures::StreamExt;
 use tracing::instrument;
 
+use super::common::resolve_version_stamp;
 use super::pipeline::{ScanPipeline, build_field_state, eval_limit_expr, kv_scan_stream};
 use super::resolved::ResolvedTableContext;
 use crate::exec::permission::{
-	PhysicalPermission, convert_permission_to_physical, should_check_perms,
+	PhysicalPermission, convert_permission_to_physical_runtime, should_check_perms,
 	validate_record_user_access,
 };
+use crate::exec::pre_decode_filter::{PreDecodeFilterStatus, pre_decode_filter_for_execute};
+use crate::exec::topk_pushdown::{TopKPushdownStatus, topk_probe_for_execute};
 use crate::exec::{
 	AccessMode, ContextLevel, ExecOperator, ExecutionContext, FlowResult, OperatorMetrics,
 	OutputOrdering, PhysicalExpr, ValueBatch, ValueBatchStream, monitor_stream,
@@ -47,6 +49,10 @@ pub struct TableScan {
 	/// Plan-time resolved table context. When present, `execute()` skips
 	/// all runtime metadata lookups (table def, permissions, field state).
 	pub(crate) resolved: Option<ResolvedTableContext>,
+	/// Predicate pre-decode filter status (plan-time); see [`PreDecodeFilterStatus`].
+	pub(crate) pre_decode_filter_status: PreDecodeFilterStatus,
+	/// TopK threshold pushdown status (plan-time); see [`TopKPushdownStatus`].
+	pub(crate) topk_pushdown_status: TopKPushdownStatus,
 	pub(crate) metrics: Arc<OperatorMetrics>,
 }
 
@@ -69,6 +75,8 @@ impl TableScan {
 			start,
 			needed_fields,
 			resolved: None,
+			pre_decode_filter_status: PreDecodeFilterStatus::NotApplicable,
+			topk_pushdown_status: TopKPushdownStatus::NotApplicable,
 			metrics: Arc::new(OperatorMetrics::new()),
 		}
 	}
@@ -78,10 +86,19 @@ impl TableScan {
 		self.resolved = Some(resolved);
 		self
 	}
-}
 
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
+	/// Set plan-time pre-decode filter status for EXPLAIN and execution.
+	pub(crate) fn with_pre_decode_filter(mut self, status: PreDecodeFilterStatus) -> Self {
+		self.pre_decode_filter_status = status;
+		self
+	}
+
+	/// Set plan-time TopK threshold pushdown status for EXPLAIN and execution.
+	pub(crate) fn with_topk_pushdown(mut self, status: TopKPushdownStatus) -> Self {
+		self.topk_pushdown_status = status;
+		self
+	}
+}
 impl ExecOperator for TableScan {
 	fn name(&self) -> &'static str {
 		"TableScan"
@@ -98,6 +115,12 @@ impl ExecOperator for TableScan {
 		}
 		if let Some(ref start) = self.start {
 			attrs.push(("offset".to_string(), start.to_sql()));
+		}
+		if let Some(s) = self.pre_decode_filter_status.explain_text() {
+			attrs.push(("pre_decode_filter".to_string(), s.to_string()));
+		}
+		if let Some(s) = self.topk_pushdown_status.explain_text() {
+			attrs.push(("topk_pushdown".to_string(), s.to_string()));
 		}
 		attrs
 	}
@@ -154,6 +177,9 @@ impl ExecOperator for TableScan {
 		let limit_expr = self.limit.clone();
 		let start_expr = self.start.clone();
 		let needed_fields = self.needed_fields.clone();
+		let pre_decode_filter_status = self.pre_decode_filter_status.clone();
+		let topk_pushdown_status = self.topk_pushdown_status.clone();
+		let metrics = Arc::clone(&self.metrics);
 		let ctx = ctx.clone();
 
 		let stream = async_stream::try_stream! {
@@ -172,23 +198,10 @@ impl ExecOperator for TableScan {
 				None => 0,
 			};
 
-			// Evaluate VERSION expression
-			let version: Option<u64> = match &version_expr {
-				Some(expr) => {
-					let eval_ctx = crate::exec::EvalContext::from_exec_ctx(&ctx);
-					let v = expr.evaluate(eval_ctx).await?;
-					Some(
-						v.cast_to::<crate::val::Datetime>()
-							.map_err(|e| anyhow::anyhow!("{e}"))?
-							.to_version_stamp(txn.timestamp_impl().as_ref())?,
-					)
-				}
-				None => ctx.version_stamp(),
-			};
-
-			if limit_val == Some(0) {
-				return;
-			}
+			// Resolve VERSION timestamp; see [`resolve_version_stamp`] for
+			// why we prefer the stamp already set by the enclosing
+			// `VersionScope` over re-evaluating `version_expr` here.
+			let version: Option<u64> = resolve_version_stamp(&ctx, version_expr.as_ref()).await?;
 
 			// Resolve table metadata: plan-time fast path or runtime fallback
 			let (select_permission, field_state) = if let Some(ref res) = resolved {
@@ -215,7 +228,8 @@ impl ExecOperator for TableScan {
 						Some(def) => def.permissions.select.clone(),
 						None => crate::catalog::Permission::None,
 					};
-					convert_permission_to_physical(&catalog_perm, ctx.ctx()).await
+					convert_permission_to_physical_runtime(&catalog_perm, ctx.ctx())
+						.await
 						.context("Failed to convert permission")?
 				} else {
 					PhysicalPermission::Allow
@@ -232,6 +246,10 @@ impl ExecOperator for TableScan {
 				return;
 			}
 
+			if limit_val == Some(0) {
+				return;
+			}
+
 			// Row-filtering (permissions, WHERE) prevents positional pushdown;
 			// row-modifying ops (computed fields, field perms) do not.
 			let needs_row_filtering = ScanPipeline::compute_needs_row_filtering(
@@ -243,10 +261,23 @@ impl ExecOperator for TableScan {
 
 			let beg = record::prefix(ns.namespace_id, db.database_id, &table_name)?;
 			let end = record::suffix(ns.namespace_id, db.database_id, &table_name)?;
-			let prefetch = effective_storage_limit.is_none();
+			let limit_hint = limit_val.map(|l| (l + start_val).try_into().unwrap_or(u32::MAX));
+			let pre_decode_filter = pre_decode_filter_for_execute(
+				&pre_decode_filter_status,
+				&field_state,
+				check_perms,
+				ctx.ctx().config.idiom_recursion_limit,
+			);
+			let topk_probe = topk_probe_for_execute(
+				&topk_pushdown_status,
+				&field_state,
+				check_perms,
+				&metrics,
+			);
 			let mut source = kv_scan_stream(
 				Arc::clone(&txn), beg, end, version,
-				effective_storage_limit, direction, pre_skip, prefetch,
+				effective_storage_limit, direction, pre_skip, limit_hint,
+				pre_decode_filter, topk_probe,
 			);
 
 			let mut pipeline = ScanPipeline::new(

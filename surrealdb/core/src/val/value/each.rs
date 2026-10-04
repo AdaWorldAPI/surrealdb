@@ -27,7 +27,7 @@ impl Value {
 			// Current path part is an object
 			Value::Object(v) => match first {
 				Part::Field(f) => {
-					if let Some(v) = v.get(&**f) {
+					if let Some(v) = v.get(f) {
 						accum.push(Part::Field(f.clone()));
 						v._each(rest, accum, build);
 						accum.pop();
@@ -62,13 +62,52 @@ impl Value {
 					let len = v.len();
 					if len > 0 {
 						accum.push(Part::index_int(len as i64 - 1));
-						v[len]._each(rest, accum, build);
+						v[len - 1]._each(rest, accum, build);
 						accum.pop();
 					}
 				}
 				x => {
 					if let Some(idx) = x.as_old_index() {
 						if let Some(v) = v.get(idx) {
+							accum.push(x.clone());
+							v._each(rest, accum, build);
+							accum.pop();
+						}
+					} else {
+						for (idx, v) in v.iter().enumerate() {
+							accum.push(Part::index_int(idx as i64));
+							v._each(rest, accum, build);
+							accum.pop();
+						}
+					}
+				}
+			},
+			// Current path part is a set
+			Value::Set(v) => match first {
+				Part::All => {
+					for (idx, v) in v.iter().enumerate() {
+						accum.push(Part::index_int(idx as i64));
+						v._each(rest, accum, build);
+						accum.pop();
+					}
+				}
+				Part::First => {
+					if let Some(v) = v.first() {
+						accum.push(Part::First);
+						v._each(rest, accum, build);
+						accum.pop();
+					}
+				}
+				Part::Last => {
+					if let Some(v) = v.last() {
+						accum.push(Part::Last);
+						v._each(rest, accum, build);
+						accum.pop();
+					}
+				}
+				x => {
+					if let Some(idx) = x.as_old_index() {
+						if let Some(v) = v.nth(idx) {
 							accum.push(x.clone());
 							v._each(rest, accum, build);
 							accum.pop();
@@ -202,5 +241,35 @@ mod tests {
 		];
 
 		assert_eq!(res, val.each(&Idiom::from(syn::idiom("test.*.color").unwrap())));
+	}
+
+	/// Regression test for an off-by-one in the `Part::Last` arm of the array branch: the earlier
+	/// code indexed `v[len]` (one past the last valid index), so any `idiom[$]` traversal of a
+	/// non-empty array panicked via `<[T]>::index`. Now it reads `v[len - 1]` and yields the
+	/// idiom pointing at the final element.
+	#[test]
+	fn each_array_last() {
+		let idi: Idiom = syn::idiom("test.something[$]").unwrap().into();
+		let val = parse_val!("{ test: { something: [{ age: 34 }, { age: 36 }, { age: 42 }] } }");
+		let res: Vec<Idiom> = vec![syn::idiom("test.something[2]").unwrap().into()];
+		assert_eq!(res, val.each(&idi));
+		assert_eq!(val.pick(&res[0]), parse_val!("{ age: 42 }"));
+	}
+
+	/// `Part::Last` on an empty array must resolve to no idioms and must not panic.
+	#[test]
+	fn each_array_last_empty() {
+		let idi: Idiom = syn::idiom("test.something[$]").unwrap().into();
+		let val = parse_val!("{ test: { something: [] } }");
+		assert_eq!(val.each(&idi), Vec::<Idiom>::new());
+	}
+
+	#[test]
+	fn each_set_last() {
+		let idi: Idiom = syn::idiom("tags[$]").unwrap().into();
+		let val = parse_val!("{ tags: {1, 3, 5} }");
+		let res: Vec<Idiom> = vec![syn::idiom("tags[$]").unwrap().into()];
+		assert_eq!(res, val.each(&idi));
+		assert_eq!(val.pick(&res[0]), Value::from(5));
 	}
 }

@@ -5,18 +5,20 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use filter::Filter;
 use reblessive::tree::Stk;
+use surrealdb_strand::Strand;
 use surrealdb_types::ToSql;
 
 use crate::catalog;
 use crate::ctx::FrozenContext;
 use crate::dbs::Options;
 use crate::err::Error;
-use crate::expr::{FlowResultExt as _, Function};
+use crate::expr::FlowResultExt as _;
 use crate::idx::ft::analyzer::filter::FilteringStage;
 use crate::idx::ft::analyzer::tokenizer::{Tokenizer, Tokens};
 use crate::idx::ft::offset::Offset;
 use crate::idx::ft::{DocLength, TermFrequency};
 use crate::idx::trees::store::IndexStores;
+use crate::sql::analyzer_function::{function_from_storage, qualified_name};
 use crate::val::Value;
 
 pub(in crate::idx::ft) mod filter;
@@ -52,7 +54,9 @@ impl Analyzer {
 		Ok(tks)
 	}
 
-	/// Was marked recursive
+	/// Tokenise a single `Value` into `tks`. Strings, numbers, and booleans
+	/// contribute their tokens directly; arrays and objects recurse into their
+	/// elements; other variants are ignored.
 	pub(super) async fn analyze_value(
 		&self,
 		stk: &mut Stk,
@@ -65,10 +69,10 @@ impl Analyzer {
 		match val {
 			Value::String(s) => tks.push(self.generate_tokens(stk, ctx, opt, stage, s).await?),
 			Value::Number(n) => {
-				tks.push(self.generate_tokens(stk, ctx, opt, stage, n.to_sql()).await?)
+				tks.push(self.generate_tokens(stk, ctx, opt, stage, n.to_sql().into()).await?)
 			}
 			Value::Bool(b) => {
-				tks.push(self.generate_tokens(stk, ctx, opt, stage, b.to_sql()).await?)
+				tks.push(self.generate_tokens(stk, ctx, opt, stage, b.to_sql().into()).await?)
 			}
 			Value::Array(a) => {
 				for v in a.0 {
@@ -91,22 +95,25 @@ impl Analyzer {
 		ctx: &FrozenContext,
 		opt: &Options,
 		stage: FilteringStage,
-		mut input: String,
+		input: Strand,
 	) -> Result<Tokens> {
-		if let Some(function_name) = self.az.function.as_ref().map(|i| i.as_str().to_owned()) {
-			let val = Function::Custom(function_name.clone())
+		let input = if let Some(function_name) = self.az.function.as_ref().map(|i| i.to_string()) {
+			let display_name = qualified_name(&function_name);
+			let val = function_from_storage(&function_name)
 				.compute(stk, ctx, opt, None, vec![Value::String(input)])
 				.await
 				.catch_return()?;
 			if let Value::String(val) = val {
-				input = val;
+				val
 			} else {
 				bail!(Error::InvalidFunction {
-					name: function_name,
+					name: display_name,
 					message: "The function should return a string.".to_string(),
 				});
 			}
-		}
+		} else {
+			input
+		};
 		if input.is_empty() {
 			return Ok(Tokens::new(input));
 		}
@@ -125,7 +132,7 @@ impl Analyzer {
 		stk: &mut Stk,
 		ctx: &FrozenContext,
 		opt: &Options,
-		input: String,
+		input: Strand,
 	) -> Result<Value> {
 		self.generate_tokens(stk, ctx, opt, FilteringStage::Indexing, input).await?.try_into()
 	}
@@ -174,7 +181,7 @@ mod tests {
 	use std::sync::Arc;
 
 	use super::Analyzer;
-	use crate::cnf::dynamic::DynamicConfiguration;
+	use crate::cnf::CommonConfig;
 	use crate::ctx::Context;
 	use crate::dbs::Options;
 	use crate::expr::DefineAnalyzerStatement;
@@ -202,7 +209,7 @@ mod tests {
 
 		let mut stack = reblessive::TreeStack::new();
 
-		let opts = Options::new(ds.id(), DynamicConfiguration::default());
+		let opts = Options::new(&CommonConfig::default());
 		stack
 			.enter(|stk| async move {
 				let a = Analyzer::new(
@@ -216,8 +223,7 @@ mod tests {
 				)
 				.unwrap();
 
-				a.generate_tokens(stk, &ctx, &opts, FilteringStage::Indexing, input.to_string())
-					.await
+				a.generate_tokens(stk, &ctx, &opts, FilteringStage::Indexing, input.into()).await
 			})
 			.finish()
 			.await

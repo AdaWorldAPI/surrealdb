@@ -1,6 +1,5 @@
 use ahash::HashSet;
 use anyhow::{Result, bail};
-use futures::StreamExt;
 use reblessive::tree::Stk;
 use revision::revisioned;
 use roaring::RoaringTreemap;
@@ -15,7 +14,7 @@ use crate::idx::trees::graph::UndirectedGraph;
 use crate::idx::trees::hnsw::filter::HnswTruthyDocumentFilter;
 use crate::idx::trees::hnsw::heuristic::Heuristic;
 use crate::idx::trees::hnsw::index::HnswContext;
-use crate::idx::trees::hnsw::{ElementId, HnswElements, HnswSearch};
+use crate::idx::trees::hnsw::{ElementId, HnswElements, HnswSearch, VectorId};
 use crate::idx::trees::knn::{DoublePriorityQueue, Ids64};
 use crate::idx::trees::vector::SharedVector;
 use crate::key::index::hn::HnswNode;
@@ -56,7 +55,7 @@ where
 		self.m_max
 	}
 
-	pub(super) fn get_edges(&self, e_id: &ElementId) -> Option<&S> {
+	pub(super) fn get_edges(&self, e_id: ElementId) -> Option<&S> {
 		self.graph.get_edges(e_id)
 	}
 
@@ -85,7 +84,17 @@ where
 	) -> Result<DoublePriorityQueue> {
 		let visited = HashSet::from_iter([ep_id]);
 		let candidates = DoublePriorityQueue::from(ep_dist, ep_id);
-		let w = candidates.clone();
+		let w = if pending_docs.is_some() {
+			let mut w = DoublePriorityQueue::default();
+			if let Some(ep_pt) = elements.get_vector(&ctx.tx, &ep_id).await?
+				&& !Self::are_all_docs_in_pending(ctx, ep_id, &ep_pt, pending_docs).await?
+			{
+				w.push(ep_dist, ep_id);
+			}
+			w
+		} else {
+			candidates.clone()
+		};
 		self.search(ctx, elements, pt, candidates, visited, w, ef, pending_docs).await
 	}
 
@@ -197,7 +206,7 @@ where
 			if cq_dist > fq_dist {
 				break;
 			}
-			if let Some(neighbourhood) = self.graph.get_edges(&doc) {
+			if let Some(neighbourhood) = self.graph.get_edges(doc) {
 				for &e_id in neighbourhood.iter() {
 					// Did we already visit it?
 					if !visited.insert(e_id) {
@@ -206,9 +215,11 @@ where
 					if let Some(e_pt) = elements.get_vector(&ctx.tx, &e_id).await? {
 						let e_dist = elements.distance(&e_pt, q);
 						if e_dist < fq_dist || w.len() < ef {
-							if !Self::are_all_docs_in_pending(ctx, &e_pt, pending_docs).await? {
-								candidates.push(e_dist, e_id);
+							if Self::are_all_docs_in_pending(ctx, e_id, &e_pt, pending_docs).await?
+							{
+								continue;
 							}
+							candidates.push(e_dist, e_id);
 							w.push(e_dist, e_id);
 							if w.len() > ef {
 								w.pop_last();
@@ -241,7 +252,24 @@ where
 			if dist > f_dist {
 				break;
 			}
-			if let Some(neighbourhood) = self.graph.get_edges(&doc) {
+			if let Some(neighbourhood) = self.graph.get_edges(doc) {
+				// Warm the transaction record cache for this neighbourhood's
+				// filter-eligible candidates in one batch, so the per-candidate
+				// `get_record` calls inside `add_if_truthy` below become cache
+				// hits instead of each issuing an individual round-trip. The loop
+				// itself is left unchanged, so results are identical.
+				self.prefetch_neighbourhood_records(
+					ctx,
+					elements,
+					search,
+					neighbourhood,
+					&visited,
+					w.len(),
+					f_dist,
+					filter,
+					pending_docs,
+				)
+				.await?;
 				for &e_id in neighbourhood.iter() {
 					// Did we already visit it?
 					if !visited.insert(e_id) {
@@ -274,6 +302,67 @@ where
 		Ok(w)
 	}
 
+	/// Prefetches the records of a popped node's filter-eligible neighbours in a
+	/// single batch, warming the transaction cache before the (unchanged)
+	/// evaluation loop in [`Self::search_with_filter`] reads them one by one.
+	///
+	/// Only neighbours that are unvisited and pass the distance gate — using the
+	/// `f_dist` / `w_len` captured at the *start* of this neighbourhood — are
+	/// considered. That start-of-neighbourhood gate is the loosest the loop will
+	/// use: while `w` is below `ef` the `w_len < ef` term holds unconditionally
+	/// (so `f_dist`, which can transiently rise in that phase, is irrelevant), and
+	/// once `w` is full `f_dist` only decreases — so the loop's evolving gate is
+	/// always a subset. The collected set is therefore a superset of what the loop
+	/// fetches, so every record it needs is already cached. Over-collecting never
+	/// affects correctness, but it is not free: a candidate the evolving gate
+	/// later skips still has its record pulled in this batch (the old one-by-one
+	/// path skipped such candidates *before* fetching), so this trades fewer
+	/// round-trips for potentially more total record bytes read — a win only on
+	/// latency-bound backends. Doc-sets are resolved cache-first and pending-only
+	/// elements are skipped, mirroring [`Self::add_if_truthy`].
+	#[expect(clippy::too_many_arguments)]
+	async fn prefetch_neighbourhood_records(
+		&self,
+		ctx: &HnswContext<'_>,
+		elements: &HnswElements,
+		search: &HnswSearch,
+		neighbourhood: &S,
+		visited: &HashSet<ElementId>,
+		w_len: usize,
+		f_dist: f64,
+		filter: &mut HnswTruthyDocumentFilter<'_>,
+		pending_docs: Option<&RoaringTreemap>,
+	) -> Result<()> {
+		let mut ids: Vec<VectorId> = Vec::new();
+		for &e_id in neighbourhood.iter() {
+			if visited.contains(&e_id) {
+				continue;
+			}
+			let Some(e_pt) = elements.get_vector(&ctx.tx, &e_id).await? else {
+				continue;
+			};
+			let e_dist = elements.distance(&e_pt, &search.pt);
+			// Same gate as the evaluation loop, but against the f_dist / w.len()
+			// captured at the start of this neighbourhood — the loosest form (see
+			// the method doc), so the collected set is a superset of the loop's.
+			if !(e_dist < f_dist || w_len < search.ef) {
+				continue;
+			}
+			let Some(docs) = ctx.vec_docs.get_docs_by_element(&ctx.tx, e_id, &e_pt).await? else {
+				continue;
+			};
+			if let Some(pending_docs) = pending_docs
+				&& Self::check_all_docs_in_pending(&docs, pending_docs)
+			{
+				continue;
+			}
+			for doc_id in docs.iter() {
+				ids.push(VectorId::DocId(doc_id));
+			}
+		}
+		filter.prefetch_records(ctx, &ids).await
+	}
+
 	#[expect(clippy::too_many_arguments)]
 	pub(super) async fn add_if_truthy(
 		ctx: &HnswContext<'_>,
@@ -286,7 +375,7 @@ where
 		filter: &mut HnswTruthyDocumentFilter<'_>,
 		pending_docs: Option<&RoaringTreemap>,
 	) -> Result<bool> {
-		if let Some(docs) = ctx.vec_docs.get_docs(&ctx.tx, e_pt).await? {
+		if let Some(docs) = ctx.vec_docs.get_docs_by_element(&ctx.tx, e_id, e_pt).await? {
 			if let Some(pending_docs) = pending_docs
 				// Check all these docs are currently updated the pending
 				&& Self::check_all_docs_in_pending(&docs, pending_docs)
@@ -319,6 +408,7 @@ where
 
 	async fn are_all_docs_in_pending(
 		search_ctx: &HnswContext<'_>,
+		e_id: ElementId,
 		e_pt: &SharedVector,
 		pending_docs: Option<&RoaringTreemap>,
 	) -> Result<bool> {
@@ -328,7 +418,9 @@ where
 		if pending_docs.is_empty() {
 			return Ok(false);
 		}
-		if let Some(docs) = search_ctx.vec_docs.get_docs(&search_ctx.tx, e_pt).await? {
+		if let Some(docs) =
+			search_ctx.vec_docs.get_docs_by_element(&search_ctx.tx, e_id, e_pt).await?
+		{
 			for doc_id in docs.iter() {
 				if !pending_docs.contains(doc_id) {
 					return Ok(false);
@@ -360,7 +452,7 @@ where
 		let neighbors = self.graph.add_node_and_bidirectional_edges(q_id, neighbors);
 
 		for e_id in &neighbors {
-			if let Some(e_conn) = self.graph.get_edges(e_id) {
+			if let Some(e_conn) = self.graph.get_edges(*e_id) {
 				if e_conn.len() > self.m_max
 					&& let Some(e_pt) = elements.get_vector(&ctx.tx, e_id).await?
 				{
@@ -414,7 +506,7 @@ where
 		e_id: ElementId,
 		efc: usize,
 	) -> Result<bool> {
-		if let Some(f_ids) = self.graph.remove_node_and_bidirectional_edges(&e_id) {
+		if let Some(f_ids) = self.graph.remove_node_and_bidirectional_edges(e_id) {
 			let mut changed_nodes = Vec::with_capacity(f_ids.len());
 			for &q_id in f_ids.iter() {
 				if let Some(q_pt) = elements.get_vector(&ctx.tx, &q_id).await? {
@@ -468,7 +560,7 @@ where
 		nodes: &[ElementId],
 	) -> Result<()> {
 		for &node_id in nodes {
-			if let Some(val) = self.graph.node_to_val(&node_id) {
+			if let Some(val) = self.graph.node_to_val(node_id) {
 				let key = self.ikb.new_hn_key(self.level, node_id);
 				tx.set(&key, &val).await?;
 			}
@@ -525,19 +617,23 @@ where
 		// for each node and take precedence over the Hl data loaded above.
 		let range = self.ikb.new_hn_layer_range(self.level)?;
 		let mut count = 0;
-		let mut stream = tx.stream_keys_vals(range, None, None, 0, ScanDirection::Forward, false);
-		while let Some(res) = stream.next().await {
-			let batch = res?;
-			for (k, v) in batch {
+		let mut cursor = tx.open_vals_cursor(range, ScanDirection::Forward, 0, None).await?;
+		loop {
+			let batch = cursor.next_batch(crate::kvs::NORMAL_BATCH_SIZE).await?;
+			if batch.is_empty() {
+				break;
+			}
+			for (k, v) in &batch {
 				// Check if the context is finished
 				if ctx.is_done(Some(count)).await? {
 					bail!(Error::QueryCancelled);
 				}
-				let key = HnswNode::decode_key(&k)?;
-				self.graph.load_node(key.node, &v);
+				let key = HnswNode::decode_key(k)?;
+				self.graph.load_node(key.node, v);
 				count += 1;
 			}
 		}
+		drop(cursor);
 
 		// If we can write, complete the migration:
 		// persist every node as an Hn key and remove the old Hl chunk keys.
@@ -546,7 +642,7 @@ where
 			// are rewritten with the same data (their state was overlaid onto
 			// the graph in the streaming step above).
 			for &node_id in &self.graph.node_ids() {
-				if let Some(node_val) = self.graph.node_to_val(&node_id) {
+				if let Some(node_val) = self.graph.node_to_val(node_id) {
 					let key = self.ikb.new_hn_key(self.level, node_id);
 					tx.set(&key, &node_val).await?;
 				}

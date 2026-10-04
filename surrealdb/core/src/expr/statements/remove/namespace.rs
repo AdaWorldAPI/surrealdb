@@ -1,6 +1,7 @@
 use anyhow::Result;
 use reblessive::tree::Stk;
 
+use super::retire_namespace_indexes;
 use crate::catalog::providers::NamespaceProvider;
 use crate::ctx::FrozenContext;
 use crate::dbs::Options;
@@ -37,7 +38,7 @@ impl RemoveNamespaceStatement {
 		doc: Option<&CursorDoc>,
 	) -> Result<Value> {
 		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Namespace, &Base::Root)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Namespace, Base::Root)?;
 		// Get the transaction
 		let txn = ctx.tx();
 		// Compute the name
@@ -56,25 +57,22 @@ impl RemoveNamespaceStatement {
 			}
 		};
 
-		// Remove the index stores
-		ctx.get_index_stores()
-			.namespace_removed(ctx.get_index_builder(), &txn, ns.namespace_id)
-			.await?;
+		// Retire index state before deleting the namespace definition. Durable
+		// cleanup is transactional; local builder aborts are deferred until commit.
+		retire_namespace_indexes(ctx, &txn, ns.namespace_id).await?;
 		// Remove the sequences
 		if let Some(seq) = ctx.get_sequences() {
 			seq.namespace_removed(&txn, ns.namespace_id).await?;
 		}
 
-		// Delete the definition
-		let key = crate::key::root::ns::new(&ns.name);
-		let namespace_root = crate::key::namespace::all::new(ns.namespace_id);
-		if self.expunge {
-			txn.clr(&key).await?;
-			txn.clrp(&namespace_root).await?;
-		} else {
-			txn.del(&key).await?;
-			txn.delp(&namespace_root).await?;
-		};
+		// Delete the catalog definition and enqueue the data for background
+		// reclaim. Only the small catalog entry is removed in this transaction
+		// (so the namespace is immediately unreachable); the potentially huge
+		// `/*{ns}` data prefix is destroyed asynchronously by
+		// `Datastore::reclaim_tombstones`. This keeps `REMOVE NAMESPACE` fast
+		// and bounded regardless of how much data the namespace holds, and a
+		// rollback undoes the removal without having destroyed any data.
+		txn.del_ns_deferred(&ns.name, self.expunge).await?;
 
 		// Clear the cache
 		if let Some(cache) = ctx.get_cache() {

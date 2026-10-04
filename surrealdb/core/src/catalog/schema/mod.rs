@@ -55,6 +55,15 @@ impl Permission {
 		matches!(self, Self::Specific(_))
 	}
 
+	/// Whether this permission clause directly contains a data-modifying
+	/// statement, which is not allowed (GHSA-66r2-5gwj-gxm2).
+	pub(crate) fn has_direct_write(&self) -> bool {
+		match self {
+			Permission::None | Permission::Full => false,
+			Permission::Specific(e) => e.has_direct_write(),
+		}
+	}
+
 	fn to_sql_definition(&self) -> crate::sql::Permission {
 		match self {
 			Permission::None => crate::sql::Permission::None,
@@ -105,18 +114,27 @@ impl Permissions {
 		}
 	}
 
-	pub fn to_sql_definition(&self) -> crate::sql::Permissions {
+	pub(crate) fn to_sql_definition(&self) -> crate::sql::Permissions {
 		self.clone().into()
+	}
+
+	/// Whether any of the select/create/update/delete clauses directly contains
+	/// a data-modifying statement (GHSA-66r2-5gwj-gxm2).
+	pub(crate) fn has_direct_write(&self) -> bool {
+		self.select.has_direct_write()
+			|| self.create.has_direct_write()
+			|| self.update.has_direct_write()
+			|| self.delete.has_direct_write()
 	}
 }
 
 impl InfoStructure for Permissions {
 	fn structure(self) -> Value {
 		Value::from(map! {
-			"select".to_string() => self.select.structure(),
-			"create".to_string() => self.create.structure(),
-			"update".to_string() => self.update.structure(),
-			"delete".to_string() => self.delete.structure(),
+			"select" => self.select.structure(),
+			"create" => self.create.structure(),
+			"update" => self.update.structure(),
+			"delete" => self.delete.structure(),
 		})
 	}
 }

@@ -71,8 +71,26 @@ pub async fn process_api_request_with_stack(
 	api: &ApiDefinition,
 	req: ApiRequest,
 ) -> Result<ApiResponse> {
-	// TODO: Figure out if it is possible if multiple actions can have the same
-	// method, and if so should they all be run?
+	// Tenant-boundary enforcement. The API handler ultimately runs with
+	// permissions disabled, so reaching it for a namespace/database the caller
+	// is not authenticated for is a cross-tenant authorization bypass. The
+	// selected ns/db can be steered by caller-controlled input — the URL path
+	// on the HTTP route, or session headers / `USE` for `api::invoke` — so the
+	// authenticated level is the only trustworthy scope. Both entry points
+	// converge here, making this the authoritative gate (GHSA-848m-r628-vrxw).
+	let (ns_name, db_name) = opt.ns_db()?;
+	if !opt.auth.can_access_ns_db(ns_name, db_name) {
+		trace!(
+			request_id = %req.request_id,
+			"API request denied: selected namespace/database is outside the authenticated session scope"
+		);
+		return Ok(ApiResponse::from_error(ApiError::PermissionDenied, req.request_id.clone()));
+	}
+
+	// `DefineApiStatement::compute` rejects duplicate methods across `FOR`
+	// clauses and `AlterApiStatement::compute` strips a method from any
+	// pre-existing action before adding a new one for it, so at most one
+	// stored action contains a given `ApiMethod`. `find` is the right matcher.
 	let method_action = api.actions.iter().find(|x| x.methods.contains(&req.method));
 
 	let (action_expr, method_config) = match (method_action, &api.fallback) {
@@ -85,7 +103,7 @@ pub async fn process_api_request_with_stack(
 				method = ?req.method,
 				"No matching handler or fallback for API request"
 			);
-			let res = ApiResponse::from_error(ApiError::NotFound.into(), req.request_id.clone());
+			let res = ApiResponse::from_error(ApiError::NotFound, req.request_id.clone());
 			return Ok(res);
 		}
 	};
@@ -95,7 +113,7 @@ pub async fn process_api_request_with_stack(
 	let global = global_entry.as_ref().map(|v| v.try_as_api()).transpose()?;
 
 	// Check permissions
-	if opt.check_perms(Action::Edit)? {
+	if ctx.check_perms(opt, Action::Edit)? {
 		let permissions: Vec<&Permission> = method_config
 			.map(|config| &config.permissions)
 			.into_iter()
@@ -111,16 +129,14 @@ pub async fn process_api_request_with_stack(
 						request_id = %req.request_id,
 						"API request denied by PERMISSIONS NONE"
 					);
-					let res = ApiResponse::from_error(
-						ApiError::PermissionDenied.into(),
-						req.request_id.clone(),
-					);
+					let res =
+						ApiResponse::from_error(ApiError::PermissionDenied, req.request_id.clone());
 					return Ok(res);
 				}
 				Permission::Full => (),
 				Permission::Specific(e) => {
-					// Disable permissions
-					let opt = &opt.new_with_perms(false);
+					// Disable permission recursion and block side effects
+					let opt = &opt.new_for_permission_predicate();
 					// Process the PERMISSION clause
 					if !stk
 						.run(|stk| e.compute(stk, ctx, opt, None))
@@ -133,7 +149,7 @@ pub async fn process_api_request_with_stack(
 							"API request denied by PERMISSIONS WHERE clause"
 						);
 						let res = ApiResponse::from_error(
-							ApiError::PermissionDenied.into(),
+							ApiError::PermissionDenied,
 							req.request_id.clone(),
 						);
 						return Ok(res);
@@ -274,7 +290,7 @@ fn create_middleware_closure(
 					Err(_e) => {
 						return Box::pin(std::future::ready(Err(
 							ApiError::MiddlewareRequestParseFailure {
-								middleware: def.name,
+								middleware: def.name.to_string(),
 							}
 							.into(),
 						)));
@@ -282,18 +298,21 @@ fn create_middleware_closure(
 				};
 
 			// Parse function name - use ctx parameter directly
-			let function: crate::expr::Function =
-				match function_with_capabilities(&def.name, ctx.get_capabilities().as_ref()) {
-					Ok(f) => f.into(),
-					Err(_e) => {
-						return Box::pin(std::future::ready(Err(
-							ApiError::MiddlewareFunctionNotFound {
-								function: def.name.clone(),
-							}
-							.into(),
-						)));
-					}
-				};
+			let function: crate::expr::Function = match function_with_capabilities(
+				def.name.as_str(),
+				ctx.get_capabilities().as_ref(),
+				&ctx.config,
+			) {
+				Ok(f) => f.into(),
+				Err(_e) => {
+					return Box::pin(std::future::ready(Err(
+						ApiError::MiddlewareFunctionNotFound {
+							function: def.name.to_string(),
+						}
+						.into(),
+					)));
+				}
+			};
 
 			// Enforce request ID in request headers & object (prevent user modification)
 			req.request_id.clone_from(&request_id);

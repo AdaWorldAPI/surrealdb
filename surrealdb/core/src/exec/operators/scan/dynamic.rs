@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use futures::StreamExt;
 use tracing::instrument;
 
@@ -14,13 +13,14 @@ use crate::exec::index::access_path::{AccessPath, select_access_path};
 use crate::exec::index::analysis::IndexAnalyzer;
 use crate::exec::operators::scan::pipeline::ScanPipeline;
 use crate::exec::permission::{
-	PhysicalPermission, convert_permission_to_physical, should_check_perms,
+	PhysicalPermission, convert_permission_to_physical_runtime, should_check_perms,
 	validate_record_user_access,
 };
 use crate::exec::planner::util::{
 	SELECT_ITERATION_PARAMS, fold_condition_expressions, index_covers_ordering,
 	resolve_condition_params, resolve_projection_field_idioms, strip_knn_from_condition,
 };
+use crate::exec::pre_decode_filter::{PreDecodeFilterStatus, pre_decode_filter_for_execute};
 use crate::exec::{
 	AccessMode, ContextLevel, EvalContext, ExecOperator, ExecutionContext, FlowResult,
 	OperatorMetrics, PhysicalExpr, ValueBatch, ValueBatchStream, monitor_stream,
@@ -77,6 +77,8 @@ pub struct DynamicScan {
 	/// KNN distance context, shared with IndexFunctionExec for vector::distance::knn().
 	/// Populated by KnnScan during execution.
 	pub(crate) knn_context: Option<Arc<crate::exec::function::KnnContext>>,
+	/// Predicate pre-decode filter status (plan-time); see [`PreDecodeFilterStatus`].
+	pub(crate) pre_decode_filter_status: PreDecodeFilterStatus,
 }
 
 impl DynamicScan {
@@ -105,7 +107,14 @@ impl DynamicScan {
 			start,
 			metrics: Arc::new(OperatorMetrics::new()),
 			knn_context: None,
+			pre_decode_filter_status: PreDecodeFilterStatus::NotApplicable,
 		}
+	}
+
+	/// Set plan-time pre-decode filter status for EXPLAIN and execution.
+	pub(crate) fn with_pre_decode_filter(mut self, status: PreDecodeFilterStatus) -> Self {
+		self.pre_decode_filter_status = status;
+		self
 	}
 
 	/// Set the KNN context for distance propagation.
@@ -117,9 +126,6 @@ impl DynamicScan {
 		self
 	}
 }
-
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl ExecOperator for DynamicScan {
 	fn name(&self) -> &'static str {
 		"DynamicScan"
@@ -135,6 +141,9 @@ impl ExecOperator for DynamicScan {
 		}
 		if let Some(ref start) = self.start {
 			attrs.push(("offset".to_string(), start.to_sql()));
+		}
+		if let Some(s) = self.pre_decode_filter_status.explain_text() {
+			attrs.push(("pre_decode_filter".to_string(), s.to_string()));
 		}
 		attrs
 	}
@@ -217,6 +226,7 @@ impl ExecOperator for DynamicScan {
 		let limit_expr = self.limit.clone();
 		let start_expr = self.start.clone();
 		let knn_context = self.knn_context.clone();
+		let pre_decode_filter_status = self.pre_decode_filter_status.clone();
 		let ctx = ctx.clone();
 
 		let stream = async_stream::try_stream! {
@@ -276,6 +286,7 @@ impl ExecOperator for DynamicScan {
 				let results = super::record_id::execute_record_lookup(
 					&rid, version, check_perms, needed_fields.as_ref(), &ctx,
 					predicate.as_ref(), limit_val, start_val, None,
+					&pre_decode_filter_status,
 				).await?;
 
 				if !results.is_empty() {
@@ -385,11 +396,6 @@ impl ExecOperator for DynamicScan {
 				None => 0,
 			};
 
-			// Early exit if limit is 0
-			if limit_val == Some(0) {
-				return;
-			}
-
 			// VERSION stamp for metadata lookups (same evaluation as `resolve_table_scan_stream`).
 			let version_stamp: Option<u64> = match &version {
 				Some(expr) => {
@@ -421,7 +427,8 @@ impl ExecOperator for DynamicScan {
 					Some(def) => def.permissions.select.clone(),
 					None => Permission::None,
 				};
-				convert_permission_to_physical(&catalog_perm, ctx.ctx()).await
+				convert_permission_to_physical_runtime(&catalog_perm, ctx.ctx())
+					.await
 					.context("Failed to convert permission")?
 			} else {
 				PhysicalPermission::Allow
@@ -432,8 +439,36 @@ impl ExecOperator for DynamicScan {
 				return;
 			}
 
+			if limit_val == Some(0) {
+				return;
+			}
+
 			// Eagerly initialize field state (computed fields + field permissions)
 			let field_state = build_field_state(&ctx, &table_name, check_perms, needed_fields.as_ref()).await?;
+
+			// SECURITY (value-ordering oracle): runtime counterpart to the
+			// plan-time guard in `planner/select`. The plan-time guard only
+			// runs when the access path is resolved at plan time; this
+			// `DynamicScan` is also reached when planning was txn-less or when
+			// plan-time access-path resolution returned `None`/`Err`, and it
+			// resolves the access path below using `order`. If `order` targets
+			// a field the current actor cannot fully read, an index that walks
+			// it in true value order would emit rows in that order; field
+			// reduction then nulls the value, but the row order would still
+			// encode the hidden values' relative ordering. Withholding `order`
+			// here keeps the scan in record-id order and forces the outer Sort
+			// to run over the reduced (NULL) keys. Unlike the plan-time path,
+			// this uses the actor's *resolved* field permissions
+			// (`field_state.field_permissions`, populated only when permissions
+			// are enforced), so it never over-applies to privileged users.
+			let order = if order_touches_restricted_select_field(
+				order.as_ref(),
+				&field_state.field_permissions,
+			) {
+				None
+			} else {
+				order
+			};
 
 			// Row-filtering (permissions, WHERE) prevents positional pushdown;
 			// row-modifying ops (computed fields, field perms) do not.
@@ -449,6 +484,13 @@ impl ExecOperator for DynamicScan {
 			// Create the source stream based on scan type.
 			// `applied_pre_skip` tracks how many rows the source will skip
 			// before decoding, so the pipeline can adjust its start accordingly.
+			let pre_decode_filter = pre_decode_filter_for_execute(
+				&pre_decode_filter_status,
+				&field_state,
+				check_perms,
+				ctx.ctx().config.idiom_recursion_limit,
+			);
+
 			let (mut source, applied_pre_skip) = {
 				// Table scan (with runtime index selection)
 				resolve_table_scan_stream(
@@ -461,10 +503,12 @@ impl ExecOperator for DynamicScan {
 						with,
 						direction,
 						version,
-					storage_limit: effective_storage_limit,
-					pre_skip,
-					has_pushed_limit: effective_storage_limit.is_some(),
-					knn_context: knn_context.clone(),
+						storage_limit: effective_storage_limit,
+						pre_skip,
+						has_pushed_limit: effective_storage_limit.is_some(),
+						limit_hint: limit_val.map(|l| (l + start_val).min(u32::MAX as usize) as u32),
+						knn_context: knn_context.clone(),
+						pre_decode_filter,
 					},
 				).await?
 			};
@@ -502,6 +546,38 @@ impl ExecOperator for DynamicScan {
 // Source helpers
 // ---------------------------------------------------------------------------
 
+/// SECURITY (value-ordering oracle): returns `true` when any top-level
+/// `ORDER BY` idiom references a field carrying a non-`Full` SELECT permission
+/// for the current actor.
+///
+/// `field_permissions` are the per-field SELECT permissions resolved into
+/// [`crate::exec::operators::scan::pipeline::FieldState`]; `Permission::Full`
+/// fields are intentionally absent and the list is empty when permission
+/// enforcement is skipped (owner/root), so a privileged actor never matches
+/// here. The match is shallow — each `Order.value` is a plain top-level idiom
+/// and an index-ordering leak requires the index to cover the field directly,
+/// so a restricted field referenced only inside an idiom filter (e.g.
+/// `ORDER BY foo[WHERE code = …]`) is not an indexable ordering and cannot leak
+/// through this vector. Mirrors the plan-time `RestrictedPrefixes::order_touches`
+/// guard in `planner/select`, including its out-of-scope parent/child
+/// nested-field gap (ordering by a *parent* of a restricted child is not
+/// caught — see that guard's docs).
+fn order_touches_restricted_select_field(
+	order: Option<&Ordering>,
+	field_permissions: &[(crate::expr::Idiom, PhysicalPermission)],
+) -> bool {
+	// `ORDER BY RAND()` references no field and cannot leak ordering.
+	let Some(Ordering::Order(order_list)) = order else {
+		return false;
+	};
+	if field_permissions.is_empty() {
+		return false;
+	}
+	order_list
+		.iter()
+		.any(|o| field_permissions.iter().any(|(field, _)| o.value.starts_with(field.0.as_slice())))
+}
+
 /// Configuration bundle for [`resolve_table_scan_stream`].
 struct TableScanConfig {
 	ns_id: NamespaceId,
@@ -522,8 +598,13 @@ struct TableScanConfig {
 	/// runtime-selected BTree index covers the requested ordering.
 	/// If it doesn't, we fall back to a KV scan for correctness.
 	has_pushed_limit: bool,
+	/// Hint for the scanner's initial batch size, typically `limit + start`.
+	/// Caps the first fetch to avoid over-reading for small-limit queries.
+	limit_hint: Option<u32>,
 	/// KNN distance context for vector::distance::knn() support.
 	knn_context: Option<Arc<crate::exec::function::KnnContext>>,
+	/// Optional structural WHERE pre-decode filter for raw KV table scans.
+	pre_decode_filter: Option<Arc<crate::exec::pre_decode_filter::PreDecodeFilter>>,
 }
 
 /// Resolve the optimal access path for a table scan and return the source
@@ -568,6 +649,19 @@ async fn resolve_table_scan_stream(
 		}
 		None => None,
 	};
+
+	// If the WHERE folded to `false` (e.g. `field IN []` short-circuited by
+	// `fold_condition_expressions`) the SELECT can produce no rows. Skip
+	// index analysis and the KV scan entirely. Mirrors the static planner's
+	// check at `planner/select/mod.rs` so dynamic FROM sources get the same
+	// zero-I/O treatment as static `FROM table` sources.
+	if let Some(c) = resolved_cond.as_ref()
+		&& matches!(&c.0, crate::expr::Expr::Literal(crate::expr::literal::Literal::Bool(false)))
+	{
+		let op = super::EmptyScan::new();
+		let stream = op.execute(ctx)?;
+		return Ok((stream, 0));
+	}
 
 	let access_path = if matches!(&cfg.with, Some(With::NoIndex)) {
 		None
@@ -628,6 +722,7 @@ async fn resolve_table_scan_stream(
 				None,
 				cfg.version,
 				None,
+				None,
 			);
 			let stream = operator.execute(ctx)?;
 			Ok((stream, 0))
@@ -672,7 +767,15 @@ async fn resolve_table_scan_stream(
 
 		// Multi-index union for OR conditions — delegate to UnionIndexScan.
 		// Permission handling is done by DynamicScan's ScanPipeline above.
-		Some(AccessPath::Union(paths)) => {
+		// The `dedupe` flag is informational here: this fallback path uses
+		// the operator's default no-merge sequential mode, which already
+		// dedupes by record id via a HashSet. The flag would matter if a
+		// future `MergeMode::ByIndexKey{,Dedup}` were wired into this
+		// fallback — see [`AccessPath::Union`].
+		Some(AccessPath::Union {
+			paths,
+			dedupe: _,
+		}) => {
 			let mut sub_operators: Vec<Arc<dyn ExecOperator>> = Vec::with_capacity(paths.len());
 			for path in paths {
 				sub_operators.push(create_index_operator(&path, &cfg, resolved_cond.as_ref()));
@@ -682,13 +785,18 @@ async fn resolve_table_scan_stream(
 			Ok((stream, 0))
 		}
 
+		// Provably empty result set — short-circuit with no storage I/O.
+		Some(AccessPath::EmptyScan) => {
+			let op = super::EmptyScan::new();
+			let stream = op.execute(ctx)?;
+			Ok((stream, 0))
+		}
+
 		// Fall back to table KV scan (NOINDEX, BTree rejected by ordering
 		// check, etc.)
 		_ => {
 			let beg = record::prefix(cfg.ns_id, cfg.db_id, &cfg.table_name)?;
 			let end = record::suffix(cfg.ns_id, cfg.db_id, &cfg.table_name)?;
-			// Enable prefetching for full scans (no limit pushed)
-			let prefetch = cfg.storage_limit.is_none();
 			let stream = kv_scan_stream(
 				txn,
 				beg,
@@ -697,7 +805,11 @@ async fn resolve_table_scan_stream(
 				cfg.storage_limit,
 				cfg.direction,
 				cfg.pre_skip,
-				prefetch,
+				cfg.limit_hint,
+				cfg.pre_decode_filter.clone(),
+				// TopK threshold pushdown is plan-time-only (TableScan);
+				// DynamicScan resolves its access path at runtime.
+				None,
 			);
 			Ok((stream, cfg.pre_skip))
 		}
@@ -728,6 +840,7 @@ fn create_index_operator(
 			None,
 			None,
 			cfg.version.clone(),
+			None,
 			None,
 		)),
 		AccessPath::FullTextSearch {
@@ -761,10 +874,15 @@ fn create_index_operator(
 				None,
 			))
 		}
+		// Provably empty: emit a single EmptyScan operator.
+		AccessPath::EmptyScan => Arc::new(super::EmptyScan::new()),
 		// TableScan and nested Union should not appear as sub-paths.
 		// Fall back to a table scan operator which will produce all
 		// records (safe but sub-optimal).
-		AccessPath::TableScan | AccessPath::Union(_) => Arc::new(super::TableScan::new(
+		AccessPath::TableScan
+		| AccessPath::Union {
+			..
+		} => Arc::new(super::TableScan::new(
 			cfg.table_name.clone(),
 			cfg.direction,
 			None,
@@ -786,9 +904,7 @@ mod tests {
 	async fn create_test_scan(table_name: &str, with_index_hints: bool) -> DynamicScan {
 		let ctx = std::sync::Arc::new(Context::new_test());
 		let source = expr_to_physical_expr(
-			crate::expr::Expr::Literal(crate::expr::literal::Literal::String(
-				table_name.to_string(),
-			)),
+			crate::expr::Expr::Literal(crate::expr::literal::Literal::String(table_name.into())),
 			&ctx,
 		)
 		.await

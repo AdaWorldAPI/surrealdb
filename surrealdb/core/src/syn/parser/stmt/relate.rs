@@ -12,6 +12,14 @@ impl Parser<'_> {
 		stk: &mut Stk,
 	) -> ParseResult<RelateStatement> {
 		let only = self.eat(t!("ONLY"));
+
+		let or_update = if self.eat(t!("OR")) {
+			expected!(self, t!("UPDATE"));
+			true
+		} else {
+			false
+		};
+
 		let (from, through, to) = stk.run(|stk| self.parse_relation(stk)).await?;
 
 		// UNIQUE is unused, parse it for backwards compatibility
@@ -22,6 +30,7 @@ impl Parser<'_> {
 		let timeout = self.try_parse_timeout(stk).await?;
 		Ok(RelateStatement {
 			only,
+			or_update,
 			through,
 			from,
 			to,
@@ -107,7 +116,7 @@ impl Parser<'_> {
 		if let Some(t!(":")) = self.peek_whitespace1().map(|x| x.kind) {
 			self.parse_record_id(stk).await.map(|x| Expr::Literal(Literal::RecordId(x)))
 		} else {
-			self.parse_ident().map(Expr::Table)
+			self.parse_ident_str().map(|x| Expr::Table(x.into()))
 		}
 	}
 }

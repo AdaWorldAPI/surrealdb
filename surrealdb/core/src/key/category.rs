@@ -35,6 +35,8 @@ pub enum Category {
 	RootConfig,
 	/// crate::key::root::ic                 /!ic{ns}{db}{tb}{ix}{nid}{uuid}
 	IndexCompaction,
+	/// crate::key::root::rc                 /!rc{kind}{ns}{db}{tb}{ix}{expunge}{uuid}
+	Reclaim,
 	/// crate::key::root::eq                 /!eq{ns}{db}{tb}{ev}{ts}{nid}
 	EventQueue,
 	///
@@ -175,6 +177,14 @@ pub enum Category {
 	IndexFullTextDocIdsSequenceState,
 	/// crate::key::index::iu                /*{ns}*{db}*{tb}+{ix}*iu{uuid}{uuid}{count}
 	IndexCountState,
+	/// crate::key::table::bs                /*{ns}*{db}*{tb}!bs{ix}
+	IndexBuildState,
+	/// crate::key::table::br                /*{ns}*{db}*{tb}!br{ix}{generation}{ticket}
+	IndexBuildReservation,
+	/// crate::key::table::bg                /*{ns}*{db}*{tb}!bg{ix}{generation}{ticket}
+	IndexBuildAppending,
+	/// crate::key::table::bp                /*{ns}*{db}*{tb}!bp{ix}{generation}{id}
+	IndexBuildPrimaryAppending,
 	/// crate::key::index                    /*{ns}*{db}*{tb}+{ix}*{fd}{id}
 	Index,
 	///
@@ -182,6 +192,8 @@ pub enum Category {
 	///
 	/// crate::key::change                   /*{ns}*{db}#{ts}
 	ChangeFeed,
+	/// crate::key::lqe                      /*{ns}*{db}%{ts}
+	LiveQueryEvent,
 	///
 	/// ------------------------------
 	///
@@ -273,6 +285,7 @@ impl Display for Category {
 			Self::IndexPrimaryAppending => "IndexPrimaryAppending",
 			Self::Index => "Index",
 			Self::ChangeFeed => "ChangeFeed",
+			Self::LiveQueryEvent => "LiveQueryEvent",
 			Self::Record => "Record",
 			Self::Graph => "Graph",
 			Self::Ref => "Ref",
@@ -285,7 +298,12 @@ impl Display for Category {
 			Self::IndexFullTextDocCountAndLength => "IndexFullTextDocCountAndLength",
 			Self::IndexTermDocuments => "IndexTermDocuments",
 			Self::IndexCompaction => "IndexCompaction",
+			Self::Reclaim => "Reclaim",
 			Self::IndexCountState => "IndexCountState",
+			Self::IndexBuildState => "IndexBuildState",
+			Self::IndexBuildReservation => "IndexBuildReservation",
+			Self::IndexBuildAppending => "IndexBuildAppending",
+			Self::IndexBuildPrimaryAppending => "IndexBuildPrimaryAppending",
 			Self::EventQueue => "EventQueue",
 			Self::TableIndexIdentifierBatch => "TableIndexIdentifierBatch",
 			Self::TableIndexIdentifierState => "TableIndexIdentifierState",

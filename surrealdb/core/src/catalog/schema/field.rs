@@ -36,14 +36,14 @@ pub struct ComputedDeps {
 	pub is_complete: bool,
 }
 
-#[revisioned(revision = 3)]
+#[revisioned(revision = 4)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub struct FieldDefinition {
 	// TODO: Needs to be it's own type.
 	// Idiom::Value/Idiom::Start are for example not allowed.
 	pub(crate) name: Idiom,
 	pub(crate) table: TableName,
-	// TODO: Optionally also be a seperate type from expr::Kind
+	// TODO: Optionally also be a separate type from expr::Kind
 	pub(crate) field_kind: Option<Kind>,
 	pub(crate) flexible: bool,
 	pub(crate) readonly: bool,
@@ -68,6 +68,21 @@ pub struct FieldDefinition {
 	/// When `None` on a computed field, deps are extracted on-the-fly at query time.
 	#[revision(start = 3, default_fn = "default_computed_deps")]
 	pub(crate) computed_deps: Option<ComputedDeps>,
+
+	/// Optional alias used as the GraphQL field name. When set, GraphQL
+	/// schema generation prefers this over the raw SurrealQL field name,
+	/// allowing snake_case columns to be exposed as camelCase. See
+	/// GitHub issue #4537. `Option<String>::default()` already returns
+	/// `None` so no explicit `default_fn` is needed.
+	#[revision(start = 4)]
+	pub(crate) graphql_alias: Option<String>,
+
+	/// Reason emitted on the GraphQL `@deprecated` directive. When set, the
+	/// corresponding GraphQL field is marked deprecated in introspection
+	/// (and in input objects), surfacing the reason to schema consumers
+	/// while remaining usable for backwards compatibility.
+	#[revision(start = 4)]
+	pub(crate) graphql_deprecated: Option<String>,
 }
 
 impl FieldDefinition {
@@ -88,7 +103,7 @@ impl FieldDefinition {
 		DefineFieldStatement {
 			kind: sql::statements::define::DefineKind::Default,
 			name: Expr::Idiom(self.name.clone()).into(),
-			what: sql::Expr::Table(self.table.clone().into_string()),
+			what: sql::Expr::Table(self.table.clone()),
 			field_kind: self.field_kind.clone().map(|x| x.into()),
 			flexible: self.flexible,
 			readonly: self.readonly,
@@ -113,9 +128,11 @@ impl FieldDefinition {
 			comment: self
 				.comment
 				.clone()
-				.map(|x| sql::Expr::Literal(sql::Literal::String(x)))
+				.map(|x| sql::Expr::Literal(sql::Literal::String(x.into())))
 				.unwrap_or(sql::Expr::Literal(sql::Literal::None)),
 			reference: self.reference.clone().map(|x| x.into()),
+			graphql_alias: self.graphql_alias.clone(),
+			graphql_deprecated: self.graphql_deprecated.clone(),
 		}
 	}
 }
@@ -123,23 +140,25 @@ impl FieldDefinition {
 impl InfoStructure for FieldDefinition {
 	fn structure(self) -> Value {
 		Value::from(map! {
-			"name".to_string() => self.name.structure(),
-			"table".to_string() => Value::String(self.table.into_string()),
-			"kind".to_string(), if let Some(v) = self.field_kind => v.structure(),
-			"flexible".to_string(), if self.flexible => true.into(),
-			"value".to_string(), if let Some(v) = self.value => v.structure(),
-			"assert".to_string(), if let Some(v) = self.assert => v.structure(),
-			"computed".to_string(), if let Some(v) = self.computed => v.structure(),
-			"default_always".to_string(), if matches!(&self.default, DefineDefault::Always(_) | DefineDefault::Set(_)) => Value::Bool(matches!(self.default,DefineDefault::Always(_))), // Only reported if DEFAULT is also enabled for this field
-			"default".to_string(), if let DefineDefault::Always(v) | DefineDefault::Set(v) = self.default => v.structure(),
-			"reference".to_string(), if let Some(v) = self.reference => v.structure(),
-			"readonly".to_string() => self.readonly.into(),
-			"permissions".to_string() => Value::from(map!{
-				"select".to_string() => self.select_permission.structure(),
-				"create".to_string() => self.create_permission.structure(),
-				"update".to_string() => self.update_permission.structure(),
+			"name" => self.name.structure(),
+			"table" => Value::String(self.table.into()),
+			"kind", if let Some(v) = self.field_kind => v.structure(),
+			"flexible", if self.flexible => true.into(),
+			"value", if let Some(v) = self.value => v.structure(),
+			"assert", if let Some(v) = self.assert => v.structure(),
+			"computed", if let Some(v) = self.computed => v.structure(),
+			"default_always", if matches!(&self.default, DefineDefault::Always(_) | DefineDefault::Set(_)) => Value::Bool(matches!(self.default,DefineDefault::Always(_))), // Only reported if DEFAULT is also enabled for this field
+			"default", if let DefineDefault::Always(v) | DefineDefault::Set(v) = self.default => v.structure(),
+			"reference", if let Some(v) = self.reference => v.structure(),
+			"readonly" => self.readonly.into(),
+			"permissions" => Value::from(map!{
+				"select" => self.select_permission.structure(),
+				"create" => self.create_permission.structure(),
+				"update" => self.update_permission.structure(),
 			}),
-			"comment".to_string(), if let Some(v) = self.comment => v.into(),
+			"comment", if let Some(v) = self.comment => v.into(),
+			"graphql_alias", if let Some(v) = self.graphql_alias => v.into(),
+			"graphql_deprecated", if let Some(v) = self.graphql_deprecated => v.into(),
 		})
 	}
 }
@@ -147,185 +166,5 @@ impl InfoStructure for FieldDefinition {
 impl ToSql for FieldDefinition {
 	fn fmt_sql(&self, f: &mut String, fmt: SqlFormat) {
 		self.to_sql_definition().fmt_sql(f, fmt)
-	}
-}
-
-/// DDL-friendly constructor and chainable setters for [`FieldDefinition`].
-///
-/// External codegen tools build typed field definitions to render via
-/// [`ToSql`] without an actual in-DB allocation. See the table-level
-/// equivalent in `catalog::TableDefinition::new_for_ddl` and
-/// `.claude/op-codegen-bridge/README.md` for the initiative context.
-///
-/// Not exposed: setters for `default` (uses `pub(crate) DefineDefault`),
-/// the three `Permission` slots, `auth_limit`, and `computed_deps` — those
-/// types are `pub(crate)` and follow in dedicated sprints (auth, computed
-/// fields). For DDL emission of typical Rails-mapped schemas the slots
-/// covered here (kind, assert, value, computed, comment, reference,
-/// flexible, readonly) are sufficient.
-//
-// `dead_code` allowed: see the equivalent comment on the
-// `TableDefinition` DDL-builder impl in `catalog/table.rs`.
-#[allow(dead_code)]
-impl FieldDefinition {
-	/// Construct a [`FieldDefinition`] for **DDL emission only**.
-	///
-	/// All optional slots default to `None`; permissions default to
-	/// `Permission::default()` (= `Full`); booleans default to `false`.
-	/// Combine with the `with_*` builders below to fill DDL slots fluently.
-	pub fn new_for_ddl(name: Idiom, table: TableName) -> Self {
-		Self {
-			name,
-			table,
-			..Default::default()
-		}
-	}
-
-	/// Set `field_kind`. Returns `self` for chaining.
-	#[must_use]
-	pub fn with_kind(mut self, v: Option<Kind>) -> Self {
-		self.field_kind = v;
-		self
-	}
-
-	/// Set `flexible`. Returns `self` for chaining.
-	#[must_use]
-	pub fn with_flexible(mut self, v: bool) -> Self {
-		self.flexible = v;
-		self
-	}
-
-	/// Set `readonly`. Returns `self` for chaining.
-	#[must_use]
-	pub fn with_readonly(mut self, v: bool) -> Self {
-		self.readonly = v;
-		self
-	}
-
-	/// Set `value` (computed default expression). Returns `self` for
-	/// chaining.
-	#[must_use]
-	pub fn with_value(mut self, v: Option<Expr>) -> Self {
-		self.value = v;
-		self
-	}
-
-	/// Set `assert` (validation expression). Returns `self` for chaining.
-	#[must_use]
-	pub fn with_assert(mut self, v: Option<Expr>) -> Self {
-		self.assert = v;
-		self
-	}
-
-	/// Set `computed` (virtual field expression). Returns `self` for
-	/// chaining.
-	#[must_use]
-	pub fn with_computed(mut self, v: Option<Expr>) -> Self {
-		self.computed = v;
-		self
-	}
-
-	/// Set `comment`. Returns `self` for chaining.
-	#[must_use]
-	pub fn with_comment(mut self, v: Option<String>) -> Self {
-		self.comment = v;
-		self
-	}
-
-	/// Set `reference` (graph reference metadata). Returns `self` for
-	/// chaining.
-	#[must_use]
-	pub fn with_reference(mut self, v: Option<Reference>) -> Self {
-		self.reference = v;
-		self
-	}
-}
-
-#[cfg(test)]
-mod ddl_builder_tests {
-	//! C16b — DDL-friendly constructor + setters for FieldDefinition.
-	//! See `.claude/op-codegen-bridge/README.md` for context.
-
-	use std::str::FromStr;
-
-	use surrealdb_types::ToSql;
-
-	use super::*;
-	use crate::expr::Idiom;
-	use crate::val::TableName;
-
-	fn idiom(s: &str) -> Idiom {
-		Idiom::from_str(s).expect("test idiom literal must parse")
-	}
-
-	#[test]
-	fn new_for_ddl_defaults_to_no_kind_and_no_constraints() {
-		let f = FieldDefinition::new_for_ddl(idiom("name"), TableName::from("widget"));
-		assert!(f.field_kind.is_none());
-		assert!(f.value.is_none());
-		assert!(f.assert.is_none());
-		assert!(f.computed.is_none());
-		assert!(!f.flexible);
-		assert!(!f.readonly);
-		assert!(f.comment.is_none());
-		assert!(f.reference.is_none());
-	}
-
-	#[test]
-	fn new_for_ddl_carries_name_and_table_through_to_sql() {
-		let f = FieldDefinition::new_for_ddl(idiom("subject"), TableName::from("WorkPackage"));
-		let sql = f.to_sql();
-		assert!(sql.contains("subject"), "field name missing: {sql}");
-		assert!(sql.contains("WorkPackage"), "table missing: {sql}");
-	}
-
-	#[test]
-	fn with_kind_round_trips() {
-		let f = FieldDefinition::new_for_ddl(idiom("count"), TableName::from("t"))
-			.with_kind(Some(Kind::Int));
-		assert!(matches!(f.field_kind, Some(Kind::Int)));
-	}
-
-	#[test]
-	fn with_flexible_and_readonly_round_trip() {
-		let f = FieldDefinition::new_for_ddl(idiom("c"), TableName::from("t"))
-			.with_flexible(true)
-			.with_readonly(true);
-		assert!(f.flexible);
-		assert!(f.readonly);
-	}
-
-	#[test]
-	fn with_comment_round_trips() {
-		let f = FieldDefinition::new_for_ddl(idiom("c"), TableName::from("t"))
-			.with_comment(Some("hi".to_string()));
-		assert_eq!(f.comment.as_deref(), Some("hi"));
-	}
-
-	#[test]
-	fn builder_output_equals_struct_literal_output() {
-		let raw = FieldDefinition {
-			name: idiom("subject"),
-			table: TableName::from("WorkPackage"),
-			field_kind: Some(Kind::Int),
-			flexible: true,
-			readonly: false,
-			value: None,
-			assert: None,
-			computed: None,
-			default: DefineDefault::None,
-			select_permission: Permission::default(),
-			create_permission: Permission::default(),
-			update_permission: Permission::default(),
-			comment: Some("the subject".to_string()),
-			reference: None,
-			auth_limit: AuthLimit::new_no_limit(),
-			computed_deps: None,
-		};
-		let built = FieldDefinition::new_for_ddl(idiom("subject"), TableName::from("WorkPackage"))
-			.with_kind(Some(Kind::Int))
-			.with_flexible(true)
-			.with_comment(Some("the subject".to_string()));
-		assert_eq!(raw.to_sql(), built.to_sql());
 	}
 }

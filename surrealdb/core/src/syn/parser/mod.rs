@@ -12,7 +12,7 @@
 //!   that the given token type is next and if not returns a parser error.
 //! - Whenever a limited set of tokens can be next it is common to match the token kind and then
 //!   have a catch all arm which calles the macro `unexpected!`. This macro will raise an parse
-//!   error with information about the type of token it recieves and what it expected.
+//!   error with information about the type of token it receives and what it expected.
 //! - If a single token can be optionally next use [`Parser::eat`] this function returns a bool
 //!   depending on if the given tokenkind was eaten.
 //! - If a closing delimiting token is expected use `Parser::expect_closing_delimiter`. This
@@ -125,14 +125,29 @@ pub struct ParserSettings {
 	/// `foo:0bar`. This would be rejected by normal identifier rules as most
 	/// identifiers can't start with a number.
 	pub flexible_record_id: bool,
-	/// Disallow a query to have objects deeper that limit.
+	/// Disallow a query to have objects deeper than the limit.
 	/// Arrays also count towards objects. So `[{foo: [] }]` would be 3 deep.
+	/// Type annotation nesting depth (e.g. `array<option<array<int>>>` in
+	/// `DEFINE FIELD TYPE`, cast expressions, etc.) also counts against this limit.
 	pub object_recursion_limit: usize,
 	/// Disallow a query from being deeper than the give limit.
 	/// A query recurses when a statement contains another statement within
 	/// itself. Examples are subquery and blocks like block statements and if
 	/// statements and such.
 	pub query_recursion_limit: usize,
+	/// Disallow an expression tree from being deeper than the given limit.
+	///
+	/// Unlike `query_recursion_limit` and `object_recursion_limit`, which only
+	/// bound bracketed/statement nesting, this bounds the depth of the operator
+	/// tree built by the pratt parser. Left-associative infix spines (e.g.
+	/// `1 + 1 + 1 + ...`), prefix chains (e.g. `!!!...x`) and postfix chains are
+	/// parsed iteratively/recursively without consuming the other budgets, so
+	/// without this limit a flat chain of operators in the query text builds an
+	/// arbitrarily deep `Expr` tree. That tree is later walked recursively (its
+	/// `Drop`, `ToSql`, and the `sql::Expr -> expr::Expr` lowering all recurse
+	/// once per node), overflowing the call stack on long enough chains — a
+	/// denial of service reachable from query text alone.
+	pub expr_recursion_limit: usize,
 	/// Whether the files feature is enabled
 	pub files_enabled: bool,
 	/// Whether the surrealism feature is enabled
@@ -149,6 +164,7 @@ impl Default for ParserSettings {
 			flexible_record_id: true,
 			object_recursion_limit: 100,
 			query_recursion_limit: 20,
+			expr_recursion_limit: 128,
 			files_enabled: false,
 			surrealism_enabled: false,
 			json_string_escapes: false,
@@ -414,8 +430,11 @@ impl<'a> Parser<'a> {
 	}
 
 	/// Parse a single statement.
-	async fn parse_statement(&mut self, stk: &mut Stk) -> ParseResult<sql::TopLevelExpr> {
-		self.parse_top_level_expr(stk).await
+	pub async fn parse_statement(&mut self, stk: &mut Stk) -> ParseResult<sql::Ast> {
+		let statement = self.parse_top_level_expr(stk).await?;
+		Ok(sql::Ast {
+			expressions: vec![statement],
+		})
 	}
 
 	/// Parse a single expression.
@@ -526,8 +545,8 @@ impl StatementStream {
 	/// updates the line and column offset after consuming bytes.
 	fn accumulate_line_col(&mut self, bytes: &[u8]) {
 		// The parser should have ensured that bytes is a valid utf-8 string.
-		// TODO: Maybe change this to unsafe cast once we have more convidence in the
-		// parsers correctness.
+		// TODO: Maybe change this to unsafe cast once we have more confidence in the
+		// parser's correctness.
 		let (line_num, remaining) = std::str::from_utf8(bytes)
 			.expect("parser validated utf8")
 			.lines()
@@ -587,7 +606,7 @@ impl StatementStream {
 			return Ok(None);
 		}
 
-		let res = self.stack.enter(|stk| parser.parse_statement(stk)).finish();
+		let res = self.stack.enter(|stk| parser.parse_top_level_expr(stk)).finish();
 		if parser.peek().is_eof() {
 			if buffer.len() > u32::MAX as usize {
 				let error = syntax_error!("Cannot parse query, statement exceeded maximum size of 4GB", @parser.last_span());
@@ -655,7 +674,7 @@ impl StatementStream {
 			return Ok(None);
 		}
 
-		match self.stack.enter(|stk| parser.parse_statement(stk)).finish() {
+		match self.stack.enter(|stk| parser.parse_top_level_expr(stk)).finish() {
 			Ok(x) => {
 				if !parser.peek().is_eof() && !parser.eat(t!(";")) {
 					let peek = parser.peek();

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use reblessive::tree::Stk;
+use surrealdb_strand::Strand;
 
 use crate::catalog::{ApiConfigDefinition, MiddlewareDefinition, Permission};
 use crate::ctx::FrozenContext;
@@ -19,7 +20,7 @@ pub(crate) struct ApiConfig {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub(crate) struct Middleware {
-	pub name: String,
+	pub name: Strand,
 	pub args: Vec<Expr>,
 }
 
@@ -42,6 +43,15 @@ impl ApiConfig {
 				name: m.name.clone(),
 				args,
 			});
+		}
+
+		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
+		if self.permissions.has_direct_write() {
+			return Err(crate::err::Error::PermissionClauseNotReadonly {
+				kind: "config",
+				name: "api".to_string(),
+			}
+			.into());
 		}
 
 		Ok(ApiConfigDefinition {

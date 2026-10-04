@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use reblessive::tree::Stk;
+use surrealdb_strand::Strand;
 use surrealdb_types::{SqlFormat, ToSql};
 
 use super::DefineKind;
@@ -16,12 +17,14 @@ use crate::val::Value;
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct DefineFunctionStatement {
 	pub kind: DefineKind,
-	pub name: String,
+	pub name: Strand,
 	pub args: Vec<(String, Kind)>,
 	pub block: Block,
 	pub comment: Expr,
 	pub permissions: Permission,
 	pub returns: Option<Kind>,
+	pub graphql_alias: Option<String>,
+	pub graphql_deprecated: Option<String>,
 }
 
 impl DefineFunctionStatement {
@@ -35,7 +38,17 @@ impl DefineFunctionStatement {
 		doc: Option<&CursorDoc>,
 	) -> Result<Value> {
 		// Allowed to run?
-		opt.is_allowed(Action::Edit, ResourceKind::Function, &Base::Db)?;
+		ctx.is_allowed(opt, Action::Edit, ResourceKind::Function, Base::Db)?;
+		// Validate any GRAPHQL_ALIAS at definition time so typos surface here
+		// rather than silently falling back at schema-generation time.
+		super::validate_graphql_alias(&self.graphql_alias, "function")?;
+		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
+		if self.permissions.has_direct_write() {
+			bail!(Error::PermissionClauseNotReadonly {
+				kind: "function",
+				name: format!("fn::{}", self.name),
+			});
+		}
 		// Fetch the transaction
 		let txn = ctx.tx();
 		// Check if the definition exists
@@ -45,7 +58,7 @@ impl DefineFunctionStatement {
 				DefineKind::Default => {
 					if !opt.import {
 						bail!(Error::FcAlreadyExists {
-							name: self.name.clone(),
+							name: format!("fn::{}", self.name),
 						});
 					}
 				}
@@ -77,6 +90,8 @@ impl DefineFunctionStatement {
 				returns: self.returns.clone(),
 				comment,
 				auth_limit: AuthLimit::new_from_auth(&opt.auth).into(),
+				graphql_alias: self.graphql_alias.clone(),
+				graphql_deprecated: self.graphql_deprecated.clone(),
 			},
 		)
 		.await?;

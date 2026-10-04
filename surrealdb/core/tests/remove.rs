@@ -1,4 +1,4 @@
-#![recursion_limit = "1024"]
+#![recursion_limit = "256"]
 
 mod helpers;
 use helpers::*;
@@ -7,7 +7,7 @@ use surrealdb_core::syn;
 use surrealdb_types::Value;
 
 #[macro_use]
-mod util;
+mod remove_macros;
 
 use std::collections::HashMap;
 

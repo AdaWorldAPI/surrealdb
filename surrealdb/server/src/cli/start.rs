@@ -1,24 +1,27 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::Args;
-use rustls::crypto::CryptoProvider;
 use surrealdb::engine::{any, tasks};
 use surrealdb_core::buc::BucketStoreProvider;
 use surrealdb_core::kvs::TransactionBuilderFactory;
+use surrealdb_core::observe::{ExecutionObserver, FanOutObserver};
 use surrealdb_core::options::EngineOptions;
 use tokio_util::sync::CancellationToken;
 
 use super::config::Config;
 use crate::cli::ConfigCheck;
-use crate::cnf::LOGO;
+use crate::cnf::{LOGO, METRICS_ENABLED, PROCESS_METRICS_REFRESH_INTERVAL};
 use crate::dbs::StartCommandDbsOptions;
 use crate::ntw::RouterFactory;
 use crate::ntw::client_ip::ClientIp;
-use crate::telemetry::metrics::ds::register_datastore_metrics;
+use crate::observe::instruments::scope;
+use crate::observe::{MetricsObserver, MetricsState, ObservabilityProvider, ObservabilityRuntime};
+use crate::telemetry::metrics::otlp_metrics_active;
 use crate::{dbs, env, ntw};
 
 #[derive(Args, Debug)]
@@ -69,9 +72,47 @@ pub struct StartCommandArguments {
 	#[arg(env = "SURREAL_INDEX_COMPACTION_INTERVAL", long = "index-compaction-interval", value_parser = super::validator::duration)]
 	#[arg(default_value = "5s")]
 	index_compaction_interval: Duration,
+	#[arg(
+		help = "The interval at which to resume index builds left unfinished by a crashed node (0 to disable)",
+		help_heading = "Database"
+	)]
+	#[arg(env = "SURREAL_INDEX_BUILD_RESUME_INTERVAL", long = "index-build-resume-interval", value_parser = super::validator::duration)]
+	#[arg(default_value = "30s")]
+	index_build_resume_interval: Duration,
 	#[arg(env = "SURREAL_ASYNC_EVENT_PROCESSING_INTERVAL", long = "async-event-interval", value_parser = super::validator::duration)]
 	#[arg(default_value = "5s")]
 	event_processing_interval: Duration,
+	#[arg(env = "SURREAL_RECLAIM_INTERVAL", long = "reclaim-interval", value_parser = super::validator::duration)]
+	#[arg(default_value = "60s")]
+	reclaim_interval: Duration,
+	#[arg(
+		help = "Minimum age a removed namespace/database/index must reach before its data is physically reclaimed (snapshot-safety grace; effective value is max(this, --tikv-gc-lifetime))",
+		help_heading = "Database"
+	)]
+	#[arg(env = "SURREAL_RECLAIM_GRACE", long = "reclaim-grace", value_parser = super::validator::duration)]
+	#[arg(default_value = "10m")]
+	reclaim_grace: Duration,
+	#[arg(
+		help = "The interval at which the TiKV MVCC garbage collector runs",
+		help_heading = "Database"
+	)]
+	#[arg(env = "SURREAL_TIKV_GC_INTERVAL", long = "tikv-gc-interval", value_parser = super::validator::duration)]
+	#[arg(default_value = "10m")]
+	tikv_gc_interval: Duration,
+	#[arg(
+		help = "How far behind the current TSO the TiKV GC safepoint is allowed to sit",
+		help_heading = "Database"
+	)]
+	#[arg(env = "SURREAL_TIKV_GC_LIFETIME", long = "tikv-gc-lifetime", value_parser = super::validator::duration)]
+	#[arg(default_value = "10m")]
+	tikv_gc_lifetime: Duration,
+	#[arg(
+		help = "The interval at which TiKV stale transactional locks are resolved",
+		help_heading = "Database"
+	)]
+	#[arg(env = "SURREAL_TIKV_LOCK_CLEANUP_INTERVAL", long = "tikv-lock-cleanup-interval", value_parser = super::validator::duration)]
+	#[arg(default_value = "60s")]
+	tikv_lock_cleanup_interval: Duration,
 	//
 	// Authentication
 	#[arg(
@@ -169,7 +210,11 @@ struct StartCommandWebTlsOptions {
 ///   - `RouterFactory` (HTTP router factory for route/middleware customization)
 ///   - `ConfigCheck` (validates configuration before initialization)
 pub async fn init<
-	C: TransactionBuilderFactory + RouterFactory + ConfigCheck + BucketStoreProvider,
+	C: TransactionBuilderFactory
+		+ RouterFactory
+		+ ConfigCheck
+		+ BucketStoreProvider
+		+ ObservabilityProvider,
 >(
 	mut composer: C,
 	StartCommandArguments {
@@ -185,15 +230,20 @@ pub async fn init<
 		node_membership_cleanup_interval,
 		changefeed_gc_interval,
 		index_compaction_interval,
+		index_build_resume_interval,
 		event_processing_interval,
+		reclaim_interval,
+		reclaim_grace,
+		tikv_gc_interval,
+		tikv_gc_lifetime,
+		tikv_lock_cleanup_interval,
 		no_banner,
 		no_identification_headers,
 		allow_origin,
 		..
 	}: StartCommandArguments,
+	runtime: ObservabilityRuntime,
 ) -> Result<()> {
-	// Install the crypto provider before any TLS operations occur
-	let _ = CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
 	// Check the path is valid
 	C::path_valid(&path)?;
 	// Check if we should output a banner
@@ -220,7 +270,13 @@ pub async fn init<
 		.with_node_membership_cleanup_interval(node_membership_cleanup_interval)
 		.with_changefeed_gc_interval(changefeed_gc_interval)
 		.with_index_compaction_interval(index_compaction_interval)
-		.with_event_processing_interval(event_processing_interval);
+		.with_index_build_resume_interval(index_build_resume_interval)
+		.with_event_processing_interval(event_processing_interval)
+		.with_reclaim_interval(reclaim_interval)
+		.with_reclaim_grace(reclaim_grace)
+		.with_tikv_gc_interval(tikv_gc_interval)
+		.with_tikv_gc_lifetime(tikv_gc_lifetime)
+		.with_tikv_lock_cleanup_interval(tikv_lock_cleanup_interval);
 	// Configure the config
 	let Some(bind) = listen_addresses.first().copied() else {
 		return Err(anyhow::anyhow!("No listen address provided"));
@@ -242,25 +298,111 @@ pub async fn init<
 	// Initiate environment
 	env::init()?;
 
+	// Build the observability pipeline before starting the datastore so the
+	// observer can be installed at construction time. The community metrics
+	// observer is only instantiated when /metrics is enabled; composer
+	// extensions may contribute an additional audit observer regardless.
+	let (metrics_state, combined_observer) = build_observability::<C>(&composer, &runtime)?;
+
 	// Create a token to cancel tasks
 	let canceller = CancellationToken::new();
-	// Start the datastore
-	let (datastore, recv) = dbs::init::<C>(composer, &config, canceller.clone(), dbs).await?;
+
+	// Keep the cached process snapshot fresh for both readers. The
+	// `/metrics` handler used to refresh on each scrape; OTLP push has
+	// no equivalent path, so a background task is the only way to
+	// avoid flat-lined `surrealdb.process.*` values on OTLP-only
+	// deployments. Only spawn when at least one reader is configured;
+	// otherwise nobody reads the cache.
+	if *METRICS_ENABLED || otlp_metrics_active() {
+		spawn_process_snapshot_refresh(canceller.clone());
+	}
+	// Start the datastore. The startup import and credential initialisation are
+	// returned rather than run here, so the web server can bind before they run.
+	let (datastore, recv, router_state, pending_startup) =
+		dbs::init::<C>(composer, &config, canceller.clone(), combined_observer, dbs).await?;
 	let datastore = Arc::new(datastore);
+	// Tracks whether the instance has finished starting up (import + credentials)
+	// and is ready to serve user-facing queries. The HTTP listener binds
+	// immediately; until this flips to `true`, query/auth endpoints return 503
+	// and `/ready` reports not-ready.
+	let ready = Arc::new(AtomicBool::new(false));
+	if pending_startup.has_work() {
+		// Run the deferred startup work (import, then credentials) concurrently
+		// so the listener comes up right away, flipping `ready` once it succeeds.
+		let ds = Arc::clone(&datastore);
+		let ready = Arc::clone(&ready);
+		let startup_canceller = canceller.clone();
+		tokio::spawn(async move {
+			tokio::select! {
+				biased;
+				// Stop promptly if the server is shutting down; leave `ready`
+				// unset so we never flip to ready mid-shutdown.
+				_ = startup_canceller.cancelled() => {
+					debug!("Startup aborted before completion due to shutdown");
+				}
+				res = dbs::finish_startup(&ds, &pending_startup) => match res {
+					Ok(()) => {
+						ready.store(true, Ordering::SeqCst);
+						info!("Startup complete; instance is now ready to serve");
+					}
+					Err(err) => {
+						error!("Startup failed; instance will not become ready: {err}");
+					}
+				}
+			}
+		});
+	} else {
+		// Nothing deferred (no import, credentials already initialised): ready to
+		// serve as soon as the listener binds.
+		ready.store(true, Ordering::SeqCst);
+	}
 	// Eagerly load surrealism modules in the background unless opted out
 	#[cfg(feature = "surrealism")]
 	if !datastore.is_lazy_surrealism() {
-		let ds = datastore.clone();
+		let ds = Arc::clone(&datastore);
 		tokio::spawn(async move {
 			ds.eager_load_surrealism_modules().await;
 		});
 	}
-	// Register datastore metrics
-	register_datastore_metrics(datastore.clone());
+	// Register datastore metrics against the unified meter provider. The
+	// instruments flow to both the Prometheus text exporter (rendered by
+	// `/metrics`) and the OTLP push exporter (when configured), so
+	// operators get the same storage-engine gauges via either path.
+	// Storage-backend metric names are not in `PUBLIC_METRICS`, so
+	// unauthenticated `/metrics` scrapers never see them.
+	if let Err(err) = crate::observe::register_storage_metrics(&datastore, &runtime) {
+		warn!("failed to register storage metrics: {err}");
+	}
 	// Start the node agent
-	let nodetasks = tasks::init(datastore.clone(), canceller.clone(), &config.engine);
+	let nodetasks = tasks::init(Arc::clone(&datastore), canceller.clone(), &config.engine);
+	// The `/ready` probe treats the node as unhealthy if its cluster heartbeat
+	// hasn't refreshed within a few cycles of the node-membership refresh task
+	// (which also confirms the storage read and write paths are working).
+	const READINESS_HEARTBEAT_STALENESS_FACTOR: u32 = 3;
+	// `checked_mul` guards against overflow from an extreme configured interval;
+	// `Duration::MAX` degrades to "heartbeat never considered stale".
+	let max_heartbeat_age = config
+		.engine
+		.node_membership_refresh_interval
+		.checked_mul(READINESS_HEARTBEAT_STALENESS_FACTOR)
+		.unwrap_or(Duration::MAX);
+	let readiness = ntw::Readiness {
+		ready: Arc::clone(&ready),
+		// The heartbeat freshness check applies on the server path, where the
+		// node-membership refresh task keeps the heartbeat current.
+		max_heartbeat_age: Some(max_heartbeat_age),
+	};
 	// Build and run the HTTP server using the provided RouterFactory implementation
-	ntw::init::<C>(&config, datastore.clone(), recv, canceller.clone()).await?;
+	ntw::init_with_metrics::<C>(
+		&config,
+		Arc::clone(&datastore),
+		recv,
+		canceller.clone(),
+		router_state,
+		metrics_state,
+		readiness,
+	)
+	.await?;
 	// Shutdown and stop closed tasks
 	canceller.cancel();
 	// Wait for background tasks to finish
@@ -269,4 +411,126 @@ pub async fn init<
 	datastore.shutdown().await?;
 	// All ok
 	Ok(())
+}
+
+/// Build the observer that will be installed on the datastore along with the
+/// `/metrics` state that will be attached to the HTTP router.
+///
+/// Behaviour:
+///
+/// - Every metric is recorded through the unified [`opentelemetry_sdk::metrics::SdkMeterProvider`]
+///   built in [`crate::telemetry::metrics::init`]. The provider routes instruments to both the
+///   Prometheus text exporter (rendered by `/metrics`) and the OTLP push exporter (when
+///   configured).
+/// - The process / pipeline observable gauges (`surrealdb.build.info`, `surrealdb.process.*`, audit
+///   / slow-query self-metrics) are registered whenever any reader is attached -- either Prometheus
+///   pull or OTLP push. This matches the gate used by [`spawn_process_snapshot_refresh`] so the
+///   cache and its readers stay symmetrical, and keeps OTLP-only deployments
+///   (`SURREAL_METRICS_ENABLED=false` + `SURREAL_TELEMETRY_PROVIDER=otlp`) wired up to the same
+///   gauge surface as Prometheus scrapers.
+/// - When [`METRICS_ENABLED`] is `true`, a [`MetricsObserver`] is constructed and returned as part
+///   of the [`MetricsState`] so the `/metrics` handler can reach the Prometheus text exporter; it
+///   also lands in the fan-out so the labelled `surrealdb.*` family is recorded on every emit.
+/// - The composer's [`ObservabilityProvider::create_observer`] is always invoked; composer
+///   extensions use this hook to install per-tenant rollups, SurrealDS cluster, and audit /
+///   slow-query observers under their own signal-domain scopes.
+/// - The resulting fan-out is `[MetricsObserver?, composer]`: one labelled recording site for the
+///   primary surface, plus whatever the composer contributes.
+///
+/// The returned [`MetricsState`] is `None` when metrics are disabled, which
+/// keeps the `/metrics` route from being mounted at all.
+#[allow(clippy::clone_on_ref_ptr)]
+fn build_observability<C: ObservabilityProvider>(
+	composer: &C,
+	runtime: &ObservabilityRuntime,
+) -> Result<(Option<MetricsState>, Arc<dyn ExecutionObserver>)> {
+	let extra = composer.create_observer_with_runtime(runtime);
+
+	// Register the process snapshot and pipeline self-metric gauges
+	// against the unified meter provider whenever any reader -- Prometheus
+	// pull or OTLP push -- is configured. Without this hoist OTLP-only
+	// deployments would build the `SdkMeterProvider` (see
+	// `telemetry::metrics::init`) and refresh the process snapshot via
+	// `spawn_process_snapshot_refresh` but never expose any gauges that
+	// read from the cache, leaving OTLP collectors with zero
+	// `surrealdb.build.info` / `surrealdb.process.*` /
+	// `surrealdb_audit_*` / `surrealdb_slow_query_*` samples.
+	if *METRICS_ENABLED || otlp_metrics_active() {
+		crate::observe::metrics::register_process_metrics(runtime);
+		if let Some(counters) = composer.audit_counters() {
+			MetricsObserver::register_pipeline_self_metrics(
+				runtime,
+				scope::AUDIT,
+				"audit",
+				counters,
+			)?;
+		}
+		if let Some(counters) = composer.slow_query_counters() {
+			MetricsObserver::register_pipeline_self_metrics(
+				runtime,
+				scope::SLOW_QUERY,
+				"slow-query",
+				counters,
+			)?;
+		}
+	}
+
+	if !*METRICS_ENABLED {
+		// `/metrics` is disabled; keep the composer observers attached
+		// so OTLP push and audit pipelines still receive events. The
+		// gauge registrations above already wired up the observable
+		// instruments against the OTLP reader.
+		return Ok((None, extra));
+	}
+
+	// Build the unified labelled observer that exposes the
+	// SurrealDB-native families via `/metrics`. The shared process /
+	// pipeline gauge registrations above already ran on this branch.
+	let metrics_observer = Arc::new(MetricsObserver::new(runtime)?);
+	let metrics_obs: Arc<dyn ExecutionObserver> = metrics_observer.clone();
+	let combined: Arc<dyn ExecutionObserver> = Arc::new(FanOutObserver::new([metrics_obs, extra]));
+	// `/metrics` is mounted only when the runtime carries a Prometheus
+	// exporter; otherwise the route is disabled but the labelled
+	// observer still records to whichever reader (OTLP push, in-test
+	// `ManualReader`, ...) the runtime carries.
+	let metrics_state = runtime.prometheus_exporter().map(|exporter| MetricsState {
+		exporter,
+		observer: metrics_observer,
+	});
+	Ok((metrics_state, combined))
+}
+
+/// Spawn a background task that refreshes the cached process snapshot
+/// used by the `surrealdb.process.{memory,cpu_percent}` observable
+/// gauges every [`PROCESS_METRICS_REFRESH_INTERVAL`] seconds.
+///
+/// The task runs an eager refresh once before entering its tick loop
+/// so the first OTLP export and the first `/metrics` scrape both
+/// observe non-zero values; without that the cold-start window can
+/// take up to one full interval before the cache populates. The task
+/// cancels cleanly via the supplied [`CancellationToken`] on graceful
+/// shutdown.
+fn spawn_process_snapshot_refresh(canceller: CancellationToken) {
+	// Floor the configured value at 1s so a misconfigured zero does
+	// not produce a tight refresh loop.
+	let secs = (*PROCESS_METRICS_REFRESH_INTERVAL).max(1);
+	let period = Duration::from_secs(secs);
+	tokio::spawn(async move {
+		// Eager initial refresh so cold-start exports observe a real
+		// snapshot rather than the all-zero default.
+		let _ = surrealdb_core::observe::refresh_process_snapshot().await;
+		let mut ticker = tokio::time::interval(period);
+		// `tokio::time::interval` fires immediately on first tick; we
+		// already refreshed above, so skip the leading tick.
+		ticker.tick().await;
+		loop {
+			tokio::select! {
+				biased;
+				_ = canceller.cancelled() => break,
+				_ = ticker.tick() => {
+					let _ = surrealdb_core::observe::refresh_process_snapshot().await;
+				}
+			}
+		}
+	});
 }

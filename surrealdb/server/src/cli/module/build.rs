@@ -187,11 +187,11 @@ fn validate_sdk_version(metadata: &serde_json::Value) -> Result<()> {
 	Ok(())
 }
 
-const WASM_TARGET: &str = "wasm32-wasip2";
-
 /// Invoke `cargo build` targeting `wasm32-wasip2`.
 fn build_wasm_module(path: &Path, package_name: &str, debug: bool) -> Result<()> {
-	let target = WASM_TARGET;
+	super::wasm_target::ensure_cargo_config(path)?;
+
+	let target = super::wasm_target::TARGET;
 	let profile = if debug {
 		"debug"
 	} else {
@@ -204,12 +204,13 @@ fn build_wasm_module(path: &Path, package_name: &str, debug: bool) -> Result<()>
 	if !debug {
 		cmd.arg("--release");
 	}
+	super::wasm_target::apply_rustflags(&mut cmd);
 
-	let cargo_status =
-		cmd.current_dir(path).status().prefix_err(|| "Failed to execute cargo build")?;
+	let output = cmd.current_dir(path).output().prefix_err(|| "Failed to execute cargo build")?;
 
-	if !cargo_status.success() {
-		anyhow::bail!("Cargo build failed");
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		anyhow::bail!("Cargo build failed:\n{stderr}");
 	}
 
 	Ok(())
@@ -248,6 +249,7 @@ fn optimize_component(wasm_bytes: &[u8]) -> Result<Vec<u8>> {
 	for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
 		let payload = payload.prefix_err(|| "Failed to parse WASM component")?;
 
+		#[allow(clippy::collapsible_match)]
 		match &payload {
 			wasmparser::Payload::Version {
 				encoding,
@@ -371,7 +373,7 @@ fn get_source_wasm(
 		.ok_or_else(|| anyhow::anyhow!("No package name found in metadata"))?;
 
 	let wasm_filename = format!("{}.wasm", package_name.replace("-", "_"));
-	let target = WASM_TARGET;
+	let target = super::wasm_target::TARGET;
 	let profile_dir = if debug {
 		"debug"
 	} else {
@@ -393,7 +395,8 @@ fn metadata(path: &Path) -> Result<serde_json::Value> {
 		.prefix_err(|| "Failed to execute cargo metadata")?;
 
 	if !output.status.success() {
-		anyhow::bail!("Failed to get cargo metadata");
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		anyhow::bail!("Failed to get cargo metadata:\n{stderr}");
 	}
 
 	let metadata_str =

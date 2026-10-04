@@ -404,7 +404,7 @@ where
 	match result {
 		Ok(DbResult::Query(results)) => {
 			if let Some(command) = pending.command {
-				session_state.replay.push(command);
+				super::record_replayable(&session_state.replay, command);
 			}
 			if let Err(err) = pending.response_channel.send(Ok(results)).await {
 				tracing::error!("Failed to send query results to channel: {err:?}");
@@ -415,14 +415,14 @@ where
 		}
 		Ok(DbResult::Other(mut value)) => {
 			if let Some(command) = pending.command {
-				session_state.replay.push(command.clone());
 				if let Command::Authenticate {
 					token,
 					..
-				} = command
+				} = &command
 				{
-					value = token.into_value();
+					value = token.clone().into_value();
 				}
+				super::record_replayable(&session_state.replay, command);
 			}
 			let result = QueryResultBuilder::started_now().finish_with_result(Ok(value));
 			if let Err(err) = pending.response_channel.send(Ok(vec![result])).await {
@@ -544,11 +544,38 @@ async fn handle_parse_error(
 			}
 		}
 		_ => {
-			warn!("Failed to deserialise message; {error:?}");
+			// The payload could not be decoded far enough to recover the request
+			// id, so we cannot route the error to a single waiting request. Rather
+			// than silently dropping it — which leaves every awaiting query hanging
+			// forever (https://github.com/surrealdb/surrealdb/issues/7037) — fail
+			// all currently-pending requests so callers surface the deserialization
+			// error instead of blocking indefinitely.
+			error!("Failed to deserialise message, failing pending requests; {error:?}");
+			fail_all_pending_requests(sessions, error).await;
 		}
 	}
 
 	HandleResult::Ok
+}
+
+/// Fail every pending request across all sessions with the given error.
+///
+/// Used when an incoming message cannot be parsed well enough to identify which
+/// request it belongs to; failing the requests prevents them from hanging.
+async fn fail_all_pending_requests(
+	sessions: &HashMap<Uuid, Result<Arc<SessionState>, SessionError>>,
+	error: crate::Error,
+) {
+	for (_, session) in sessions.to_vec() {
+		let Ok(session_state) = session else {
+			continue;
+		};
+		for (id, _) in session_state.pending_requests.to_vec() {
+			if let Some(pending) = session_state.pending_requests.take(&id) {
+				pending.response_channel.send(Err(error.clone())).await.ok();
+			}
+		}
+	}
 }
 
 // ============================================================================
@@ -596,7 +623,7 @@ async fn handle_session_initial<M, S, E>(
 	session_state.replay.push(Command::Attach {
 		session_id,
 	});
-	sessions.insert(session_id, Ok(session_state.clone()));
+	sessions.insert(session_id, Ok(Arc::clone(&session_state)));
 
 	if let Err(error) = replay_session::<M, S, E>(session_id, &session_state, sink).await {
 		sessions.insert(session_id, Err(SessionError::Remote(error.to_string())));
@@ -624,7 +651,7 @@ async fn handle_session_clone<M, S, E>(
 				};
 			}
 			let session_state = Arc::new(session_state);
-			sessions.insert(new, Ok(session_state.clone()));
+			sessions.insert(new, Ok(Arc::clone(&session_state)));
 
 			if let Err(error) = replay_session::<M, S, E>(new, &session_state, sink).await {
 				sessions.insert(new, Err(SessionError::Remote(error.to_string())));
@@ -657,6 +684,28 @@ async fn handle_session_drop<M, S, E>(
 		replay_session::<M, S, E>(session_id, &session_state, sink).await.ok();
 	}
 	sessions.remove(&session_id);
+}
+
+/// Dispatch a session-lifecycle event to the appropriate handler.
+async fn handle_session<M, S, E>(
+	session_id: crate::SessionId,
+	sessions: &HashMap<Uuid, Result<Arc<SessionState>, SessionError>>,
+	sink: &RwLock<S>,
+) where
+	M: WsMessage,
+	S: Sink<M, Error = E> + Unpin,
+	E: std::fmt::Debug,
+{
+	match session_id {
+		crate::SessionId::Initial(id) => {
+			handle_session_initial::<M, S, E>(id, sessions, sink).await
+		}
+		crate::SessionId::Clone {
+			old,
+			new,
+		} => handle_session_clone::<M, S, E>(old, new, sessions, sink).await,
+		crate::SessionId::Drop(id) => handle_session_drop::<M, S, E>(id, sessions, sink).await,
+	}
 }
 
 /// Clear all pending requests on connection reset.
@@ -735,7 +784,7 @@ impl Surreal<Client> {
 		address: impl IntoEndpoint<P, Client = Client>,
 	) -> Connect<Client, ()> {
 		Connect {
-			surreal: self.inner.clone().into(),
+			surreal: Arc::clone(&self.inner).into(),
 			address: address.into_endpoint(),
 			capacity: 0,
 			response_type: PhantomData,

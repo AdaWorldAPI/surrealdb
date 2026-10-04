@@ -24,7 +24,7 @@ async fn setup_tx_with_ns_db() -> (Datastore, crate::kvs::Transaction, Namespace
 
 	let ns_def = NamespaceDefinition {
 		namespace_id: NamespaceId(1),
-		name: "test".to_string(),
+		name: "test".into(),
 		comment: None,
 	};
 	tx.put_ns(ns_def).await.unwrap();
@@ -32,7 +32,7 @@ async fn setup_tx_with_ns_db() -> (Datastore, crate::kvs::Transaction, Namespace
 	let db_def = DatabaseDefinition {
 		namespace_id: NamespaceId(1),
 		database_id: DatabaseId(1),
-		name: "test".to_string(),
+		name: "test".into(),
 		strict: false,
 		comment: None,
 		changefeed: None,
@@ -89,7 +89,7 @@ async fn test_single_tx_cache_invalidation_on_index_put() {
 	// Step 2: Add an index via put_tb_index
 	let ix_def = IndexDefinition {
 		index_id: IndexId(1),
-		name: "test_idx".to_string(),
+		name: "test_idx".into(),
 		table_name: tb.clone(),
 		cols: vec![],
 		index: Index::Idx,
@@ -122,7 +122,7 @@ async fn test_single_tx_cache_invalidation_on_index_delete() {
 	// Add an index
 	let ix_def = IndexDefinition {
 		index_id: IndexId(1),
-		name: "test_idx".to_string(),
+		name: "test_idx".into(),
 		table_name: tb.clone(),
 		cols: vec![],
 		index: Index::Idx,
@@ -250,7 +250,7 @@ async fn test_single_tx_cache_invalidation_on_ns_put() {
 	// Add a namespace
 	let ns_def = NamespaceDefinition {
 		namespace_id: NamespaceId(1),
-		name: "test".to_string(),
+		name: "test".into(),
 		comment: None,
 	};
 	tx.put_ns(ns_def).await.unwrap();
@@ -278,7 +278,7 @@ async fn test_single_tx_cache_invalidation_on_db_put_and_del() {
 
 	let ns_def = NamespaceDefinition {
 		namespace_id: NamespaceId(1),
-		name: "test".to_string(),
+		name: "test".into(),
 		comment: None,
 	};
 	tx.put_ns(ns_def).await.unwrap();
@@ -291,7 +291,7 @@ async fn test_single_tx_cache_invalidation_on_db_put_and_del() {
 	let db_def = DatabaseDefinition {
 		namespace_id: NamespaceId(1),
 		database_id: DatabaseId(1),
-		name: "testdb".to_string(),
+		name: "testdb".into(),
 		strict: false,
 		comment: None,
 		changefeed: None,
@@ -306,15 +306,16 @@ async fn test_single_tx_cache_invalidation_on_db_put_and_del() {
 		"After put_db, all_db should return the new database (cache must be invalidated)"
 	);
 
-	// Delete the database
-	tx.del_db("test", "testdb", false).await.unwrap();
+	// Delete the database (deferred: removes the catalog entry + invalidates
+	// the cache now; the data prefix is reclaimed in the background).
+	tx.del_db_deferred("test", "testdb", false).await.unwrap();
 
 	// Query again — must see empty list
 	let dbs = tx.all_db(NamespaceId(1), None).await.unwrap();
 	assert_eq!(
 		dbs.len(),
 		0,
-		"After del_db, all_db should return empty list (cache must be invalidated)"
+		"After del_db_deferred, all_db should return empty list (cache must be invalidated)"
 	);
 
 	tx.cancel().await.unwrap();
@@ -371,7 +372,7 @@ async fn test_single_tx_cache_invalidation_on_param_put() {
 
 	// Add a param
 	let pa_def = ParamDefinition {
-		name: "test_param".to_string(),
+		name: "test_param".into(),
 		value: crate::val::Value::Bool(true),
 		..Default::default()
 	};
