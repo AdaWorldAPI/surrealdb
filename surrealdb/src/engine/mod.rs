@@ -7,6 +7,7 @@ pub mod any;
 	feature = "kv-rocksdb",
 	feature = "kv-indxdb",
 	feature = "kv-surrealkv",
+	feature = "kv-lance",
 ))]
 pub mod local;
 #[cfg(any(feature = "protocol-http", feature = "protocol-ws"))]
@@ -28,6 +29,7 @@ use tokio::time::Interval;
 	feature = "kv-rocksdb",
 	feature = "kv-indxdb",
 	feature = "kv-surrealkv",
+	feature = "kv-lance",
 	feature = "protocol-http",
 	feature = "protocol-ws",
 ))]
@@ -65,6 +67,7 @@ impl Stream for IntervalStream {
 	feature = "kv-rocksdb",
 	feature = "kv-indxdb",
 	feature = "kv-surrealkv",
+	feature = "kv-lance",
 	feature = "protocol-http",
 	feature = "protocol-ws",
 ))]
@@ -80,6 +83,7 @@ pub(crate) enum SessionError {
 	feature = "kv-rocksdb",
 	feature = "kv-indxdb",
 	feature = "kv-surrealkv",
+	feature = "kv-lance",
 	feature = "protocol-http",
 	feature = "protocol-ws",
 ))]

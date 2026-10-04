@@ -133,11 +133,17 @@ async fn test_closed_is_sticky_after_commit() {
 
 	// Any further operation short-circuits with TransactionFinished.
 	let err = tx.get(b"k".to_vec(), None).await.expect_err("get after commit must fail");
-	assert!(matches!(err, crate::kvs::err::Error::TransactionFinished),
-		"expected TransactionFinished after commit, got {:?}", err);
+	assert!(
+		matches!(err, crate::kvs::err::Error::TransactionFinished),
+		"expected TransactionFinished after commit, got {:?}",
+		err
+	);
 	let err = tx.set(b"k2".to_vec(), b"v2".to_vec()).await.expect_err("set after commit must fail");
-	assert!(matches!(err, crate::kvs::err::Error::TransactionFinished),
-		"expected TransactionFinished after commit, got {:?}", err);
+	assert!(
+		matches!(err, crate::kvs::err::Error::TransactionFinished),
+		"expected TransactionFinished after commit, got {:?}",
+		err
+	);
 
 	ds.shutdown().await.expect("shutdown");
 }
@@ -154,8 +160,11 @@ async fn test_closed_is_sticky_after_cancel() {
 	assert!(tx.closed(), "tx must be closed after cancel");
 
 	let err = tx.get(b"k".to_vec(), None).await.expect_err("get after cancel must fail");
-	assert!(matches!(err, crate::kvs::err::Error::TransactionFinished),
-		"expected TransactionFinished after cancel, got {:?}", err);
+	assert!(
+		matches!(err, crate::kvs::err::Error::TransactionFinished),
+		"expected TransactionFinished after cancel, got {:?}",
+		err
+	);
 
 	ds.shutdown().await.expect("shutdown");
 }
@@ -168,8 +177,11 @@ async fn test_write_on_readonly_tx_errors() {
 
 	let tx = ds.transaction(false, false).await.expect("ro tx");
 	let err = tx.set(b"k".to_vec(), b"v".to_vec()).await.expect_err("set on ro tx must fail");
-	assert!(matches!(err, crate::kvs::err::Error::TransactionReadonly),
-		"expected TransactionReadonly, got {:?}", err);
+	assert!(
+		matches!(err, crate::kvs::err::Error::TransactionReadonly),
+		"expected TransactionReadonly, got {:?}",
+		err
+	);
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -220,11 +232,7 @@ async fn test_get_after_set_then_del_in_pending_returns_none() {
 	tx.set(b"k1".to_vec(), b"v1".to_vec()).await.expect("set");
 	tx.del(b"k1".to_vec()).await.expect("del");
 	let result = tx.get(b"k1".to_vec(), None).await.expect("get");
-	assert!(
-		result.is_none(),
-		"pending delete should hide pending set, got {:?}",
-		result
-	);
+	assert!(result.is_none(), "pending delete should hide pending set, got {:?}", result);
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -283,8 +291,12 @@ async fn test_set_commit_get_roundtrip() {
 	// Second transaction: get must see the committed value via Lance scan.
 	let tx = ds.transaction(false, false).await.expect("tx2");
 	let result = tx.get(b"k1".to_vec(), None).await.expect("get");
-	assert_eq!(result.as_deref(), Some(b"v1".as_ref()),
-		"set+commit+get failed: expected Some(v1), got {:?}", result);
+	assert_eq!(
+		result.as_deref(),
+		Some(b"v1".as_ref()),
+		"set+commit+get failed: expected Some(v1), got {:?}",
+		result
+	);
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -304,8 +316,7 @@ async fn test_cancel_discards_pending_writes() {
 
 	let tx = ds.transaction(false, false).await.expect("tx2");
 	let result = tx.get(b"k1".to_vec(), None).await.expect("get");
-	assert!(result.is_none(),
-		"cancel should discard pending writes; got {:?}", result);
+	assert!(result.is_none(), "cancel should discard pending writes; got {:?}", result);
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -328,8 +339,13 @@ async fn test_multiple_sets_commit_atomically() {
 	let tx = ds.transaction(false, false).await.expect("tx2");
 	for (k, v) in [(b"a".as_ref(), b"1".as_ref()), (b"b", b"2"), (b"c", b"3")] {
 		let result = tx.get(k.to_vec(), None).await.expect("get");
-		assert_eq!(result.as_deref(), Some(v),
-			"multi-set commit missing key {:?}: got {:?}", k, result);
+		assert_eq!(
+			result.as_deref(),
+			Some(v),
+			"multi-set commit missing key {:?}: got {:?}",
+			k,
+			result
+		);
 	}
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
@@ -353,8 +369,12 @@ async fn test_del_after_commit_hides_value() {
 	{
 		let tx = ds.transaction(false, false).await.expect("tx2");
 		let result = tx.get(b"k1".to_vec(), None).await.expect("get pre-del");
-		assert_eq!(result.as_deref(), Some(b"v1".as_ref()),
-			"pre-delete sanity failed; got {:?}", result);
+		assert_eq!(
+			result.as_deref(),
+			Some(b"v1".as_ref()),
+			"pre-delete sanity failed; got {:?}",
+			result
+		);
 		tx.cancel().await.expect("cancel");
 	}
 
@@ -368,8 +388,7 @@ async fn test_del_after_commit_hides_value() {
 	// Value should be gone.
 	let tx = ds.transaction(false, false).await.expect("tx4");
 	let result = tx.get(b"k1".to_vec(), None).await.expect("get post-del");
-	assert!(result.is_none(),
-		"del+commit should hide value; got {:?}", result);
+	assert!(result.is_none(), "del+commit should hide value; got {:?}", result);
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -390,8 +409,7 @@ async fn test_put_succeeds_on_missing() {
 	tx.commit().await.expect("commit");
 
 	let tx2 = ds.transaction(false, false).await.expect("tx2");
-	assert_eq!(tx2.get(b"k1".to_vec(), None).await.expect("get").as_deref(),
-		Some(b"v1".as_ref()));
+	assert_eq!(tx2.get(b"k1".to_vec(), None).await.expect("get").as_deref(), Some(b"v1".as_ref()));
 	tx2.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -413,8 +431,11 @@ async fn test_put_fails_on_existing() {
 	// put should now fail.
 	let tx = ds.transaction(true, false).await.expect("tx2");
 	let err = tx.put(b"k1".to_vec(), b"v2".to_vec()).await.expect_err("put should fail");
-	assert!(matches!(err, crate::kvs::err::Error::TransactionKeyAlreadyExists),
-		"expected TransactionKeyAlreadyExists, got {:?}", err);
+	assert!(
+		matches!(err, crate::kvs::err::Error::TransactionKeyAlreadyExists),
+		"expected TransactionKeyAlreadyExists, got {:?}",
+		err
+	);
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -434,14 +455,12 @@ async fn test_putc_matching_value_succeeds() {
 
 	{
 		let tx = ds.transaction(true, false).await.expect("tx2");
-		tx.putc(b"k1".to_vec(), b"v2".to_vec(), Some(b"v1".to_vec()))
-			.await.expect("putc match");
+		tx.putc(b"k1".to_vec(), b"v2".to_vec(), Some(b"v1".to_vec())).await.expect("putc match");
 		tx.commit().await.expect("commit");
 	}
 
 	let tx = ds.transaction(false, false).await.expect("tx3");
-	assert_eq!(tx.get(b"k1".to_vec(), None).await.expect("get").as_deref(),
-		Some(b"v2".as_ref()));
+	assert_eq!(tx.get(b"k1".to_vec(), None).await.expect("get").as_deref(), Some(b"v2".as_ref()));
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -460,10 +479,15 @@ async fn test_putc_mismatched_value_fails() {
 	}
 
 	let tx = ds.transaction(true, false).await.expect("tx2");
-	let err = tx.putc(b"k1".to_vec(), b"v2".to_vec(), Some(b"wrong".to_vec()))
-		.await.expect_err("putc should fail");
-	assert!(matches!(err, crate::kvs::err::Error::TransactionConditionNotMet),
-		"expected TransactionConditionNotMet, got {:?}", err);
+	let err = tx
+		.putc(b"k1".to_vec(), b"v2".to_vec(), Some(b"wrong".to_vec()))
+		.await
+		.expect_err("putc should fail");
+	assert!(
+		matches!(err, crate::kvs::err::Error::TransactionConditionNotMet),
+		"expected TransactionConditionNotMet, got {:?}",
+		err
+	);
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -480,8 +504,7 @@ async fn test_putc_none_chk_on_missing_succeeds() {
 	tx.commit().await.expect("commit");
 
 	let tx2 = ds.transaction(false, false).await.expect("tx2");
-	assert_eq!(tx2.get(b"k1".to_vec(), None).await.expect("get").as_deref(),
-		Some(b"v1".as_ref()));
+	assert_eq!(tx2.get(b"k1".to_vec(), None).await.expect("get").as_deref(), Some(b"v1".as_ref()));
 	tx2.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -499,10 +522,15 @@ async fn test_putc_none_chk_on_existing_fails() {
 	}
 
 	let tx = ds.transaction(true, false).await.expect("tx2");
-	let err = tx.putc(b"k1".to_vec(), b"v2".to_vec(), None)
-		.await.expect_err("putc None on existing must fail");
-	assert!(matches!(err, crate::kvs::err::Error::TransactionConditionNotMet),
-		"expected TransactionConditionNotMet, got {:?}", err);
+	let err = tx
+		.putc(b"k1".to_vec(), b"v2".to_vec(), None)
+		.await
+		.expect_err("putc None on existing must fail");
+	assert!(
+		matches!(err, crate::kvs::err::Error::TransactionConditionNotMet),
+		"expected TransactionConditionNotMet, got {:?}",
+		err
+	);
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -526,8 +554,7 @@ async fn test_delc_matching_value_succeeds() {
 
 	{
 		let tx = ds.transaction(true, false).await.expect("tx2");
-		tx.delc(b"k1".to_vec(), Some(b"v1".to_vec()))
-			.await.expect("delc match");
+		tx.delc(b"k1".to_vec(), Some(b"v1".to_vec())).await.expect("delc match");
 		tx.commit().await.expect("commit");
 	}
 
@@ -552,17 +579,22 @@ async fn test_delc_mismatched_value_fails() {
 
 	{
 		let tx = ds.transaction(true, false).await.expect("tx2");
-		let err = tx.delc(b"k1".to_vec(), Some(b"wrong".to_vec()))
-			.await.expect_err("delc should fail");
-		assert!(matches!(err, crate::kvs::err::Error::TransactionConditionNotMet),
-			"expected TransactionConditionNotMet, got {:?}", err);
+		let err =
+			tx.delc(b"k1".to_vec(), Some(b"wrong".to_vec())).await.expect_err("delc should fail");
+		assert!(
+			matches!(err, crate::kvs::err::Error::TransactionConditionNotMet),
+			"expected TransactionConditionNotMet, got {:?}",
+			err
+		);
 		tx.cancel().await.expect("cancel");
 	}
 
 	let tx = ds.transaction(false, false).await.expect("tx3");
-	assert_eq!(tx.get(b"k1".to_vec(), None).await.expect("get").as_deref(),
+	assert_eq!(
+		tx.get(b"k1".to_vec(), None).await.expect("get").as_deref(),
 		Some(b"v1".as_ref()),
-		"delc with wrong chk should NOT delete the value");
+		"delc with wrong chk should NOT delete the value"
+	);
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -629,7 +661,6 @@ async fn test_set_then_set_returns_latest_value() {
 //  Transaction::scan / scanr tests
 // ============================================================================
 
-use crate::kvs::api::ScanLimit;
 
 /// Helper: seed a dataset with keys a-e mapped to values 1-5, committed.
 async fn seed_a_to_e(ds: &Datastore) {
@@ -650,18 +681,18 @@ async fn test_scan_forward_returns_all_in_order() {
 	seed_a_to_e(&ds).await;
 
 	let tx = ds.transaction(false, false).await.expect("tx");
-	let result = tx.scan(
-		b"a".to_vec()..b"z".to_vec(),
-		ScanLimit::Count(100),
-		0,
-		None,
-	).await.expect("scan");
+	let result =
+		tx.scan(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("scan");
 
-	let keys: Vec<&[u8]> = result.iter().map(|(k, _)| k.as_slice()).collect();
-	assert_eq!(keys, vec![b"a".as_ref(), b"b", b"c", b"d", b"e"],
-		"scan forward should return ascending; got {:?}", keys);
+	let keys: Vec<&[u8]> = result.values.iter().map(|(k, _)| k.as_slice()).collect();
+	assert_eq!(
+		keys,
+		vec![b"a".as_ref(), b"b", b"c", b"d", b"e"],
+		"scan forward should return ascending; got {:?}",
+		keys
+	);
 
-	let vals: Vec<&[u8]> = result.iter().map(|(_, v)| v.as_slice()).collect();
+	let vals: Vec<&[u8]> = result.values.iter().map(|(_, v)| v.as_slice()).collect();
 	assert_eq!(vals, vec![b"1".as_ref(), b"2", b"3", b"4", b"5"]);
 
 	tx.cancel().await.expect("cancel");
@@ -676,16 +707,18 @@ async fn test_scanr_reverse_returns_all_in_descending_order() {
 	seed_a_to_e(&ds).await;
 
 	let tx = ds.transaction(false, false).await.expect("tx");
-	let result = tx.scanr(
-		b"a".to_vec()..b"z".to_vec(),
-		ScanLimit::Count(100),
-		0,
-		None,
-	).await.expect("scanr");
+	let result = tx
+		.scanr(b"a".to_vec()..b"z".to_vec(), 100, 0, None)
+		.await
+		.expect("scanr");
 
-	let keys: Vec<&[u8]> = result.iter().map(|(k, _)| k.as_slice()).collect();
-	assert_eq!(keys, vec![b"e".as_ref(), b"d", b"c", b"b", b"a"],
-		"scanr should return descending; got {:?}", keys);
+	let keys: Vec<&[u8]> = result.values.iter().map(|(k, _)| k.as_slice()).collect();
+	assert_eq!(
+		keys,
+		vec![b"e".as_ref(), b"d", b"c", b"b", b"a"],
+		"scanr should return descending; got {:?}",
+		keys
+	);
 
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
@@ -699,16 +732,11 @@ async fn test_scan_skip_and_limit() {
 	seed_a_to_e(&ds).await;
 
 	let tx = ds.transaction(false, false).await.expect("tx");
-	let result = tx.scan(
-		b"a".to_vec()..b"z".to_vec(),
-		ScanLimit::Count(2),
-		2,
-		None,
-	).await.expect("scan");
+	let result =
+		tx.scan(b"a".to_vec()..b"z".to_vec(), 2, 2, None).await.expect("scan");
 
-	let keys: Vec<&[u8]> = result.iter().map(|(k, _)| k.as_slice()).collect();
-	assert_eq!(keys, vec![b"c".as_ref(), b"d"],
-		"skip 2 take 2 should yield c,d; got {:?}", keys);
+	let keys: Vec<&[u8]> = result.values.iter().map(|(k, _)| k.as_slice()).collect();
+	assert_eq!(keys, vec![b"c".as_ref(), b"d"], "skip 2 take 2 should yield c,d; got {:?}", keys);
 
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
@@ -723,16 +751,16 @@ async fn test_scan_half_open_range_excludes_end() {
 
 	let tx = ds.transaction(false, false).await.expect("tx");
 	// Range [b, d) → b, c (d excluded).
-	let result = tx.scan(
-		b"b".to_vec()..b"d".to_vec(),
-		ScanLimit::Count(100),
-		0,
-		None,
-	).await.expect("scan");
+	let result =
+		tx.scan(b"b".to_vec()..b"d".to_vec(), 100, 0, None).await.expect("scan");
 
-	let keys: Vec<&[u8]> = result.iter().map(|(k, _)| k.as_slice()).collect();
-	assert_eq!(keys, vec![b"b".as_ref(), b"c"],
-		"range [b, d) should yield b,c only; got {:?}", keys);
+	let keys: Vec<&[u8]> = result.values.iter().map(|(k, _)| k.as_slice()).collect();
+	assert_eq!(
+		keys,
+		vec![b"b".as_ref(), b"c"],
+		"range [b, d) should yield b,c only; got {:?}",
+		keys
+	);
 
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
@@ -748,16 +776,16 @@ async fn test_scan_pending_set_appears_in_results() {
 	let tx = ds.transaction(true, false).await.expect("tx");
 	tx.set(b"bb".to_vec(), b"22".to_vec()).await.expect("set pending");
 
-	let result = tx.scan(
-		b"a".to_vec()..b"z".to_vec(),
-		ScanLimit::Count(100),
-		0,
-		None,
-	).await.expect("scan");
+	let result =
+		tx.scan(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("scan");
 
-	let keys: Vec<&[u8]> = result.iter().map(|(k, _)| k.as_slice()).collect();
-	assert_eq!(keys, vec![b"a".as_ref(), b"b", b"bb", b"c", b"d", b"e"],
-		"pending Set 'bb' should appear in order; got {:?}", keys);
+	let keys: Vec<&[u8]> = result.values.iter().map(|(k, _)| k.as_slice()).collect();
+	assert_eq!(
+		keys,
+		vec![b"a".as_ref(), b"b", b"bb", b"c", b"d", b"e"],
+		"pending Set 'bb' should appear in order; got {:?}",
+		keys
+	);
 
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
@@ -773,18 +801,18 @@ async fn test_scan_pending_set_overrides_stored_value() {
 	let tx = ds.transaction(true, false).await.expect("tx");
 	tx.set(b"c".to_vec(), b"33".to_vec()).await.expect("override c");
 
-	let result = tx.scan(
-		b"a".to_vec()..b"z".to_vec(),
-		ScanLimit::Count(100),
-		0,
-		None,
-	).await.expect("scan");
+	let result =
+		tx.scan(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("scan");
 
-	let pair_c = result.iter().find(|(k, _)| k.as_slice() == b"c").expect("c present");
-	assert_eq!(pair_c.1.as_slice(), b"33",
-		"pending override of stored 'c' must win; got {:?}", pair_c.1);
+	let pair_c = result.values.iter().find(|(k, _)| k.as_slice() == b"c").expect("c present");
+	assert_eq!(
+		pair_c.1.as_slice(),
+		b"33",
+		"pending override of stored 'c' must win; got {:?}",
+		pair_c.1
+	);
 	// And there must be exactly ONE entry for c (no duplicate stored+pending row).
-	let count_c = result.iter().filter(|(k, _)| k.as_slice() == b"c").count();
+	let count_c = result.values.iter().filter(|(k, _)| k.as_slice() == b"c").count();
 	assert_eq!(count_c, 1, "merged scan must dedupe 'c' to a single row, got {}", count_c);
 
 	tx.cancel().await.expect("cancel");
@@ -801,16 +829,16 @@ async fn test_scan_pending_delete_hides_stored_row() {
 	let tx = ds.transaction(true, false).await.expect("tx");
 	tx.del(b"c".to_vec()).await.expect("del pending");
 
-	let result = tx.scan(
-		b"a".to_vec()..b"z".to_vec(),
-		ScanLimit::Count(100),
-		0,
-		None,
-	).await.expect("scan");
+	let result =
+		tx.scan(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("scan");
 
-	let keys: Vec<&[u8]> = result.iter().map(|(k, _)| k.as_slice()).collect();
-	assert_eq!(keys, vec![b"a".as_ref(), b"b", b"d", b"e"],
-		"pending Delete of 'c' should hide it; got {:?}", keys);
+	let keys: Vec<&[u8]> = result.values.iter().map(|(k, _)| k.as_slice()).collect();
+	assert_eq!(
+		keys,
+		vec![b"a".as_ref(), b"b", b"d", b"e"],
+		"pending Delete of 'c' should hide it; got {:?}",
+		keys
+	);
 
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
@@ -824,14 +852,10 @@ async fn test_keys_returns_keys_only() {
 	seed_a_to_e(&ds).await;
 
 	let tx = ds.transaction(false, false).await.expect("tx");
-	let result = tx.keys(
-		b"a".to_vec()..b"z".to_vec(),
-		ScanLimit::Count(100),
-		0,
-		None,
-	).await.expect("keys");
+	let result =
+		tx.keys(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("keys");
 
-	let keys: Vec<&[u8]> = result.iter().map(|k| k.as_slice()).collect();
+	let keys: Vec<&[u8]> = result.keys.iter().map(|k| k.as_slice()).collect();
 	assert_eq!(keys, vec![b"a".as_ref(), b"b", b"c", b"d", b"e"]);
 
 	tx.cancel().await.expect("cancel");
@@ -846,14 +870,12 @@ async fn test_keysr_returns_keys_in_reverse() {
 	seed_a_to_e(&ds).await;
 
 	let tx = ds.transaction(false, false).await.expect("tx");
-	let result = tx.keysr(
-		b"a".to_vec()..b"z".to_vec(),
-		ScanLimit::Count(100),
-		0,
-		None,
-	).await.expect("keysr");
+	let result = tx
+		.keysr(b"a".to_vec()..b"z".to_vec(), 100, 0, None)
+		.await
+		.expect("keysr");
 
-	let keys: Vec<&[u8]> = result.iter().map(|k| k.as_slice()).collect();
+	let keys: Vec<&[u8]> = result.keys.iter().map(|k| k.as_slice()).collect();
 	assert_eq!(keys, vec![b"e".as_ref(), b"d", b"c", b"b", b"a"]);
 
 	tx.cancel().await.expect("cancel");
@@ -878,11 +900,15 @@ async fn test_savepoint_rollback_reverts_pending() {
 	tx.rollback_to_save_point().await.expect("rollback");
 
 	// After rollback, k1=v1 (pre-savepoint), k2 absent.
-	assert_eq!(tx.get(b"k1".to_vec(), None).await.expect("get k1").as_deref(),
+	assert_eq!(
+		tx.get(b"k1".to_vec(), None).await.expect("get k1").as_deref(),
 		Some(b"v1".as_ref()),
-		"rollback should restore k1=v1");
-	assert!(tx.get(b"k2".to_vec(), None).await.expect("get k2").is_none(),
-		"rollback should remove k2");
+		"rollback should restore k1=v1"
+	);
+	assert!(
+		tx.get(b"k2".to_vec(), None).await.expect("get k2").is_none(),
+		"rollback should remove k2"
+	);
 
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
@@ -900,14 +926,18 @@ async fn test_savepoint_rollback_restores_deleted_key() {
 	tx.new_save_point().await.expect("save_point");
 	tx.del(b"k1".to_vec()).await.expect("del inside sp");
 	// Inside the savepoint the delete is visible.
-	assert!(tx.get(b"k1".to_vec(), None).await.expect("get pre-rollback").is_none(),
-		"delete must be visible before rollback");
+	assert!(
+		tx.get(b"k1".to_vec(), None).await.expect("get pre-rollback").is_none(),
+		"delete must be visible before rollback"
+	);
 	tx.rollback_to_save_point().await.expect("rollback");
 
 	// After rollback the pre-savepoint write is restored.
-	assert_eq!(tx.get(b"k1".to_vec(), None).await.expect("get post-rollback").as_deref(),
+	assert_eq!(
+		tx.get(b"k1".to_vec(), None).await.expect("get post-rollback").as_deref(),
 		Some(b"v1".as_ref()),
-		"rollback must undo the staged delete and restore k1=v1");
+		"rollback must undo the staged delete and restore k1=v1"
+	);
 
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
@@ -926,9 +956,11 @@ async fn test_savepoint_release_keeps_pending() {
 	tx.release_last_save_point().await.expect("release");
 
 	// After release, k1=v2 stays (release just pops the snapshot without rollback).
-	assert_eq!(tx.get(b"k1".to_vec(), None).await.expect("get k1").as_deref(),
+	assert_eq!(
+		tx.get(b"k1".to_vec(), None).await.expect("get k1").as_deref(),
 		Some(b"v2".as_ref()),
-		"release should NOT revert k1");
+		"release should NOT revert k1"
+	);
 
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
@@ -970,8 +1002,11 @@ async fn test_savepoint_rollback_with_no_savepoint_errors() {
 
 	let tx = ds.transaction(true, false).await.expect("tx");
 	let err = tx.rollback_to_save_point().await.expect_err("should error");
-	assert!(matches!(err, crate::kvs::err::Error::NoSavePointPresent),
-		"expected NoSavePointPresent, got {:?}", err);
+	assert!(
+		matches!(err, crate::kvs::err::Error::NoSavePointPresent),
+		"expected NoSavePointPresent, got {:?}",
+		err
+	);
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -984,8 +1019,11 @@ async fn test_savepoint_release_with_no_savepoint_errors() {
 
 	let tx = ds.transaction(true, false).await.expect("tx");
 	let err = tx.release_last_save_point().await.expect_err("should error");
-	assert!(matches!(err, crate::kvs::err::Error::NoSavePointPresent),
-		"expected NoSavePointPresent, got {:?}", err);
+	assert!(
+		matches!(err, crate::kvs::err::Error::NoSavePointPresent),
+		"expected NoSavePointPresent, got {:?}",
+		err
+	);
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -1073,8 +1111,11 @@ async fn test_versioned_query_with_versioned_false_errors() {
 
 	let tx = ds.transaction(false, false).await.expect("tx");
 	let err = tx.get(b"k".to_vec(), Some(0)).await.expect_err("should error");
-	assert!(matches!(err, crate::kvs::err::Error::UnsupportedVersionedQueries),
-		"expected UnsupportedVersionedQueries, got {:?}", err);
+	assert!(
+		matches!(err, crate::kvs::err::Error::UnsupportedVersionedQueries),
+		"expected UnsupportedVersionedQueries, got {:?}",
+		err
+	);
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -1091,8 +1132,11 @@ async fn test_exists_versioned_with_versioned_false_errors() {
 
 	let tx = ds.transaction(false, false).await.expect("tx");
 	let err = tx.exists(b"k".to_vec(), Some(0)).await.expect_err("should error");
-	assert!(matches!(err, crate::kvs::err::Error::UnsupportedVersionedQueries),
-		"expected UnsupportedVersionedQueries, got {:?}", err);
+	assert!(
+		matches!(err, crate::kvs::err::Error::UnsupportedVersionedQueries),
+		"expected UnsupportedVersionedQueries, got {:?}",
+		err
+	);
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -1216,9 +1260,11 @@ async fn test_property_matches_hashmap_reference() {
 						}
 					}
 					let actual = tx.get(key.clone(), None).await.expect("get");
-					assert_eq!(actual, expected,
+					assert_eq!(
+						actual, expected,
 						"txn {}: get({:?}) mismatch: expected {:?}, got {:?}",
-						txn_i, key, expected, actual);
+						txn_i, key, expected, actual
+					);
 				}
 				_ => unreachable!(),
 			}
@@ -1230,8 +1276,12 @@ async fn test_property_matches_hashmap_reference() {
 			// Apply staged ops to reference.
 			for (k, v) in staged {
 				match v {
-					Some(val) => { reference.insert(k, val); }
-					None => { reference.remove(&k); }
+					Some(val) => {
+						reference.insert(k, val);
+					}
+					None => {
+						reference.remove(&k);
+					}
 				}
 			}
 		} else {
@@ -1246,9 +1296,11 @@ async fn test_property_matches_hashmap_reference() {
 			let key = format!("k{}", n).into_bytes();
 			let actual = verify_tx.get(key.clone(), None).await.expect("verify get");
 			let expected = reference.get(&key).cloned();
-			assert_eq!(actual, expected,
+			assert_eq!(
+				actual, expected,
 				"txn {} post-commit: key {:?} datastore={:?} reference={:?}",
-				txn_i, key, actual, expected);
+				txn_i, key, actual, expected
+			);
 		}
 		verify_tx.cancel().await.expect("verify cancel");
 	}
@@ -1257,92 +1309,30 @@ async fn test_property_matches_hashmap_reference() {
 }
 
 // ============================================================================
-//  ScanLimit::Bytes accounting tests
+//  Scan byte accounting (upstream's ScanResult / KeysResult)
 // ============================================================================
 
-/// ScanLimit::Bytes returns at least the requested byte budget, then stops.
-/// Semantics: include the first entry that pushes the cumulative key+val byte
-/// total over the target. So a small budget still yields ≥ 1 row when data
-/// exists.
+/// Upstream replaced `ScanLimit` with a plain row count and moved byte
+/// accounting into the result: `ScanResult::{key_bytes, value_bytes}` and
+/// `KeysResult::key_bytes` must sum exactly the rows returned.
 #[tokio::test]
-async fn test_scan_limit_bytes_stops_at_budget() {
+async fn test_scan_result_byte_totals_match_rows() {
 	let path = unique_tmp_path();
 	let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
 	seed_a_to_e(&ds).await;
 
 	let tx = ds.transaction(false, false).await.expect("tx");
-	// Each (key, val) = 1 + 1 = 2 bytes here. Budget = 5 → 3 entries
-	// (cumulative 2 → 4 → 6 ≥ 5; stop).
-	let result = tx.scan(
-		b"a".to_vec()..b"z".to_vec(),
-		ScanLimit::Bytes(5),
-		0,
-		None,
-	).await.expect("scan");
-	assert_eq!(result.len(), 3,
-		"Bytes(5) over 2-byte rows should yield 3, got {}", result.len());
-	tx.cancel().await.expect("cancel");
-	ds.shutdown().await.expect("shutdown");
-}
+	let result = tx.scan(b"a".to_vec()..b"z".to_vec(), 3, 0, None).await.expect("scan");
+	assert_eq!(result.values.len(), 3, "count limit 3 should yield 3 rows");
+	let kb: u64 = result.values.iter().map(|(k, _)| k.len() as u64).sum();
+	let vb: u64 = result.values.iter().map(|(_, v)| v.len() as u64).sum();
+	assert!(kb > 0 && vb > 0, "seeded rows must carry bytes (anti-vacuity)");
+	assert_eq!(result.key_bytes, kb);
+	assert_eq!(result.value_bytes, vb);
 
-/// ScanLimit::Bytes with a very large budget returns everything.
-#[tokio::test]
-async fn test_scan_limit_bytes_large_budget_returns_all() {
-	let path = unique_tmp_path();
-	let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
-	seed_a_to_e(&ds).await;
-
-	let tx = ds.transaction(false, false).await.expect("tx");
-	let result = tx.scan(
-		b"a".to_vec()..b"z".to_vec(),
-		ScanLimit::Bytes(1_000_000),
-		0,
-		None,
-	).await.expect("scan");
-	assert_eq!(result.len(), 5, "large budget should yield all 5 seeded keys");
-	tx.cancel().await.expect("cancel");
-	ds.shutdown().await.expect("shutdown");
-}
-
-/// ScanLimit::BytesOrCount stops on whichever limit hits first — count first.
-#[tokio::test]
-async fn test_scan_limit_bytes_or_count_count_wins() {
-	let path = unique_tmp_path();
-	let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
-	seed_a_to_e(&ds).await;
-
-	let tx = ds.transaction(false, false).await.expect("tx");
-	// Bytes=1_000_000 (large) + Count=2 → count wins.
-	let result = tx.scan(
-		b"a".to_vec()..b"z".to_vec(),
-		ScanLimit::BytesOrCount(1_000_000, 2),
-		0,
-		None,
-	).await.expect("scan");
-	assert_eq!(result.len(), 2,
-		"BytesOrCount(huge, 2) should be capped at count=2, got {}", result.len());
-	tx.cancel().await.expect("cancel");
-	ds.shutdown().await.expect("shutdown");
-}
-
-/// ScanLimit::BytesOrCount — bytes side wins.
-#[tokio::test]
-async fn test_scan_limit_bytes_or_count_bytes_wins() {
-	let path = unique_tmp_path();
-	let ds = Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds");
-	seed_a_to_e(&ds).await;
-
-	let tx = ds.transaction(false, false).await.expect("tx");
-	// Bytes=3 + Count=100 → bytes wins after ≥ 2 entries
-	// (cumulative 2 → 4 ≥ 3; stop). Result: 2.
-	let result = tx.scan(
-		b"a".to_vec()..b"z".to_vec(),
-		ScanLimit::BytesOrCount(3, 100),
-		0,
-		None,
-	).await.expect("scan");
-	assert_eq!(result.len(), 2,
-		"BytesOrCount(3, 100) should hit bytes after 2 rows, got {}", result.len());
+	let keys = tx.keys(b"a".to_vec()..b"z".to_vec(), 3, 0, None).await.expect("keys");
+	assert_eq!(keys.keys.len(), 3);
+	assert_eq!(keys.key_bytes, kb);
 	tx.cancel().await.expect("cancel");
 	ds.shutdown().await.expect("shutdown");
 }
@@ -1361,9 +1351,7 @@ async fn test_concurrent_disjoint_writes() {
 
 	let path = unique_tmp_path();
 	let ds = std::sync::Arc::new(
-		Datastore::new(path.to_str().unwrap(), LanceConfig::default())
-			.await
-			.expect("ds"),
+		Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds"),
 	);
 
 	let mut handles = Vec::with_capacity(N_TASKS);
@@ -1422,9 +1410,7 @@ async fn test_concurrent_same_key_yields_one_winner() {
 
 	let path = unique_tmp_path();
 	let ds = std::sync::Arc::new(
-		Datastore::new(path.to_str().unwrap(), LanceConfig::default())
-			.await
-			.expect("ds"),
+		Datastore::new(path.to_str().unwrap(), LanceConfig::default()).await.expect("ds"),
 	);
 
 	let mut handles = Vec::with_capacity(N_TASKS);
@@ -1447,9 +1433,7 @@ async fn test_concurrent_same_key_yields_one_winner() {
 					Err(e) => return Err(e),
 				}
 			}
-			Err(crate::kvs::err::Error::TransactionConflict(
-				"exceeded 5 retries".into(),
-			))
+			Err(crate::kvs::err::Error::TransactionConflict("exceeded 5 retries".into()))
 		}));
 	}
 
@@ -1467,15 +1451,11 @@ async fn test_concurrent_same_key_yields_one_winner() {
 
 	// Final value must be SOMETHING (one of v0..vN-1), not None.
 	let tx = ds.transaction(false, false).await.expect("read tx");
-	let got = tx
-		.get(b"shared".to_vec(), None)
-		.await
-		.expect("get");
+	let got = tx.get(b"shared".to_vec(), None).await.expect("get");
 	let got = got.expect("expected Some(val), got None");
 	let got_str = String::from_utf8_lossy(&got);
 	assert!(
-		got_str.starts_with('v')
-			&& got_str[1..].parse::<usize>().is_ok_and(|n| n < N_TASKS),
+		got_str.starts_with('v') && got_str[1..].parse::<usize>().is_ok_and(|n| n < N_TASKS),
 		"final value must be one of v0..v{}; got {:?}",
 		N_TASKS - 1,
 		got_str
