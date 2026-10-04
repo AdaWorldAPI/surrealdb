@@ -700,14 +700,16 @@ impl TransactionBuilderFactory for CommunityComposer {
 				#[cfg(feature = "kv-lance")]
 				{
 					// Parse Lance-specific configuration from query parameters
-					let config =
-						super::config::LanceConfig::from_params(&params).map_err(Error::Kvs)?;
+					// All Lance knobs are env-driven (`kvs/lance/cnf.rs`).
+					let config = super::config::LanceConfig::default();
 					// Initialise the storage engine
 					let v = super::lance::Datastore::new(&path, config)
 						.await
 						.map(DatastoreFlavor::Lance)?;
 					info!(target: TARGET, "Started {flavour} kvs store");
-					Ok(Box::<DatastoreFlavor>::new(v))
+					Ok(TransactionBuilderParts::without_router_state(Box::<DatastoreFlavor>::new(
+						v,
+					)))
 				}
 				#[cfg(not(feature = "kv-lance"))]
 				bail!(Error::Kvs(crate::kvs::Error::Datastore("Cannot connect to the `lance` storage engine as it is not enabled in this build of SurrealDB".to_owned())));

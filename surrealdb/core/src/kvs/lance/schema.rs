@@ -1,5 +1,6 @@
 #![cfg(feature = "kv-lance")]
-#![allow(dead_code)] // kv-lance helpers: some builders/knobs reserved or vestigial after the native rewrite (prune follow-up)
+#![allow(dead_code)]
+// kv-lance helpers: some builders/knobs reserved or vestigial after the native rewrite (prune follow-up)
 
 //! Arrow schema for the SurrealDB KV pair layout on top of Lance.
 //!
@@ -38,9 +39,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-	BinaryArray, BooleanArray, RecordBatch, UInt64Array,
-};
+use arrow_array::{BinaryArray, BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 
 use crate::kvs::{Key, Val};
@@ -82,21 +81,13 @@ impl KvSchema {
 	) -> Result<RecordBatch, arrow_schema::ArrowError> {
 		let schema = Self::arrow_schema_ref();
 
-		let key_array: BinaryArray = writes
-			.iter()
-			.map(|(k, _)| Some(k.as_slice()))
-			.collect();
-		let val_array: BinaryArray = writes
-			.iter()
-			.map(|(_, v)| Some(v.as_slice()))
-			.collect();
-		let version_array: UInt64Array =
-			std::iter::repeat_n(version, writes.len()).collect();
+		let key_array: BinaryArray = writes.iter().map(|(k, _)| Some(k.as_slice())).collect();
+		let val_array: BinaryArray = writes.iter().map(|(_, v)| Some(v.as_slice())).collect();
+		let version_array: UInt64Array = std::iter::repeat_n(version, writes.len()).collect();
 		let tombstone_array = BooleanArray::from(vec![false; writes.len()]);
 		// This helper has no per-row seq input; default `seq = version`.
 		// The production builders in `mod.rs` carry true per-commit seqs.
-		let seq_array: UInt64Array =
-			std::iter::repeat_n(version, writes.len()).collect();
+		let seq_array: UInt64Array = std::iter::repeat_n(version, writes.len()).collect();
 
 		RecordBatch::try_new(
 			schema,
@@ -124,17 +115,13 @@ impl KvSchema {
 		let schema = Self::arrow_schema_ref();
 		let empty_val: &[u8] = &[];
 
-		let key_array: BinaryArray =
-			deletes.iter().map(|k| Some(k.as_slice())).collect();
-		let val_array: BinaryArray =
-			std::iter::repeat_n(Some(empty_val), deletes.len()).collect();
-		let version_array: UInt64Array =
-			std::iter::repeat_n(version, deletes.len()).collect();
+		let key_array: BinaryArray = deletes.iter().map(|k| Some(k.as_slice())).collect();
+		let val_array: BinaryArray = std::iter::repeat_n(Some(empty_val), deletes.len()).collect();
+		let version_array: UInt64Array = std::iter::repeat_n(version, deletes.len()).collect();
 		let tombstone_array = BooleanArray::from(vec![true; deletes.len()]);
 		// No per-row seq input here; default `seq = version` (see the
 		// note in `build_write_batch`).
-		let seq_array: UInt64Array =
-			std::iter::repeat_n(version, deletes.len()).collect();
+		let seq_array: UInt64Array = std::iter::repeat_n(version, deletes.len()).collect();
 
 		RecordBatch::try_new(
 			schema,
@@ -197,10 +184,8 @@ mod tests {
 
 	#[test]
 	fn write_batch_roundtrip() {
-		let writes = vec![
-			(b"key1".to_vec(), b"val1".to_vec()),
-			(b"key2".to_vec(), b"val2".to_vec()),
-		];
+		let writes =
+			vec![(b"key1".to_vec(), b"val1".to_vec()), (b"key2".to_vec(), b"val2".to_vec())];
 		let batch = KvSchema::build_write_batch(&writes, 42).unwrap();
 		assert_eq!(batch.num_rows(), 2);
 		assert_eq!(batch.num_columns(), 5);

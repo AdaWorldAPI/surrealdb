@@ -70,13 +70,7 @@ impl BackgroundOptimizer {
 		let shutdown_for_task = Arc::clone(&shutdown);
 
 		tokio::spawn(async move {
-			Self::run_loop(
-				dataset_for_task,
-				notify_for_task,
-				shutdown_for_task,
-				interval_ns,
-			)
-			.await;
+			Self::run_loop(dataset_for_task, notify_for_task, shutdown_for_task, interval_ns).await;
 		});
 
 		Self {
@@ -186,19 +180,13 @@ impl BackgroundOptimizer {
 			// ------------------------------------------------------------------
 			let retention_secs = *super::cnf::LANCE_VERSION_RETENTION_SECS;
 			if retention_secs > 0 {
-				let cutoff = chrono::Utc::now()
-					- chrono::TimeDelta::seconds(retention_secs as i64);
+				let cutoff = chrono::Utc::now() - chrono::TimeDelta::seconds(retention_secs as i64);
 				let policy = lance::dataset::cleanup::CleanupPolicy {
 					before_timestamp: Some(cutoff),
 					error_if_tagged_old_versions: false, // skip tagged, don't error
 					..Default::default()
 				};
-				match lance::dataset::cleanup::cleanup_old_versions(
-					&ds.inner,
-					policy,
-				)
-				.await
-				{
+				match lance::dataset::cleanup::cleanup_old_versions(&ds.inner, policy).await {
 					Ok(stats) => {
 						tracing::debug!(
 							target = "surrealdb::core::kvs::lance::optimizer",

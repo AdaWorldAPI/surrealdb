@@ -313,6 +313,7 @@ pub fn into_types_error(error: Error) -> TypesError {
 			| KvsError::Transaction(_)
 			| KvsError::TimestampInvalid(_)
 			| KvsError::Internal(_)
+			| KvsError::NoSavePointPresent
 			| KvsError::CompactionNotSupported => TypesError::internal(message),
 		},
 

@@ -95,7 +95,6 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lance::Dataset as LanceDataset;
 use lance::dataset::WriteParams;
@@ -109,7 +108,7 @@ use schema::KvSchema;
 use tx_buffer::{PendingBuffer, PendingEntry};
 
 use super::Direction;
-use super::api::ScanLimit;
+use super::api::{BoxFut, KeysResult, ScanResult};
 use super::config::LanceConfig;
 use super::err::{Error, Result};
 use crate::key::debug::Sprintable;
@@ -196,10 +195,8 @@ impl Datastore {
 			.await
 			.map_err(|e| Error::Datastore(format!("seq seed scan: {e}")))?;
 		let mut max_seq: u64 = 0;
-		while let Some(batch) = stream
-			.try_next()
-			.await
-			.map_err(|e| Error::Datastore(format!("seq seed next: {e}")))?
+		while let Some(batch) =
+			stream.try_next().await.map_err(|e| Error::Datastore(format!("seq seed next: {e}")))?
 		{
 			if let Some(col) = batch
 				.column_by_name("seq")
@@ -230,7 +227,9 @@ impl Datastore {
 				info!(target: TARGET, "Opened existing Lance dataset at: {}", path);
 				ds
 			}
-			Err(lance::Error::DatasetNotFound { .. }) => {
+			Err(lance::Error::DatasetNotFound {
+				..
+			}) => {
 				info!(target: TARGET, "Dataset not found — creating new Lance dataset at: {}", path);
 				// Build an empty RecordBatch reader typed with the KV schema.
 				// Sprint R unification: lance 4.0 and our Cargo.toml both pin
@@ -245,10 +244,7 @@ impl Datastore {
 				]));
 				let empty_reader = arrow_array::RecordBatchIterator::new(
 					std::iter::empty::<
-						std::result::Result<
-							arrow_array::RecordBatch,
-							arrow_schema::ArrowError,
-						>,
+						std::result::Result<arrow_array::RecordBatch, arrow_schema::ArrowError>,
 					>(),
 					schema,
 				);
@@ -331,11 +327,7 @@ impl Datastore {
 	}
 
 	/// Begin a new transaction against this datastore.
-	pub(crate) async fn transaction(
-		&self,
-		write: bool,
-		_lock: bool,
-	) -> Result<Transaction> {
+	pub(crate) async fn transaction(&self, write: bool, _lock: bool) -> Result<Transaction> {
 		Ok(Transaction {
 			done: AtomicBool::new(false),
 			write,
@@ -399,10 +391,8 @@ impl Datastore {
 			.await
 			.map_err(|e| Error::Datastore(format!("ver scan stream: {e}")))?;
 		let mut out: Vec<(Key, u64)> = Vec::new();
-		while let Some(batch) = stream
-			.try_next()
-			.await
-			.map_err(|e| Error::Datastore(format!("ver scan next: {e}")))?
+		while let Some(batch) =
+			stream.try_next().await.map_err(|e| Error::Datastore(format!("ver scan next: {e}")))?
 		{
 			let key_col = batch
 				.column_by_name("key")
@@ -443,10 +433,8 @@ impl Datastore {
 			.map_err(|e| Error::Datastore(format!("seq scan stream: {e}")))?;
 
 		let mut out: Vec<(Key, u64, bool)> = Vec::new();
-		while let Some(batch) = stream
-			.try_next()
-			.await
-			.map_err(|e| Error::Datastore(format!("seq scan next: {e}")))?
+		while let Some(batch) =
+			stream.try_next().await.map_err(|e| Error::Datastore(format!("seq scan next: {e}")))?
 		{
 			let key_col = batch
 				.column_by_name("key")
@@ -521,7 +509,6 @@ pub struct Transaction {
 	commit_seq: Arc<AtomicU64>,
 }
 
-#[async_trait]
 impl Transactable for Transaction {
 	fn kind(&self) -> &'static str {
 		"lance"
@@ -550,83 +537,87 @@ impl Transactable for Transaction {
 	/// intermediate version. This is the only place lance OCC conflicts can
 	/// surface.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self))]
-	async fn commit(&self) -> Result<()> {
-		if self.closed() {
-			return Err(Error::TransactionFinished);
-		}
-		if !self.writeable() {
-			return Err(Error::TransactionReadonly);
-		}
+	fn commit(&self) -> BoxFut<'_, Result<()>> {
+		Box::pin(async move {
+			if self.closed() {
+				return Err(Error::TransactionFinished);
+			}
+			if !self.writeable() {
+				return Err(Error::TransactionReadonly);
+			}
 
-		// Drain the pending buffer into owned microcopies. After this point
-		// the transaction owns the bytes and we drop the read guard before
-		// crossing any await boundary.
-		let (writes, deletes) = {
-			let pending = self.pending.read().await;
-			pending.partition()
-		};
+			// Drain the pending buffer into owned microcopies. After this point
+			// the transaction owns the bytes and we drop the read guard before
+			// crossing any await boundary.
+			let (writes, deletes) = {
+				let pending = self.pending.read().await;
+				pending.partition()
+			};
 
-		if writes.is_empty() && deletes.is_empty() {
+			if writes.is_empty() && deletes.is_empty() {
+				self.done.store(true, Ordering::Release);
+				return Ok(());
+			}
+
+			// One per-commit seq for this transaction; every row it writes
+			// carries it into Lance's `seq` column.
+			let seq = self.commit_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+			// Per-row `version` stamp: the datastore's real monotonic commit
+			// versionstamp (HLC in prod = `millis << 16 | counter`), NOT the old
+			// `read_version + 1` GUESS. That guess silently drifted from the true
+			// dataset version whenever a background optimize / concurrent commit
+			// minted a Lance version, making it a misleading "surreal version
+			// pointer". Time-travel reads do NOT key off this column — they map the
+			// requested instant onto a Lance native version (`lance_version_as_of`),
+			// so versioning is fully transparent; this column is an informational,
+			// wall-clock-comparable commit stamp.
+			let version = self.timestamp().await?.as_versionstamp() as u64;
+			let write_seqs = vec![seq; writes.len()];
+			let delete_seqs = vec![seq; deletes.len()];
+
+			// Build the merge source: live rows for writes, tombstone rows for
+			// deletes. Identical schema, so both stream through one reader and
+			// land as ONE dataset version.
+			let mut batches: Vec<arrow_array::RecordBatch> = Vec::with_capacity(2);
+			if !writes.is_empty() {
+				batches.push(
+					Self::build_write_batch_lance(&writes, version, &write_seqs)
+						.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?,
+				);
+			}
+			if !deletes.is_empty() {
+				batches.push(
+					Self::build_tombstone_batch_lance(&deletes, version, &delete_seqs)
+						.map_err(|e| Error::Datastore(format!("lance build tombstones: {e}")))?,
+				);
+			}
+
+			// ONE native merge-insert = one lance version.
+			Self::execute_merge(&self.dataset, batches).await?;
+
 			self.done.store(true, Ordering::Release);
-			return Ok(());
-		}
 
-		// One per-commit seq for this transaction; every row it writes
-		// carries it into Lance's `seq` column.
-		let seq = self.commit_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-		// Per-row `version` stamp: the datastore's real monotonic commit
-		// versionstamp (HLC in prod = `millis << 16 | counter`), NOT the old
-		// `read_version + 1` GUESS. That guess silently drifted from the true
-		// dataset version whenever a background optimize / concurrent commit
-		// minted a Lance version, making it a misleading "surreal version
-		// pointer". Time-travel reads do NOT key off this column — they map the
-		// requested instant onto a Lance native version (`lance_version_as_of`),
-		// so versioning is fully transparent; this column is an informational,
-		// wall-clock-comparable commit stamp.
-		let version = self.timestamp().await?.as_versionstamp() as u64;
-		let write_seqs = vec![seq; writes.len()];
-		let delete_seqs = vec![seq; deletes.len()];
+			// Notify the optimizer — it gauges write activity and may trigger
+			// lance compaction once enough commits have landed.
+			if let Some(opt) = &self.background_optimizer {
+				opt.notify_commit().await;
+			}
 
-		// Build the merge source: live rows for writes, tombstone rows for
-		// deletes. Identical schema, so both stream through one reader and
-		// land as ONE dataset version.
-		let mut batches: Vec<arrow_array::RecordBatch> = Vec::with_capacity(2);
-		if !writes.is_empty() {
-			batches.push(
-				Self::build_write_batch_lance(&writes, version, &write_seqs)
-					.map_err(|e| Error::Datastore(format!("lance build batch: {e}")))?,
-			);
-		}
-		if !deletes.is_empty() {
-			batches.push(
-				Self::build_tombstone_batch_lance(&deletes, version, &delete_seqs)
-					.map_err(|e| Error::Datastore(format!("lance build tombstones: {e}")))?,
-			);
-		}
-
-		// ONE native merge-insert = one lance version.
-		Self::execute_merge(&self.dataset, batches).await?;
-
-		self.done.store(true, Ordering::Release);
-
-		// Notify the optimizer — it gauges write activity and may trigger
-		// lance compaction once enough commits have landed.
-		if let Some(opt) = &self.background_optimizer {
-			opt.notify_commit().await;
-		}
-
-		Ok(())
+			Ok(())
+		})
 	}
 
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self))]
-	async fn cancel(&self) -> Result<()> {
-		if self.closed() {
-			return Err(Error::TransactionFinished);
-		}
-		self.pending.write().await.clear();
-		self.save_points.write().await.clear();
-		self.done.store(true, Ordering::Release);
-		Ok(())
+	fn cancel(&self) -> BoxFut<'_, Result<()>> {
+		Box::pin(async move {
+			if self.closed() {
+				return Err(Error::TransactionFinished);
+			}
+			self.pending.write().await.clear();
+			self.save_points.write().await.clear();
+			self.done.store(true, Ordering::Release);
+			Ok(())
+		})
 	}
 
 	// ------------------------------------------------------------------------
@@ -634,8 +625,8 @@ impl Transactable for Transaction {
 	// ------------------------------------------------------------------------
 
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
-	async fn exists(&self, key: Key, version: Option<u64>) -> Result<bool> {
-		self.get(key, version).await.map(|v| v.is_some())
+	fn exists(&self, key: Key, version: Option<u64>) -> BoxFut<'_, Result<bool>> {
+		Box::pin(async move { self.get(key, version).await.map(|v| v.is_some()) })
 	}
 
 	/// Resolve a key by:
@@ -644,85 +635,85 @@ impl Transactable for Transaction {
 	///     requested (`checkout_version`), else @ latest — with a
 	///     `key = ? AND tombstone = false` filter, limit 1.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
-	async fn get(&self, key: Key, version: Option<u64>) -> Result<Option<Val>> {
-		if !self.versioned && version.is_some() {
-			return Err(Error::UnsupportedVersionedQueries);
-		}
-		if self.closed() {
-			return Err(Error::TransactionFinished);
-		}
+	fn get(&self, key: Key, version: Option<u64>) -> BoxFut<'_, Result<Option<Val>>> {
+		Box::pin(async move {
+			if !self.versioned && version.is_some() {
+				return Err(Error::UnsupportedVersionedQueries);
+			}
+			if self.closed() {
+				return Err(Error::TransactionFinished);
+			}
 
-		// (1) Check pending buffer (read-your-writes). A pending tombstone
-		// returns None.
-		if let Some(pending_entry) = self.pending.read().await.get(&key) {
-			return Ok(match pending_entry {
-				PendingEntry::Set(v) => Some(v.clone()),
-				PendingEntry::Delete => None,
-			});
-		}
+			// (1) Check pending buffer (read-your-writes). A pending tombstone
+			// returns None.
+			if let Some(pending_entry) = self.pending.read().await.get(&key) {
+				return Ok(match pending_entry {
+					PendingEntry::Set(v) => Some(v.clone()),
+					PendingEntry::Delete => None,
+				});
+			}
 
-		// (2) Fall through to a native Lance scan.
-		//
-		// Snapshot selection (TRANSPARENT versioning):
-		// - `version.is_some()` → map the versionstamp to the Lance version
-		//   AS OF that instant (`lance_version_as_of`, via Lance's native
-		//   per-version timestamps) and `checkout_version` it; no version
-		//   at-or-before that instant → `None` (key did not exist yet).
-		// - `version.is_none()` → read Lance @ latest. Every committed
-		//   write is its own lance version, so the latest manifest already
-		//   reflects all durable commits; pinning to a stale `read_version`
-		//   would hide rows committed by concurrent transactions.
-		let ds = self.dataset.read().await;
-		let snapshot = match version {
-			Some(v) => {
-				let Some(lance_v) = self.lance_version_as_of(&ds.inner, v).await else {
-					return Ok(None);
-				};
-				match ds.inner.checkout_version(lance_v).await.ok() {
-					Some(s) => s,
-					None => return Ok(None),
+			// (2) Fall through to a native Lance scan.
+			//
+			// Snapshot selection (TRANSPARENT versioning):
+			// - `version.is_some()` → map the versionstamp to the Lance version
+			//   AS OF that instant (`lance_version_as_of`, via Lance's native
+			//   per-version timestamps) and `checkout_version` it; no version
+			//   at-or-before that instant → `None` (key did not exist yet).
+			// - `version.is_none()` → read Lance @ latest. Every committed
+			//   write is its own lance version, so the latest manifest already
+			//   reflects all durable commits; pinning to a stale `read_version`
+			//   would hide rows committed by concurrent transactions.
+			let ds = self.dataset.read().await;
+			let snapshot = match version {
+				Some(v) => {
+					let Some(lance_v) = self.lance_version_as_of(&ds.inner, v).await else {
+						return Ok(None);
+					};
+					match ds.inner.checkout_version(lance_v).await.ok() {
+						Some(s) => s,
+						None => return Ok(None),
+					}
+				}
+				None => ds.inner.clone(),
+			};
+
+			let filter = KvSchema::build_get_predicate(&key);
+
+			let mut scanner = snapshot.scan();
+			scanner
+				.filter(&filter)
+				.map_err(|e| Error::Datastore(format!("lance scan filter: {e}")))?
+				.project(&["val", "version"])
+				.map_err(|e| Error::Datastore(format!("lance scan project: {e}")))?
+				.limit(Some(1), None)
+				.map_err(|e| Error::Datastore(format!("lance scan limit: {e}")))?;
+
+			let mut stream = scanner
+				.try_into_stream()
+				.await
+				.map_err(|e| Error::Datastore(format!("lance scan stream: {e}")))?;
+
+			use futures::TryStreamExt;
+			while let Some(batch) = stream
+				.try_next()
+				.await
+				.map_err(|e| Error::Datastore(format!("lance scan next: {e}")))?
+			{
+				if batch.num_rows() > 0 {
+					let val_col = batch
+						.column_by_name("val")
+						.ok_or_else(|| Error::Datastore("lance scan: missing val column".into()))?;
+					let val_array =
+						val_col.as_any().downcast_ref::<arrow_array::BinaryArray>().ok_or_else(
+							|| Error::Datastore("lance scan: val column type mismatch".into()),
+						)?;
+					return Ok(Some(val_array.value(0).to_vec()));
 				}
 			}
-			None => ds.inner.clone(),
-		};
 
-		let filter = KvSchema::build_get_predicate(&key);
-
-		let mut scanner = snapshot.scan();
-		scanner
-			.filter(&filter)
-			.map_err(|e| Error::Datastore(format!("lance scan filter: {e}")))?
-			.project(&["val", "version"])
-			.map_err(|e| Error::Datastore(format!("lance scan project: {e}")))?
-			.limit(Some(1), None)
-			.map_err(|e| Error::Datastore(format!("lance scan limit: {e}")))?;
-
-		let mut stream = scanner
-			.try_into_stream()
-			.await
-			.map_err(|e| Error::Datastore(format!("lance scan stream: {e}")))?;
-
-		use futures::TryStreamExt;
-		while let Some(batch) = stream
-			.try_next()
-			.await
-			.map_err(|e| Error::Datastore(format!("lance scan next: {e}")))?
-		{
-			if batch.num_rows() > 0 {
-				let val_col = batch
-					.column_by_name("val")
-					.ok_or_else(|| Error::Datastore("lance scan: missing val column".into()))?;
-				let val_array = val_col
-					.as_any()
-					.downcast_ref::<arrow_array::BinaryArray>()
-					.ok_or_else(|| {
-						Error::Datastore("lance scan: val column type mismatch".into())
-					})?;
-				return Ok(Some(val_array.value(0).to_vec()));
-			}
-		}
-
-		Ok(None)
+			Ok(None)
+		})
 	}
 
 	// ------------------------------------------------------------------------
@@ -731,15 +722,17 @@ impl Transactable for Transaction {
 
 	/// Insert or overwrite a key. Buffered until commit.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
-	async fn set(&self, key: Key, val: Val) -> Result<()> {
-		if self.closed() {
-			return Err(Error::TransactionFinished);
-		}
-		if !self.writeable() {
-			return Err(Error::TransactionReadonly);
-		}
-		self.pending.write().await.set(key, val);
-		Ok(())
+	fn set(&self, key: Key, val: Val) -> BoxFut<'_, Result<()>> {
+		Box::pin(async move {
+			if self.closed() {
+				return Err(Error::TransactionFinished);
+			}
+			if !self.writeable() {
+				return Err(Error::TransactionReadonly);
+			}
+			self.pending.write().await.set(key, val);
+			Ok(())
+		})
 	}
 
 	/// Insert only if key does not exist. Performs a read-side check
@@ -751,77 +744,85 @@ impl Transactable for Transaction {
 	/// concurrently, one will succeed at commit and the other will get a
 	/// conflict-error and must retry.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
-	async fn put(&self, key: Key, val: Val) -> Result<()> {
-		if self.closed() {
-			return Err(Error::TransactionFinished);
-		}
-		if !self.writeable() {
-			return Err(Error::TransactionReadonly);
-		}
-		if self.exists(key.clone(), None).await? {
-			return Err(Error::TransactionKeyAlreadyExists);
-		}
-		self.pending.write().await.set(key, val);
-		Ok(())
+	fn put(&self, key: Key, val: Val) -> BoxFut<'_, Result<()>> {
+		Box::pin(async move {
+			if self.closed() {
+				return Err(Error::TransactionFinished);
+			}
+			if !self.writeable() {
+				return Err(Error::TransactionReadonly);
+			}
+			if self.exists(key.clone(), None).await? {
+				return Err(Error::TransactionKeyAlreadyExists);
+			}
+			self.pending.write().await.set(key, val);
+			Ok(())
+		})
 	}
 
 	/// Compare-and-Set: write `val` only if current value matches `chk`.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
-	async fn putc(&self, key: Key, val: Val, chk: Option<Val>) -> Result<()> {
-		if self.closed() {
-			return Err(Error::TransactionFinished);
-		}
-		if !self.writeable() {
-			return Err(Error::TransactionReadonly);
-		}
-		let current = self.get(key.clone(), None).await?;
-		match (current, chk) {
-			(Some(v), Some(w)) if v == w => {
-				self.pending.write().await.set(key, val);
-				Ok(())
+	fn putc(&self, key: Key, val: Val, chk: Option<Val>) -> BoxFut<'_, Result<()>> {
+		Box::pin(async move {
+			if self.closed() {
+				return Err(Error::TransactionFinished);
 			}
-			(None, None) => {
-				self.pending.write().await.set(key, val);
-				Ok(())
+			if !self.writeable() {
+				return Err(Error::TransactionReadonly);
 			}
-			_ => Err(Error::TransactionConditionNotMet),
-		}
+			let current = self.get(key.clone(), None).await?;
+			match (current, chk) {
+				(Some(v), Some(w)) if v == w => {
+					self.pending.write().await.set(key, val);
+					Ok(())
+				}
+				(None, None) => {
+					self.pending.write().await.set(key, val);
+					Ok(())
+				}
+				_ => Err(Error::TransactionConditionNotMet),
+			}
+		})
 	}
 
 	/// Delete a key. Buffered as a tombstone until commit.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
-	async fn del(&self, key: Key) -> Result<()> {
-		if self.closed() {
-			return Err(Error::TransactionFinished);
-		}
-		if !self.writeable() {
-			return Err(Error::TransactionReadonly);
-		}
-		self.pending.write().await.delete(key);
-		Ok(())
+	fn del(&self, key: Key) -> BoxFut<'_, Result<()>> {
+		Box::pin(async move {
+			if self.closed() {
+				return Err(Error::TransactionFinished);
+			}
+			if !self.writeable() {
+				return Err(Error::TransactionReadonly);
+			}
+			self.pending.write().await.delete(key);
+			Ok(())
+		})
 	}
 
 	/// Compare-and-Delete: delete `key` only if current value matches `chk`.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
-	async fn delc(&self, key: Key, chk: Option<Val>) -> Result<()> {
-		if self.closed() {
-			return Err(Error::TransactionFinished);
-		}
-		if !self.writeable() {
-			return Err(Error::TransactionReadonly);
-		}
-		let current = self.get(key.clone(), None).await?;
-		match (current, chk) {
-			(Some(v), Some(w)) if v == w => {
-				self.pending.write().await.delete(key);
-				Ok(())
+	fn delc(&self, key: Key, chk: Option<Val>) -> BoxFut<'_, Result<()>> {
+		Box::pin(async move {
+			if self.closed() {
+				return Err(Error::TransactionFinished);
 			}
-			(None, None) => {
-				// Nothing to delete; conditional satisfied trivially.
-				Ok(())
+			if !self.writeable() {
+				return Err(Error::TransactionReadonly);
 			}
-			_ => Err(Error::TransactionConditionNotMet),
-		}
+			let current = self.get(key.clone(), None).await?;
+			match (current, chk) {
+				(Some(v), Some(w)) if v == w => {
+					self.pending.write().await.delete(key);
+					Ok(())
+				}
+				(None, None) => {
+					// Nothing to delete; conditional satisfied trivially.
+					Ok(())
+				}
+				_ => Err(Error::TransactionConditionNotMet),
+			}
+		})
 	}
 
 	// ------------------------------------------------------------------------
@@ -829,49 +830,79 @@ impl Transactable for Transaction {
 	// ------------------------------------------------------------------------
 
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(rng = rng.sprint()))]
-	async fn keys(
+	fn keys(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
-	) -> Result<Vec<Key>> {
-		let pairs = self.scan(rng, limit, skip, version).await?;
-		Ok(pairs.into_iter().map(|(k, _v)| k).collect())
+	) -> BoxFut<'_, Result<KeysResult>> {
+		Box::pin(async move {
+			let pairs = self.scan(rng, limit, skip, version).await?;
+			let keys: Vec<Key> = pairs.values.into_iter().map(|(k, _v)| k).collect();
+			Ok(KeysResult {
+				key_bytes: pairs.key_bytes,
+				keys,
+			})
+		})
 	}
 
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(rng = rng.sprint()))]
-	async fn keysr(
+	fn keysr(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
-	) -> Result<Vec<Key>> {
-		let pairs = self.scanr(rng, limit, skip, version).await?;
-		Ok(pairs.into_iter().map(|(k, _v)| k).collect())
+	) -> BoxFut<'_, Result<KeysResult>> {
+		Box::pin(async move {
+			let pairs = self.scanr(rng, limit, skip, version).await?;
+			let keys: Vec<Key> = pairs.values.into_iter().map(|(k, _v)| k).collect();
+			Ok(KeysResult {
+				key_bytes: pairs.key_bytes,
+				keys,
+			})
+		})
 	}
 
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(rng = rng.sprint()))]
-	async fn scan(
+	fn scan(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
-	) -> Result<Vec<(Key, Val)>> {
-		self.scan_impl(rng, limit, skip, version, Direction::Forward).await
+	) -> BoxFut<'_, Result<ScanResult>> {
+		Box::pin(async move {
+			let values = self.scan_impl(rng, limit, skip, version, Direction::Forward).await?;
+			let key_bytes = values.iter().map(|(k, _)| k.len() as u64).sum();
+			let value_bytes = values.iter().map(|(_, v)| v.len() as u64).sum();
+			Ok(ScanResult {
+				values,
+				key_bytes,
+				value_bytes,
+			})
+		})
 	}
 
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(rng = rng.sprint()))]
-	async fn scanr(
+	fn scanr(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
-	) -> Result<Vec<(Key, Val)>> {
-		self.scan_impl(rng, limit, skip, version, Direction::Backward).await
+	) -> BoxFut<'_, Result<ScanResult>> {
+		Box::pin(async move {
+			let values = self.scan_impl(rng, limit, skip, version, Direction::Backward).await?;
+			let key_bytes = values.iter().map(|(k, _)| k.len() as u64).sum();
+			let value_bytes = values.iter().map(|(_, v)| v.len() as u64).sum();
+			Ok(ScanResult {
+				values,
+				key_bytes,
+				value_bytes,
+			})
+		})
 	}
 
 	// ------------------------------------------------------------------------
@@ -880,44 +911,41 @@ impl Transactable for Transaction {
 
 	/// Push the current state of `pending` onto the save-point stack.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self))]
-	async fn new_save_point(&self) -> Result<()> {
-		if self.closed() {
-			return Err(Error::TransactionFinished);
-		}
-		let snapshot = self.pending.read().await.clone();
-		self.save_points.write().await.push(snapshot);
-		Ok(())
+	fn new_save_point(&self) -> BoxFut<'_, Result<()>> {
+		Box::pin(async move {
+			if self.closed() {
+				return Err(Error::TransactionFinished);
+			}
+			let snapshot = self.pending.read().await.clone();
+			self.save_points.write().await.push(snapshot);
+			Ok(())
+		})
 	}
 
 	/// Replace `pending` with the most recently saved snapshot.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self))]
-	async fn rollback_to_save_point(&self) -> Result<()> {
-		if self.closed() {
-			return Err(Error::TransactionFinished);
-		}
-		let snapshot = self
-			.save_points
-			.write()
-			.await
-			.pop()
-			.ok_or(Error::NoSavePointPresent)?;
-		*self.pending.write().await = snapshot;
-		Ok(())
+	fn rollback_to_save_point(&self) -> BoxFut<'_, Result<()>> {
+		Box::pin(async move {
+			if self.closed() {
+				return Err(Error::TransactionFinished);
+			}
+			let snapshot = self.save_points.write().await.pop().ok_or(Error::NoSavePointPresent)?;
+			*self.pending.write().await = snapshot;
+			Ok(())
+		})
 	}
 
 	/// Pop the most recent save-point without applying it (commit it into
 	/// the parent scope).
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self))]
-	async fn release_last_save_point(&self) -> Result<()> {
-		if self.closed() {
-			return Err(Error::TransactionFinished);
-		}
-		self.save_points
-			.write()
-			.await
-			.pop()
-			.ok_or(Error::NoSavePointPresent)?;
-		Ok(())
+	fn release_last_save_point(&self) -> BoxFut<'_, Result<()>> {
+		Box::pin(async move {
+			if self.closed() {
+				return Err(Error::TransactionFinished);
+			}
+			self.save_points.write().await.pop().ok_or(Error::NoSavePointPresent)?;
+			Ok(())
+		})
 	}
 }
 
@@ -935,10 +963,7 @@ impl Transaction {
 		writes: &[(crate::kvs::Key, crate::kvs::Val)],
 		version: u64,
 		seqs: &[u64],
-	) -> std::result::Result<
-		arrow_array::RecordBatch,
-		arrow_schema::ArrowError,
-	> {
+	) -> std::result::Result<arrow_array::RecordBatch, arrow_schema::ArrowError> {
 		use arrow_array::{BinaryArray, BooleanArray, RecordBatch, UInt64Array};
 		use arrow_schema::{DataType, Field, Schema};
 		use std::sync::Arc;
@@ -961,10 +986,8 @@ impl Transaction {
 			Field::new("seq", DataType::UInt64, false),
 		]));
 
-		let key_array: BinaryArray =
-			writes.iter().map(|(k, _)| Some(k.as_slice())).collect();
-		let val_array: BinaryArray =
-			writes.iter().map(|(_, v)| Some(v.as_slice())).collect();
+		let key_array: BinaryArray = writes.iter().map(|(k, _)| Some(k.as_slice())).collect();
+		let val_array: BinaryArray = writes.iter().map(|(_, v)| Some(v.as_slice())).collect();
 		let version_array = UInt64Array::from(vec![version; writes.len()]);
 		let tombstone_array = BooleanArray::from(vec![false; writes.len()]);
 		let seq_array = UInt64Array::from(seqs.to_vec());
@@ -1104,10 +1127,8 @@ impl Transaction {
 	/// counter that also advances on background compaction — the two spaces
 	/// diverge, so `checkout_version(versionstamp)` was always wrong).
 	async fn lance_version_as_of(&self, ds: &LanceDataset, versionstamp: u64) -> Option<u64> {
-		let dt: DateTime<Utc> = self
-			.timestamp_impl()
-			.create_from_versionstamp(versionstamp as u128)?
-			.as_datetime()?;
+		let dt: DateTime<Utc> =
+			self.timestamp_impl().create_from_versionstamp(versionstamp as u128)?.as_datetime()?;
 		// Compare at MILLISECOND resolution on both sides. `as_datetime` floors
 		// an HLC versionstamp to the ms (the 16-bit logical counter is not a
 		// queryable time axis, and Lance does not persist it), whereas Lance's
@@ -1136,7 +1157,7 @@ impl Transaction {
 	async fn scan_impl(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 		direction: Direction,
@@ -1208,9 +1229,7 @@ impl Transaction {
 						.as_any()
 						.downcast_ref::<arrow_array::BinaryArray>()
 						.ok_or_else(|| {
-							Error::Datastore(
-								"lance scan_impl: key column type mismatch".into(),
-							)
+							Error::Datastore("lance scan_impl: key column type mismatch".into())
 						})?;
 					let val_col = batch
 						.column_by_name("val")
@@ -1220,14 +1239,11 @@ impl Transaction {
 						.as_any()
 						.downcast_ref::<arrow_array::BinaryArray>()
 						.ok_or_else(|| {
-							Error::Datastore(
-								"lance scan_impl: val column type mismatch".into(),
-							)
+							Error::Datastore("lance scan_impl: val column type mismatch".into())
 						})?;
 
 					for i in 0..batch.num_rows() {
-						lance_rows
-							.push((key_col.value(i).to_vec(), val_col.value(i).to_vec()));
+						lance_rows.push((key_col.value(i).to_vec(), val_col.value(i).to_vec()));
 					}
 				}
 			}
@@ -1251,9 +1267,7 @@ impl Transaction {
 			// Overlay pending writes: Set overrides everything below, Delete
 			// masks the key entirely.
 			for (k, entry) in pending.iter() {
-				if k.as_slice() >= rng.start.as_slice()
-					&& k.as_slice() < rng.end.as_slice()
-				{
+				if k.as_slice() >= rng.start.as_slice() && k.as_slice() < rng.end.as_slice() {
 					match entry {
 						PendingEntry::Set(v) => {
 							merged.insert(k.clone(), Some(v.clone()));
@@ -1266,64 +1280,19 @@ impl Transaction {
 			}
 			// Materialise in direction order. BTreeMap iterates ascending by
 			// default; reverse for Backward.
-			let mut combined: Vec<(Key, Val)> = merged
-				.into_iter()
-				.filter_map(|(k, v)| v.map(|val| (k, val)))
-				.collect();
+			let mut combined: Vec<(Key, Val)> =
+				merged.into_iter().filter_map(|(k, v)| v.map(|val| (k, val))).collect();
 			if matches!(direction, Direction::Backward) {
 				combined.reverse();
 			}
 
-			// ── (3) Apply skip + limit ─────────────────────────────────────────
-			// Three limit kinds (see crate::kvs::api::ScanLimit):
-			//   Count(n)             — stop after n entries
-			//   Bytes(b)             — stop after key.len()+val.len() ≥ b
-			//   BytesOrCount(b, n)   — stop on whichever hits first
-			//
-			// Per-entry byte cost is key.len() + val.len() (matching the wire-
-			// layer accounting used by other backends). The Bytes variant uses
-			// "at least n bytes" semantics: we include the first entry that
-			// crosses the threshold (so a tiny limit still yields ≥1 row when
-			// data exists).
-			let skip_n = skip as usize;
-			let post_skip = combined.into_iter().skip(skip_n);
-			let result: Vec<(Key, Val)> = match limit {
-				ScanLimit::Count(n) => post_skip.take(n as usize).collect(),
-				ScanLimit::Bytes(b_target) => {
-					let b_target = b_target as usize;
-					let mut acc = 0usize;
-					let mut out = Vec::new();
-					for (k, v) in post_skip {
-						let cost = k.len() + v.len();
-						out.push((k, v));
-						acc += cost;
-						if acc >= b_target {
-							break;
-						}
-					}
-					out
-				}
-				ScanLimit::BytesOrCount(b_target, n) => {
-					let b_target = b_target as usize;
-					let n = n as usize;
-					let mut acc = 0usize;
-					let mut out = Vec::new();
-					for (k, v) in post_skip {
-						let cost = k.len() + v.len();
-						out.push((k, v));
-						acc += cost;
-						if out.len() >= n || acc >= b_target {
-							break;
-						}
-					}
-					out
-				}
-			};
+			// ── (3) Apply skip + limit (count-based; upstream dropped ScanLimit) ──
+			let result: Vec<(Key, Val)> =
+				combined.into_iter().skip(skip as usize).take(limit as usize).collect();
 			Ok(result)
 		}
 	}
 }
-
 
 // (WritePath, LanceConfig::{write_path,disable_background_flusher,flusher_tick_interval},
 // commit_gate module, memtable). These test modules will NOT compile until
@@ -1331,5 +1300,3 @@ impl Transaction {
 // "write only mod.rs" constraint.
 #[cfg(test)]
 mod tests;
-
-
