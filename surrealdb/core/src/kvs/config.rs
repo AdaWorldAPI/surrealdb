@@ -23,6 +23,50 @@ pub fn parse_query_params(query: &str) -> HashMap<String, String> {
 // --------------------------------------------------
 
 // --------------------------------------------------
+// Lance configuration
+// --------------------------------------------------
+
+/// Configuration for the Lance backend.
+///
+/// Most knobs live in env-vars (see `kvs/lance/cnf.rs`); this struct
+/// only carries the per-Datastore options that the SurrealDB CLI/config
+/// layer needs to know about.
+///
+/// The native rewrite delegates compaction/GC to lance's own
+/// `optimize`/`cleanup_old_versions` (via `background_optimizer.rs`), so
+/// the former `WritePath` enum and the `write_path`,
+/// `flusher_tick_interval`, and `disable_background_flusher` knobs that
+/// configured the hand-rolled LSM flusher are gone.
+#[cfg(feature = "kv-lance")]
+#[derive(Debug, Clone)]
+pub struct LanceConfig {
+	/// Whether to enable per-key versioning (MVCC reads via
+	/// `Dataset::checkout(version)`).
+	pub versioned: bool,
+
+}
+
+#[cfg(feature = "kv-lance")]
+impl Default for LanceConfig {
+	fn default() -> Self {
+		Self {
+			versioned: true,
+		}
+	}
+}
+
+#[cfg(feature = "kv-lance")]
+impl LanceConfig {
+	/// Build configuration from parsed query parameters.
+	/// No parameters are currently parsed; all knobs are controlled
+	/// via environment variables in `kvs/lance/cnf.rs`. Returns
+	/// `Ok(Self::default())` for forward-compatibility.
+	pub fn from_params(_params: &HashMap<String, String>) -> Result<Self> {
+		Ok(Self::default())
+	}
+}
+
+// --------------------------------------------------
 // Duration
 // --------------------------------------------------
 

@@ -287,6 +287,47 @@ pub struct Mem;
 #[derive(Debug)]
 pub struct RocksDb;
 
+/// Lance columnar database
+///
+/// Provides a Lance-backed local storage engine. Lance is a columnar dataset
+/// format with built-in vector search, manifest-based versioning, and
+/// append-only fragment storage. The Lance backend uses the path argument as
+/// the dataset location on the local filesystem.
+///
+/// # Examples
+///
+/// Instantiating a Lance-backed instance
+///
+/// ```no_run
+/// # #[tokio::main]
+/// # async fn main() -> surrealdb::Result<()> {
+/// use surrealdb::Surreal;
+/// use surrealdb::engine::local::Lance;
+///
+/// let db = Surreal::new::<Lance>("path/to/lance/dataset").await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Instantiating a Lance-backed strict instance
+///
+/// ```no_run
+/// # #[tokio::main]
+/// # async fn main() -> surrealdb::Result<()> {
+/// use surrealdb::opt::Config;
+/// use surrealdb::Surreal;
+/// use surrealdb::engine::local::Lance;
+///
+/// let config = Config::default().strict();
+/// let db = Surreal::new::<Lance>(("path/to/lance/dataset", config)).await?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "kv-lance")]
+#[cfg_attr(docsrs, doc(cfg(feature = "kv-lance")))]
+#[derive(Debug)]
+pub struct Lance;
+
 /// IndxDB database
 ///
 /// # Examples

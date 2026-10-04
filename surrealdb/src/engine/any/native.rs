@@ -86,6 +86,27 @@ impl conn::Sealed for Any {
 				));
 				}
 
+				EndpointKind::Lance => {
+					#[cfg(feature = "kv-lance")]
+					{
+						features.insert(ExtraFeatures::Backup);
+						features.insert(ExtraFeatures::LiveQueries);
+						tokio::spawn(engine::local::native::run_router(
+							address,
+							conn_tx,
+							route_rx,
+							session_clone.receiver.clone(),
+						));
+						conn_rx.recv().await.map_err(crate::std_error_to_types_error)??
+					}
+
+					#[cfg(not(feature = "kv-lance"))]
+				return Err(Error::configuration(
+					"Cannot connect to the `lance` storage engine as it is not enabled in this build of SurrealDB".to_string(),
+					None,
+				));
+				}
+
 				EndpointKind::TiKv => {
 					#[cfg(feature = "kv-tikv")]
 					{
