@@ -20,6 +20,9 @@ use parking_lot::RwLock;
 /// `cache::user::preferences::theme`.
 pub const MAX_KV_KEY_BYTES: usize = 1024;
 
+// clippy 1.99: `#[async_trait]` puts a bare `#[must_use]` on each desugared
+// method, whose return type (a boxed `Future`) is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait KVStore: Send + Sync {
 	async fn get(&self, key: String) -> Result<Option<surrealdb_types::Value>>;

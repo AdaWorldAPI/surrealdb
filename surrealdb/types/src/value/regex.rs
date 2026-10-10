@@ -84,14 +84,14 @@ impl Deref for Regex {
 impl Debug for Regex {
 	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
 		let t = self.0.to_string().replace('/', "\\/");
-		write!(f, "/{}/", &t)
+		write!(f, "/{}/", t)
 	}
 }
 
 impl Display for Regex {
 	fn fmt(&self, f: &mut Formatter) -> fmt::Result {
 		let t = self.0.to_string().replace('/', "\\/");
-		write!(f, "/{}/", &t)
+		write!(f, "/{}/", t)
 	}
 }
 
