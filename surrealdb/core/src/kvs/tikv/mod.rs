@@ -86,6 +86,9 @@ impl Transaction {
 		// returns `Err` and the counter is left unchanged. An underflow
 		// would signal a missing increment somewhere, which is the real
 		// bug to surface — clamping at zero would just hide it.
+		// `fetch_update` is deprecated in Rust 1.99 in favour of `try_update`, which
+		// does not exist on the 1.95 MSRV; keep the old name until the MSRV moves.
+		#[allow(deprecated)]
 		let _ = self
 			.handle
 			.in_flight_txns
@@ -1588,6 +1591,7 @@ mod tests {
 		// with a bare `fetch_sub` later.
 		let counter = Arc::new(AtomicUsize::new(2));
 		let release = |c: &Arc<AtomicUsize>| {
+			#[allow(deprecated)] // `try_update` needs 1.99; MSRV is 1.95
 			let _ = c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
 		};
 		release(&counter);

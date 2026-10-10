@@ -28,6 +28,7 @@ impl Categorise for Kv {
 	}
 }
 
+#[allow(unused)]
 impl Kv {
 	pub fn new() -> Kv {
 		Kv {

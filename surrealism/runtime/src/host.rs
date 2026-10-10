@@ -20,6 +20,9 @@ use crate::store::StoreData;
 
 /// Context provided for each WASM function invocation.
 /// Created per-call with borrowed execution context (stack, query context, etc).
+// clippy 1.99: `#[async_trait]` puts a bare `#[must_use]` on each desugared
+// method, whose return type (a boxed `Future`) is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait InvocationContext: Send + Sync {
 	async fn sql(

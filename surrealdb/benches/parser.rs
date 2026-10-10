@@ -53,10 +53,7 @@ fn bench_parser(c: &mut Criterion) {
 		c,
 		json_large_object,
 		syn::json,
-		&format!(
-			"{{{}}}",
-			&(1..=100).map(|n| format!("'{n}': {n}")).collect::<Vec<_>>().join(", ")
-		)
+		&format!("{{{}}}", (1..=100).map(|n| format!("'{n}': {n}")).collect::<Vec<_>>().join(", "))
 	);
 	parser!(c, full_test, syn::parse, include_str!("../core/test.surql"));
 	c.finish();

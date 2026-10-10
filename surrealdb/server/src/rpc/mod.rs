@@ -165,7 +165,7 @@ pub async fn notifications(
 /// connections have been drained from the [`RpcState`].
 pub async fn graceful_shutdown(state: Arc<RpcState>) {
 	// Close WebSocket connections, ensuring queued messages are processed
-	for (_, rpc) in state.web_sockets.read().await.iter() {
+	for rpc in state.web_sockets.read().await.values() {
 		rpc.shutdown.cancel();
 	}
 	// Wait for all existing WebSocket connections to finish sending

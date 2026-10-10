@@ -499,18 +499,10 @@ impl<'a> IndexAnalyzer<'a> {
 	) -> Option<SimpleCondition> {
 		let (idiom, value, position) = match (left, right) {
 			(Expr::Idiom(idiom), Expr::Literal(lit)) => {
-				if let Some(value) = try_literal_to_value(lit) {
-					(idiom.clone(), value, IdiomPosition::Left)
-				} else {
-					return None;
-				}
+				(idiom.clone(), try_literal_to_value(lit)?, IdiomPosition::Left)
 			}
 			(Expr::Literal(lit), Expr::Idiom(idiom)) => {
-				if let Some(value) = try_literal_to_value(lit) {
-					(idiom.clone(), value, IdiomPosition::Right)
-				} else {
-					return None;
-				}
+				(idiom.clone(), try_literal_to_value(lit)?, IdiomPosition::Right)
 			}
 			_ => return None,
 		};
