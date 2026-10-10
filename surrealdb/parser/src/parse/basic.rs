@@ -264,13 +264,12 @@ impl ParseSync for Duration {
 			let number = match lexer.next() {
 				None => break,
 				Some(Ok(DurationToken::Digits)) => {
-					let Some(x) = lexer.slice().parse::<u128>().ok().and_then(|x| {
-						if x > NANOSECOND_DURATION_MAX {
-							None
-						} else {
-							Some(x)
-						}
-					}) else {
+					let Some(x) = lexer
+						.slice()
+						.parse::<u128>()
+						.ok()
+						.filter(|&x| x <= NANOSECOND_DURATION_MAX)
+					else {
 						return Err(parser.with_error(|parser| {
 							Level::Error
 								.title(
@@ -304,13 +303,10 @@ impl ParseSync for Duration {
 				_ => unreachable!(),
 			};
 
-			let Some(x) = sub_duration.and_then(|x| duration.checked_add(x)).and_then(|x| {
-				if x > NANOSECOND_DURATION_MAX {
-					None
-				} else {
-					Some(x)
-				}
-			}) else {
+			let Some(x) = sub_duration
+				.and_then(|x| duration.checked_add(x))
+				.filter(|&x| x <= NANOSECOND_DURATION_MAX)
+			else {
 				return Err(parser.with_error(|parser| {
 					Level::Error
 						.title(
