@@ -46,7 +46,10 @@ runs:
       # The cleanup commands are Linux-specific (sudo + GNU paths). Running them
       # on macOS/Windows runners only produces noise (read-only volume / missing
       # sudo), so restrict the step to Linux where it actually frees space.
-      if: inputs.free-disk-space == 'true' && runner.os == 'Linux'
+      # GitHub-hosted runners (named "GitHub Actions N") have ~14 GB free, too
+      # little for these builds, so the cleanup always runs there; the larger
+      # self-hosted runners keep the opt-in.
+      if: (inputs.free-disk-space == 'true' || startsWith(runner.name, 'GitHub Actions')) && runner.os == 'Linux'
       shell: bash
       run: |
         echo "Disk space before cleanup:"

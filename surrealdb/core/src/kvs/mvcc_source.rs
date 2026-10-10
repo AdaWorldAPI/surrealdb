@@ -6,16 +6,15 @@
 //! monotonically-increasing version numbers used to implement MVCC
 //! (multi-version concurrency control):
 //!
-//! - **Local backends** (mem, RocksDB, SurrealKV, Lance): a process-local
-//!   [`AtomicU64`] counter is sufficient because there is only one writer
-//!   process.  [`LocalGeneratedMvcc`] provides this default.
+//! - **Local backends** (mem, RocksDB, SurrealKV, Lance): a process-local [`AtomicU64`] counter is
+//!   sufficient because there is only one writer process.  [`LocalGeneratedMvcc`] provides this
+//!   default.
 //!
-//! - **Distributed backends** (kv-tikv with native-MVCC): the PD (Placement
-//!   Driver) cluster issues HLC (Hybrid Logical Clock) timestamps that are
-//!   globally ordered.  Sprint 2 will add `impl MvccSource for
-//!   TikvNativeMvccTxn` that delegates to the TiKV client — that
-//!   implementation is **out of scope here** and will be added
-//!   in `kvs/tikv/native_mvcc.rs` without touching this file.
+//! - **Distributed backends** (kv-tikv with native-MVCC): the PD (Placement Driver) cluster issues
+//!   HLC (Hybrid Logical Clock) timestamps that are globally ordered.  Sprint 2 will add `impl
+//!   MvccSource for TikvNativeMvccTxn` that delegates to the TiKV client — that implementation is
+//!   **out of scope here** and will be added in `kvs/tikv/native_mvcc.rs` without touching this
+//!   file.
 //!
 //! Making the source pluggable through a trait keeps the transaction layer
 //! free from backend-specific timestamp logic and makes it straightforward
@@ -49,16 +48,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// # Contract
 ///
-/// - Each call to [`next_version`] MUST return a value `≥` any value
-///   previously returned by the same instance.
-/// - Values need not be consecutive; gaps are permitted (for example, an
-///   HLC-backed source will return wall-clock milliseconds which can jump).
-/// - Implementations must be `Send + Sync` so a concrete source can be
-///   shared across Tokio tasks (e.g. `Arc<LocalGeneratedMvcc>`). Note the
-///   trait itself is NOT object-safe: `next_version` uses return-position
-///   `impl Trait` (RPITIT) for zero-cost static dispatch, so `dyn MvccSource`
-///   / `Arc<dyn MvccSource>` will not compile. A future consumer that needs
-///   runtime-pluggable sources can add a boxed-future variant at that point.
+/// - Each call to [`next_version`] MUST return a value `≥` any value previously returned by the
+///   same instance.
+/// - Values need not be consecutive; gaps are permitted (for example, an HLC-backed source will
+///   return wall-clock milliseconds which can jump).
+/// - Implementations must be `Send + Sync` so a concrete source can be shared across Tokio tasks
+///   (e.g. `Arc<LocalGeneratedMvcc>`). Note the trait itself is NOT object-safe: `next_version`
+///   uses return-position `impl Trait` (RPITIT) for zero-cost static dispatch, so `dyn MvccSource`
+///   / `Arc<dyn MvccSource>` will not compile. A future consumer that needs runtime-pluggable
+///   sources can add a boxed-future variant at that point.
 ///
 /// [`next_version`]: MvccSource::next_version
 pub trait MvccSource: Send + Sync {

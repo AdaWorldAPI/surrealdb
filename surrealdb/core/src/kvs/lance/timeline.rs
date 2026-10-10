@@ -15,12 +15,12 @@
 //!
 //! ## What it builds on (all Lance 7.0.0 surface — the mandatory pin)
 //!
-//! - `Dataset::versions() -> Vec<lance::dataset::Version>` — the version
-//!   timeline (same call the lance-graph `VersionedGraph` uses).
+//! - `Dataset::versions() -> Vec<lance::dataset::Version>` — the version timeline (same call the
+//!   lance-graph `VersionedGraph` uses).
 //! - `Dataset::checkout_version(u64)` — pin a read-only snapshot.
 //! - `Dataset::version().version -> u64` — the latest version number.
-//! - `Scanner::project(&["key","val","version"])` + `filter` — the same
-//!   scan idiom as [`super::Transaction::scan_impl`].
+//! - `Scanner::project(&["key","val","version"])` + `filter` — the same scan idiom as
+//!   [`super::Transaction::scan_impl`].
 //!
 //! ## Wall-clock time (owned, not inferred)
 //!

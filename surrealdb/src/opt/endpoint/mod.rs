@@ -5,18 +5,23 @@ mod ws;
 
 #[cfg(feature = "kv-indxdb")]
 mod indxdb;
+#[cfg(feature = "kv-lance")]
+mod lance;
 #[cfg(feature = "kv-mem")]
 mod mem;
 #[cfg(feature = "kv-rocksdb")]
 mod rocksdb;
-#[cfg(feature = "kv-lance")]
-mod lance;
 #[cfg(feature = "kv-surrealkv")]
 mod surrealkv;
 #[cfg(feature = "kv-tikv")]
 mod tikv;
 
-#[cfg(any(feature = "kv-mem", feature = "kv-surrealkv", feature = "kv-rocksdb", feature = "kv-lance"))]
+#[cfg(any(
+	feature = "kv-mem",
+	feature = "kv-surrealkv",
+	feature = "kv-rocksdb",
+	feature = "kv-lance"
+))]
 mod local;
 
 use url::Url;
@@ -56,7 +61,12 @@ impl Endpoint {
 	/// Append a query parameter to the endpoint path string.
 	/// Only used when a local engine (e.g. `kv-mem`, `kv-rocksdb`) is enabled.
 	#[cfg_attr(
-		not(any(feature = "kv-mem", feature = "kv-surrealkv", feature = "kv-rocksdb", feature = "kv-lance")),
+		not(any(
+			feature = "kv-mem",
+			feature = "kv-surrealkv",
+			feature = "kv-rocksdb",
+			feature = "kv-lance"
+		)),
 		allow(dead_code)
 	)]
 	pub(crate) fn append_query_param(&mut self, key: &str, value: &str) {
