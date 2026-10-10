@@ -14,12 +14,10 @@
 //!
 //! The optimize cycle runs when *either* of the following is true:
 //!
-//! 1. **Time-based**: the configured interval has elapsed since the last
-//!    optimize. Default: 5 minutes
-//!    ([`cnf::LANCE_OPTIMIZE_INTERVAL_NS`]).
-//! 2. **Write-count-based**: the cumulative write-count since the last
-//!    optimize exceeds the threshold. Default: 1000 writes
-//!    ([`cnf::LANCE_OPTIMIZE_AFTER_N_WRITES`]).
+//! 1. **Time-based**: the configured interval has elapsed since the last optimize. Default: 5
+//!    minutes ([`cnf::LANCE_OPTIMIZE_INTERVAL_NS`]).
+//! 2. **Write-count-based**: the cumulative write-count since the last optimize exceeds the
+//!    threshold. Default: 1000 writes ([`cnf::LANCE_OPTIMIZE_AFTER_N_WRITES`]).
 //!
 //! Write-count is updated via [`BackgroundOptimizer::notify_commit`],
 //! which is cheap (atomic increment) and called inline by `commit()`.
@@ -173,8 +171,8 @@ impl BackgroundOptimizer {
 			//
 			// We build a `CleanupPolicy` with:
 			//   - `before_timestamp`: versions older than `retention_secs` ago
-			//   - `error_if_tagged_old_versions = false`: skip tagged snapshots
-			//     rather than aborting the cleanup cycle
+			//   - `error_if_tagged_old_versions = false`: skip tagged snapshots rather than
+			//     aborting the cleanup cycle
 			//
 			// `chrono` is already a workspace dep in surrealdb/core/Cargo.toml.
 			// ------------------------------------------------------------------

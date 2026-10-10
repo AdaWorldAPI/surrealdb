@@ -31,17 +31,15 @@
 //! commit-gate), this backend reads and writes through lance's **native**
 //! path, exactly as `lance-graph` does:
 //!
-//! - **commit** builds ONE Arrow `RecordBatch` from the transaction's
-//!   pending buffer (live rows for writes, tombstone rows for deletes) and
-//!   applies it with a single `MergeInsertBuilder::execute_reader`
-//!   (`WhenMatched::UpdateAll` / `WhenNotMatched::InsertAll`, keyed on
-//!   `key`). One SurrealDB commit = one lance dataset version.
-//! - **read** checks the pending buffer first (read-your-writes), then
-//!   reads lance (the version AS OF the requested instant via
-//!   [`Transaction::lance_version_as_of`] for an explicit version, else the
-//!   latest manifest) with a DataFusion filter + projection, then merges.
-//! - **compaction / GC** is lance's own `optimize` via the
-//!   [`background_optimizer`], never a hand-rolled flusher.
+//! - **commit** builds ONE Arrow `RecordBatch` from the transaction's pending buffer (live rows for
+//!   writes, tombstone rows for deletes) and applies it with a single
+//!   `MergeInsertBuilder::execute_reader` (`WhenMatched::UpdateAll` / `WhenNotMatched::InsertAll`,
+//!   keyed on `key`). One SurrealDB commit = one lance dataset version.
+//! - **read** checks the pending buffer first (read-your-writes), then reads lance (the version AS
+//!   OF the requested instant via [`Transaction::lance_version_as_of`] for an explicit version,
+//!   else the latest manifest) with a DataFusion filter + projection, then merges.
+//! - **compaction / GC** is lance's own `optimize` via the [`background_optimizer`], never a
+//!   hand-rolled flusher.
 //!
 //! ## Schema
 //!
@@ -88,23 +86,21 @@ mod tx_buffer;
 // `TimelineView` + `VersionInfo` are the read-side surface a kanban/replay
 // consumer reaches for next. Re-exported crate-wide so that wiring lands
 // without churn; `allow(unused_imports)` until the first in-tree consumer.
-#[allow(unused_imports)]
-pub(crate) use timeline::{Timeline, TimelineView, VersionInfo};
-
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use background_optimizer::BackgroundOptimizer;
 use chrono::{DateTime, Utc};
 use lance::Dataset as LanceDataset;
 use lance::dataset::WriteParams;
 use lance::index::DatasetIndexExt;
 use lance_index::IndexType;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-use tokio::sync::RwLock;
-
-use background_optimizer::BackgroundOptimizer;
 use schema::KvSchema;
+#[allow(unused_imports)]
+pub(crate) use timeline::{Timeline, TimelineView, VersionInfo};
+use tokio::sync::RwLock;
 use tx_buffer::{PendingBuffer, PendingEntry};
 
 use super::Direction;
@@ -631,9 +627,9 @@ impl Transactable for Transaction {
 
 	/// Resolve a key by:
 	///  1. Check the pending buffer for read-your-writes.
-	///  2. Otherwise scan the Lance dataset — at `version` if explicitly
-	///     requested (`checkout_version`), else @ latest — with a
-	///     `key = ? AND tombstone = false` filter, limit 1.
+	///  2. Otherwise scan the Lance dataset — at `version` if explicitly requested
+	///     (`checkout_version`), else @ latest — with a `key = ? AND tombstone = false` filter,
+	///     limit 1.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self), fields(key = key.sprint()))]
 	fn get(&self, key: Key, version: Option<u64>) -> BoxFut<'_, Result<Option<Val>>> {
 		Box::pin(async move {
@@ -656,14 +652,13 @@ impl Transactable for Transaction {
 			// (2) Fall through to a native Lance scan.
 			//
 			// Snapshot selection (TRANSPARENT versioning):
-			// - `version.is_some()` → map the versionstamp to the Lance version
-			//   AS OF that instant (`lance_version_as_of`, via Lance's native
-			//   per-version timestamps) and `checkout_version` it; no version
-			//   at-or-before that instant → `None` (key did not exist yet).
-			// - `version.is_none()` → read Lance @ latest. Every committed
-			//   write is its own lance version, so the latest manifest already
-			//   reflects all durable commits; pinning to a stale `read_version`
-			//   would hide rows committed by concurrent transactions.
+			// - `version.is_some()` → map the versionstamp to the Lance version AS OF that instant
+			//   (`lance_version_as_of`, via Lance's native per-version timestamps) and
+			//   `checkout_version` it; no version at-or-before that instant → `None` (key did not
+			//   exist yet).
+			// - `version.is_none()` → read Lance @ latest. Every committed write is its own lance
+			//   version, so the latest manifest already reflects all durable commits; pinning to a
+			//   stale `read_version` would hide rows committed by concurrent transactions.
 			let ds = self.dataset.read().await;
 			let snapshot = match version {
 				Some(v) => {
@@ -964,9 +959,10 @@ impl Transaction {
 		version: u64,
 		seqs: &[u64],
 	) -> std::result::Result<arrow_array::RecordBatch, arrow_schema::ArrowError> {
+		use std::sync::Arc;
+
 		use arrow_array::{BinaryArray, BooleanArray, RecordBatch, UInt64Array};
 		use arrow_schema::{DataType, Field, Schema};
-		use std::sync::Arc;
 
 		// Enforced in ALL builds (not just debug): a mismatch would otherwise
 		// surface only as an opaque Arrow "unequal column length" error.
@@ -1021,9 +1017,10 @@ impl Transaction {
 		version: u64,
 		seqs: &[u64],
 	) -> std::result::Result<arrow_array::RecordBatch, arrow_schema::ArrowError> {
+		use std::sync::Arc;
+
 		use arrow_array::{BinaryArray, BooleanArray, RecordBatch, UInt64Array};
 		use arrow_schema::{DataType, Field, Schema};
-		use std::sync::Arc;
 
 		if deletes.len() != seqs.len() {
 			return Err(arrow_schema::ArrowError::InvalidArgumentError(format!(
@@ -1172,11 +1169,11 @@ impl Transaction {
 		// ── (1) Read Lance rows in range ───────────────────────────────────────
 		//
 		// Snapshot selection mirrors `Transaction::get` (TRANSPARENT versioning):
-		// - `version.is_some()` → map the versionstamp to the Lance version AS
-		//   OF that instant (`lance_version_as_of`) and `checkout_version` it;
-		//   no version that old → empty Lance side.
-		// - `version.is_none()` → Lance @ latest (every commit is its own
-		//   version, so latest already reflects all durable commits).
+		// - `version.is_some()` → map the versionstamp to the Lance version AS OF that instant
+		//   (`lance_version_as_of`) and `checkout_version` it; no version that old → empty Lance
+		//   side.
+		// - `version.is_none()` → Lance @ latest (every commit is its own version, so latest
+		//   already reflects all durable commits).
 		let mut lance_rows: Vec<(Key, Val)> = Vec::new();
 		{
 			let ds = self.dataset.read().await;

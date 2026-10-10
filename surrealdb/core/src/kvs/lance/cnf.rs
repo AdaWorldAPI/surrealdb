@@ -1,6 +1,7 @@
 #![cfg(feature = "kv-lance")]
 #![allow(dead_code)]
-// kv-lance helpers: some builders/knobs reserved or vestigial after the native rewrite (prune follow-up)
+// kv-lance helpers: some builders/knobs reserved or vestigial after the native rewrite (prune
+// follow-up)
 
 //! Configuration constants for the Lance backend.
 //!

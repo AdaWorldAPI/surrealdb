@@ -661,7 +661,6 @@ async fn test_set_then_set_returns_latest_value() {
 //  Transaction::scan / scanr tests
 // ============================================================================
 
-
 /// Helper: seed a dataset with keys a-e mapped to values 1-5, committed.
 async fn seed_a_to_e(ds: &Datastore) {
 	let tx = ds.transaction(true, false).await.expect("tx");
@@ -681,8 +680,7 @@ async fn test_scan_forward_returns_all_in_order() {
 	seed_a_to_e(&ds).await;
 
 	let tx = ds.transaction(false, false).await.expect("tx");
-	let result =
-		tx.scan(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("scan");
+	let result = tx.scan(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("scan");
 
 	let keys: Vec<&[u8]> = result.values.iter().map(|(k, _)| k.as_slice()).collect();
 	assert_eq!(
@@ -707,10 +705,7 @@ async fn test_scanr_reverse_returns_all_in_descending_order() {
 	seed_a_to_e(&ds).await;
 
 	let tx = ds.transaction(false, false).await.expect("tx");
-	let result = tx
-		.scanr(b"a".to_vec()..b"z".to_vec(), 100, 0, None)
-		.await
-		.expect("scanr");
+	let result = tx.scanr(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("scanr");
 
 	let keys: Vec<&[u8]> = result.values.iter().map(|(k, _)| k.as_slice()).collect();
 	assert_eq!(
@@ -732,8 +727,7 @@ async fn test_scan_skip_and_limit() {
 	seed_a_to_e(&ds).await;
 
 	let tx = ds.transaction(false, false).await.expect("tx");
-	let result =
-		tx.scan(b"a".to_vec()..b"z".to_vec(), 2, 2, None).await.expect("scan");
+	let result = tx.scan(b"a".to_vec()..b"z".to_vec(), 2, 2, None).await.expect("scan");
 
 	let keys: Vec<&[u8]> = result.values.iter().map(|(k, _)| k.as_slice()).collect();
 	assert_eq!(keys, vec![b"c".as_ref(), b"d"], "skip 2 take 2 should yield c,d; got {:?}", keys);
@@ -751,8 +745,7 @@ async fn test_scan_half_open_range_excludes_end() {
 
 	let tx = ds.transaction(false, false).await.expect("tx");
 	// Range [b, d) → b, c (d excluded).
-	let result =
-		tx.scan(b"b".to_vec()..b"d".to_vec(), 100, 0, None).await.expect("scan");
+	let result = tx.scan(b"b".to_vec()..b"d".to_vec(), 100, 0, None).await.expect("scan");
 
 	let keys: Vec<&[u8]> = result.values.iter().map(|(k, _)| k.as_slice()).collect();
 	assert_eq!(
@@ -776,8 +769,7 @@ async fn test_scan_pending_set_appears_in_results() {
 	let tx = ds.transaction(true, false).await.expect("tx");
 	tx.set(b"bb".to_vec(), b"22".to_vec()).await.expect("set pending");
 
-	let result =
-		tx.scan(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("scan");
+	let result = tx.scan(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("scan");
 
 	let keys: Vec<&[u8]> = result.values.iter().map(|(k, _)| k.as_slice()).collect();
 	assert_eq!(
@@ -801,8 +793,7 @@ async fn test_scan_pending_set_overrides_stored_value() {
 	let tx = ds.transaction(true, false).await.expect("tx");
 	tx.set(b"c".to_vec(), b"33".to_vec()).await.expect("override c");
 
-	let result =
-		tx.scan(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("scan");
+	let result = tx.scan(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("scan");
 
 	let pair_c = result.values.iter().find(|(k, _)| k.as_slice() == b"c").expect("c present");
 	assert_eq!(
@@ -829,8 +820,7 @@ async fn test_scan_pending_delete_hides_stored_row() {
 	let tx = ds.transaction(true, false).await.expect("tx");
 	tx.del(b"c".to_vec()).await.expect("del pending");
 
-	let result =
-		tx.scan(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("scan");
+	let result = tx.scan(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("scan");
 
 	let keys: Vec<&[u8]> = result.values.iter().map(|(k, _)| k.as_slice()).collect();
 	assert_eq!(
@@ -852,8 +842,7 @@ async fn test_keys_returns_keys_only() {
 	seed_a_to_e(&ds).await;
 
 	let tx = ds.transaction(false, false).await.expect("tx");
-	let result =
-		tx.keys(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("keys");
+	let result = tx.keys(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("keys");
 
 	let keys: Vec<&[u8]> = result.keys.iter().map(|k| k.as_slice()).collect();
 	assert_eq!(keys, vec![b"a".as_ref(), b"b", b"c", b"d", b"e"]);
@@ -870,10 +859,7 @@ async fn test_keysr_returns_keys_in_reverse() {
 	seed_a_to_e(&ds).await;
 
 	let tx = ds.transaction(false, false).await.expect("tx");
-	let result = tx
-		.keysr(b"a".to_vec()..b"z".to_vec(), 100, 0, None)
-		.await
-		.expect("keysr");
+	let result = tx.keysr(b"a".to_vec()..b"z".to_vec(), 100, 0, None).await.expect("keysr");
 
 	let keys: Vec<&[u8]> = result.keys.iter().map(|k| k.as_slice()).collect();
 	assert_eq!(keys, vec![b"e".as_ref(), b"d", b"c", b"b", b"a"]);
