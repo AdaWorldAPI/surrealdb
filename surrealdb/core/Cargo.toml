@@ -260,8 +260,10 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 wiremock.workspace = true
 
 [package.metadata.cargo-machete]
-# md-5 crate is imported as md5::, regex-syntax is optional (tied to arbitrary feature)
-ignored = ["md-5", "regex-syntax"]
+# md-5 crate is imported as md5::, regex-syntax is optional (tied to arbitrary feature).
+# lancedb is part of the kv-lance feature but not yet referenced from the kv-lance source
+# (it talks to `lance` directly); kept so the lance family stays pinned in lockstep.
+ignored = ["md-5", "regex-syntax", "lancedb"]
 
 [lints]
 workspace = true
