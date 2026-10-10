@@ -46,12 +46,8 @@ impl super::Routine for Create {
 					async move {
 						let mut res = std::hint::black_box(
 							ds.execute(
-								format!(
-									"CREATE {} SET field = '{}'",
-									table_name,
-									super::rand_id()
-								)
-								.as_str(),
+								format!("CREATE {} SET field = '{}'", table_name, super::rand_id())
+									.as_str(),
 								&session,
 								None,
 							)
