@@ -1,5 +1,3 @@
-use core::f64;
-
 use anyhow::Result;
 use rust_decimal::{Decimal, MathematicalOps};
 

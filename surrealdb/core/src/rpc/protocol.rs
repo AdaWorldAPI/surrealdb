@@ -1171,13 +1171,7 @@ pub trait RpcProtocol {
 		};
 
 		let data = data
-			.and_then(|x| {
-				if x.is_nullish() {
-					None
-				} else {
-					Some(x)
-				}
-			})
+			.filter(|x| !x.is_nullish())
 			.map(|x| SqlData::ContentExpression(Expr::from_public_value(x)));
 
 		// Specify the SQL query string
@@ -1224,13 +1218,7 @@ pub trait RpcProtocol {
 		};
 
 		let data = data
-			.and_then(|x| {
-				if x.is_nullish() {
-					None
-				} else {
-					Some(x)
-				}
-			})
+			.filter(|x| !x.is_nullish())
 			.map(|x| SqlData::ContentExpression(Expr::from_public_value(x)));
 
 		// Specify the SQL query string
@@ -1282,13 +1270,7 @@ pub trait RpcProtocol {
 		};
 
 		let data = data
-			.and_then(|x| {
-				if x.is_nullish() {
-					None
-				} else {
-					Some(x)
-				}
-			})
+			.filter(|x| !x.is_nullish())
 			.map(|x| SqlData::ContentExpression(Expr::from_public_value(x)));
 		// Specify the SQL query string
 		let sql = UpdateStatement {
@@ -1337,13 +1319,7 @@ pub trait RpcProtocol {
 		};
 
 		let data = data
-			.and_then(|x| {
-				if x.is_nullish() {
-					None
-				} else {
-					Some(x)
-				}
-			})
+			.filter(|x| !x.is_nullish())
 			.map(|x| SqlData::MergeExpression(Expr::from_public_value(x)));
 		// Specify the SQL query string
 		let sql = UpdateStatement {
@@ -1395,13 +1371,7 @@ pub trait RpcProtocol {
 		};
 
 		let data = data
-			.and_then(|x| {
-				if x.is_nullish() {
-					None
-				} else {
-					Some(x)
-				}
-			})
+			.filter(|x| !x.is_nullish())
 			.map(|x| SqlData::PatchExpression(Expr::from_public_value(x)));
 
 		let diff = matches!(diff, Some(PublicValue::Bool(true)));
@@ -1459,13 +1429,7 @@ pub trait RpcProtocol {
 		let only = singular(&from) && singular(&with);
 
 		let data = data
-			.and_then(|x| {
-				if x.is_nullish() {
-					None
-				} else {
-					Some(x)
-				}
-			})
+			.filter(|x| !x.is_nullish())
 			.map(|x| SqlData::ContentExpression(Expr::from_public_value(x)));
 
 		// Specify the SQL query string

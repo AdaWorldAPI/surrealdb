@@ -1,5 +1,3 @@
-use core::f64;
-
 use anyhow::{Result, bail, ensure};
 use surrealdb_types::ToSql;
 

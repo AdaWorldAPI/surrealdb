@@ -51,7 +51,7 @@ fn append_blob_part<'js>(
 						data.extend(LINE_ENDING);
 					}
 				} else {
-					data.extend([b'\r'])
+					data.extend(b"\r")
 				}
 			} else if x == b'\n' {
 				// \n

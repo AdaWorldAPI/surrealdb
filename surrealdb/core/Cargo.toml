@@ -101,9 +101,13 @@ surrealdb-collections = { workspace = true }
 vart.workspace = true
 
 # External KV stores
-lance = { version = "=7.0.0", optional = true }
-lance-index = { version = "=7.0.0", optional = true }
-lancedb = { version = "=0.30.0", optional = true }
+lance = { version = "=13.0.0", optional = true }
+lance-index = { version = "=13.0.0", optional = true }
+# `remote` is not a capability kv-lance asked for: lancedb >= 0.38 (0.40.0
+# re-measured 2026-10-10) does not compile without it -- `src/job.rs` builds
+# `Error::Http`, which `src/error.rs` gates on `cfg(feature = "remote")`
+# (two E0599). Drop the feature once upstream gates `job.rs`.
+lancedb = { version = "=0.40.0", optional = true, features = ["remote"] }
 arrow-array = { version = "58", optional = true }
 arrow-schema = { version = "58", optional = true }
 rocksdb = { workspace = true, optional = true }

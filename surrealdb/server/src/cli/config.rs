@@ -13,6 +13,9 @@ use crate::ntw::client_ip::ClientIp;
 /// validation checks on the configuration before the datastore and network
 /// components are initialized. Implementations can verify that the configuration
 /// is valid for the specific backend and features being used.
+// clippy 1.99: `#[async_trait]` puts a bare `#[must_use]` on each desugared
+// method, whose return type (a boxed `Future`) is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
 pub trait ConfigCheck: ConfigCheckRequirements {
