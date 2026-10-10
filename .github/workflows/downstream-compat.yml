@@ -70,7 +70,7 @@ jobs:
     if: github.repository != 'surrealdb/surrealdb'
     # On-demand (not spot): spot preemption shows up as "runner lost
     # communication" failures, and this is a soft signal we don't want flaking.
-    runs-on: runner-arm-16-cores
+    runs-on: ${{ vars.CI_RUNNER_ARM || 'ubuntu-24.04-arm' }}
     timeout-minutes: 45
 
     steps:
