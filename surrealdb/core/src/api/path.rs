@@ -33,12 +33,8 @@ impl<'a> Path {
 
 		let mut obj = Object::default();
 		for (i, segment) in self.iter().enumerate() {
-			if let Some(res) = segment.fit(&segments[i..]) {
-				if let Some((k, v)) = res {
-					obj.insert(k, v);
-				}
-			} else {
-				return None;
+			if let Some((k, v)) = segment.fit(&segments[i..])? {
+				obj.insert(k, v);
 			}
 		}
 

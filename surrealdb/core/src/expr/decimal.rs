@@ -250,8 +250,8 @@ impl DecimalLexEncoder {
 	/// For odd digit counts, the last byte has a zero low nibble; for even
 	/// counts, an extra 0xFF terminator byte is appended after bit inversion.
 	fn pack_digits_negative(radix10: &str, buf: &mut Vec<u8>) {
-		let mut iter = radix10.as_bytes().chunks_exact(2);
-		for pair in &mut iter {
+		let (pairs, remainder) = radix10.as_bytes().as_chunks::<2>();
+		for pair in pairs {
 			// pair is &[u8; 2]
 			// Convert ASCII digits to numeric values: '0' (48) -> 1, '1' (49) -> 2, etc.
 			// We subtract 47 instead of 48 to map '0'->1, '1'->2, ..., '9'->10
@@ -262,7 +262,7 @@ impl DecimalLexEncoder {
 			buf.push(!packed); // Invert bits for negative number lexicographic ordering
 		}
 		// If the length is odd, the remainder (the last lone byte) is here:
-		if let Some(remainder) = iter.remainder().first() {
+		if let Some(remainder) = remainder.first() {
 			let hi = remainder - 47;
 			let packed = hi << 4;
 			buf.push(!packed);
@@ -279,8 +279,8 @@ impl DecimalLexEncoder {
 	/// byte is appended. This ensures decode will stop before any trailing
 	/// type marker appended by higher layers.
 	fn pack_digits_positive(radix10: &str, buf: &mut Vec<u8>) {
-		let mut iter = radix10.as_bytes().chunks_exact(2);
-		for pair in &mut iter {
+		let (pairs, remainder) = radix10.as_bytes().as_chunks::<2>();
+		for pair in pairs {
 			// pair is &[u8; 2]
 			// Convert ASCII digits to numeric values: '0' (48) -> 1, '1' (49) -> 2, etc.
 			// We subtract 47 instead of 48 to map '0'->1, '1'->2, ..., '9'->10
@@ -292,7 +292,7 @@ impl DecimalLexEncoder {
 		}
 
 		// If the length is odd, the remainder (the last lone byte) is here:
-		if let Some(remainder) = iter.remainder().first() {
+		if let Some(remainder) = remainder.first() {
 			let hi = remainder - 47;
 			let packed = hi << 4;
 			buf.push(packed);

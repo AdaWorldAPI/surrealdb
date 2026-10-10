@@ -1,4 +1,3 @@
-use core::f64;
 use std::collections::BTreeMap;
 
 use anyhow::Result;

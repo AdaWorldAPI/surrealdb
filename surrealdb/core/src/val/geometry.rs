@@ -975,7 +975,6 @@ impl<'de, F> BorrowDecode<'de, F> for Geometry {
 
 #[cfg(test)]
 mod test {
-	use core::f64;
 
 	use geo::{Coord, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 
